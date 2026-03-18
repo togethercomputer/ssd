@@ -853,8 +853,8 @@ def capture_fi_tree_decode_cudagraph(model_runner):
             hf_config.head_dim,
             model_runner.block_size,
             custom_mask=custom_mask,
-            q_data_type=torch.bfloat16,
-            kv_data_type=torch.bfloat16,
+            q_data_type=hf_config.torch_dtype,
+            kv_data_type=hf_config.torch_dtype,
         )
 
         # Set minimal context needed for run
