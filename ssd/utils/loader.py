@@ -186,6 +186,8 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, 
 def load_safetensors_model(model: nn.Module, path: str, packed_modules_mapping: dict):
     """Load model weights from safetensors files"""
     safetensor_files = glob(os.path.join(path, "*.safetensors"))
+    assert safetensor_files, f"No safetensors files found at {path}"
+    print(f"[load_safetensors_model] Found {len(safetensor_files)} safetensors files at {path}")
     for file in tqdm(safetensor_files, desc="Loading model files"):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
