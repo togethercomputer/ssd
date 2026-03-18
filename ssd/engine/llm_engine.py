@@ -21,7 +21,6 @@ from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
 
-
 METRICS = {
     "cache_hits": [],
     "accepted_suffix_lens_with_recovery": [],
@@ -45,8 +44,6 @@ class LLMEngine:
         self.config = config
         Sequence.block_size = config.kvcache_block_size 
 
-        assert config.kvcache_block_size >= (
-            2 * config.speculate_k + 2), "ERROR: support for block size < 2*k+2 is not implemented"
         assert config.num_gpus > 1 or not config.draft_async, "ERROR: draft_async requires at least 2 gpus"
             
         # Check that target and draft are from the same family
@@ -83,7 +80,12 @@ class LLMEngine:
             init_q = ctx.Queue()
             draft_rank = config.num_gpus - 1
             self.draft_ps = ctx.Process(
-                target=DraftRunner, args=(config, draft_rank, init_q))
+                target=DraftRunner, args=(
+                    DraftRunner.create_draft_config(config),
+                    draft_rank,
+                    init_q,
+                ),
+            )
             self.draft_ps.start()
             print(
                 f'Draft runner created on rank {draft_rank} (async)!', flush=True)
@@ -190,11 +192,13 @@ class LLMEngine:
         self.scheduler.add(seq)
 
 
-    def step(self, step: InferenceStep):
+    def step(self, step: InferenceStep, step_num: int):
         t = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
-        ttl_tokens = step.prefill(seqs) if is_prefill else step.decode(seqs)
-
+        ttl_tokens = (
+            step.prefill(seqs, step_num=step_num) if is_prefill else
+            step.decode(seqs, step_num=step_num)
+        )
         time_taken = perf_counter() - t
 
         if is_prefill:
@@ -325,8 +329,6 @@ class LLMEngine:
         use_tqdm: bool = True,
         stream_callback=None,
     ) -> list[str]:
-        for k in METRICS:
-            METRICS[k] = [] if isinstance(METRICS[k], list) else 0
 
         if use_tqdm:
             pbar = tqdm(total=len(prompts),
@@ -349,7 +351,7 @@ class LLMEngine:
                 )
             i += 1
             t = perf_counter()
-            output = self.step(inference_step)
+            output = self.step(inference_step, i - 1)
             time_taken = perf_counter() - t
             METRICS["target_step_times"].append(time_taken)
 
