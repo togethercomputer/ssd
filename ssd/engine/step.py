@@ -18,11 +18,11 @@ class InferenceStep(ABC):
         self.scheduler = scheduler
 
     @abstractmethod
-    def decode(self, seqs: list[Sequence]) -> int:
+    def prefill(self, seqs: list[Sequence], step_num: int = 0) -> int:
         pass
 
     @abstractmethod
-    def prefill(self, seqs: list[Sequence]) -> int:
+    def decode(self, seqs: list[Sequence], step_num: int = 0) -> int:
         pass
 
 
@@ -33,7 +33,7 @@ class AutoRegressiveStep(InferenceStep):
         self.model_runner = model_runner
         self.tokenizer = tokenizer
 
-    def step(self, seqs: list[Sequence], is_prefill: bool) -> int:
+    def step(self, seqs: list[Sequence], is_prefill: bool, step_num: int = 0) -> int:
         if __debug__:
             print(f'[auto_regressive_step] is_prefill={is_prefill}', flush=True)
 
@@ -46,11 +46,11 @@ class AutoRegressiveStep(InferenceStep):
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         return len(seqs) if not is_prefill else sum(len(seq) for seq in seqs)
 
-    def prefill(self, seqs: list[Sequence]) -> int:
-        return self.step(seqs, is_prefill=True)
+    def prefill(self, seqs: list[Sequence], step_num: int = 0) -> int:
+        return self.step(seqs, is_prefill=True, step_num=step_num)
 
-    def decode(self, seqs: list[Sequence]) -> int:
-        return self.step(seqs, is_prefill=False)
+    def decode(self, seqs: list[Sequence], step_num: int = 0) -> int:
+        return self.step(seqs, is_prefill=False, step_num=step_num)
 
 
 class SpecDecodeStep(InferenceStep):
@@ -71,15 +71,24 @@ class SpecDecodeStep(InferenceStep):
         self.tokenizer = tokenizer
         self.async_spec = async_spec
 
-    def prefill(self, seqs: list[Sequence]) -> int:
+    def prefill(self, seqs: list[Sequence], step_num: int = 0) -> int:
         # When doing async speculation and not Eagle, we can do draft and target prefills in parallel.
-        if not self.eagle and self.async_spec:
-            empty_verify_result = VerifyResult([], [], None)
-            self.speculator.prefill(seqs, empty_verify_result)
-            verify_result = self.verifier.prefill(seqs, eagle=False)
-        else:
-            verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
-            self.speculator.prefill(seqs, verify_result)
+        # TEMPORARY: Disable prefill optimization of running draft and target prefills in parallel.
+        # if not self.eagle and self.async_spec:
+        #     empty_verify_result = VerifyResult([], [], None)
+        #     self.speculator.prefill(seqs, empty_verify_result)
+        #     verify_result = self.verifier.prefill(seqs, eagle=False)
+        # else:
+        if __debug__:
+            print(f"[SpecDecodeStep] Verifier prefill {step_num}", flush=True)
+        verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
+
+        if __debug__:
+            print(f"[SpecDecodeStep] Speculator prefill {step_num}", flush=True)
+        self.speculator.prefill(seqs, verify_result)
+
+        if __debug__:
+            print(f"[SpecDecodeStep] Prefill {step_num} complete", flush=True)
 
         for seq in seqs:
             assert seq.recovery_token_id is not None
@@ -88,7 +97,7 @@ class SpecDecodeStep(InferenceStep):
 
         return sum(len(seq) for seq in seqs)
 
-    def decode(self, seqs: list[Sequence]) -> int:
+    def decode(self, seqs: list[Sequence], step_num: int = 0) -> int:
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         if _prof:
             torch.cuda.synchronize()
@@ -115,12 +124,12 @@ class SpecDecodeStep(InferenceStep):
 
         if __debug__:
             speculations = speculate_result.speculations
-            print(f"[SpecDecodeStep] speculations: {speculations}", flush=True)
+            print(f"[SpecDecodeStep] speculations {step_num}: {speculations}", flush=True)
             speculations_list = speculations.tolist()
 
             for i, speculation in enumerate(speculations_list):
                 decoded_tokens = decode_tokens(speculation, self.tokenizer)
-                print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
+                print(f"[SpecDecodeStep] speculation {step_num},{i}: {decoded_tokens}", flush=True)
 
         #### STEP 2: VERIFY ####
         out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
@@ -134,7 +143,7 @@ class SpecDecodeStep(InferenceStep):
             new_suffixes = out_verify_result.new_suffixes
             for i, new_suffix in enumerate(new_suffixes):
                 decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
-                print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
+                print(f"[SpecDecodeStep] verification {step_num},{i}: {decoded_tokens}", flush=True)
 
         # Restore original seq state before postprocess (undo speculate + verify modifications)
         for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):

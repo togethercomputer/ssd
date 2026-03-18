@@ -40,4 +40,4 @@ if __name__ == '__main__':
 
     outputs, _ = llm.generate(["The capital city of France is"], sampling_params)
 
-    print(outputs)
+    print(outputs[0]["text"])
