@@ -1,10 +1,10 @@
 from datetime import datetime
+from dataclasses import dataclass
 import os
 import torch
 import torch.distributed as dist
 
 from ssd.engine.sequence import Sequence
-from ssd.utils.async_helpers.nccl_pack import send_int64, recv_int64
 
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 _nccl_tokenizer = None
@@ -12,6 +12,34 @@ _nccl_tokenizer = None
 
 def _ts():
     return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+
+@dataclass
+class PrefillRequest:
+    cmd: torch.Tensor
+    metadata: torch.Tensor
+    input_ids: torch.Tensor
+    num_tokens: torch.Tensor
+    draft_block_table: torch.Tensor
+    eagle_acts: torch.Tensor
+
+
+@dataclass
+class SpeculationRequest:
+    cmd: torch.Tensor
+    meta: torch.Tensor
+    cache_keys: torch.Tensor
+    num_tokens: torch.Tensor
+    block_tables: torch.Tensor
+    temps: torch.Tensor
+
+
+@dataclass
+class SpeculationResponse:
+    speculations: torch.Tensor
+    logits_q: torch.Tensor
+    cache_hits: torch.Tensor
+
 
 
 def _get_nccl_tokenizer():
@@ -46,6 +74,40 @@ def _decode_id_list(ids_tensor):
     return [tok.decode([t]) for t in ids]
 
 
+def concat_tensors_as_int64(*tensors: torch.Tensor) -> torch.Tensor:
+    """Concatenate tensors into a single flat int64 payload."""
+    parts = []
+    for t in tensors:
+        if t is None:
+            continue
+        if t.dtype != torch.int64:
+            t = t.to(torch.int64)
+        parts.append(t.reshape(-1))
+    if not parts:
+        return torch.empty(0, dtype=torch.int64)
+    return torch.cat(parts, dim=0)
+
+
+def receive_tensor(tensor: torch.Tensor, async_pg: dist.ProcessGroup, draft_runner_rank: int, name: str | None = None) -> torch.Tensor:
+    name_str = f" (name={name})" if name else ""
+    if NCCL_LOG:
+        print(f"[{_ts()}] [NCCL_LOG RECV_TENSOR] RECEIVING TENSOR{name_str}", flush=True)
+    
+    dist.recv(tensor, src=draft_runner_rank, group=async_pg)
+    if NCCL_LOG:
+        print(f"[{_ts()}] [NCCL_LOG RECV_TENSOR] TENSOR RECEIVED{name_str}", flush=True)
+    return tensor
+
+
+def send_tensor(tensor: torch.Tensor, async_pg: dist.ProcessGroup, draft_runner_rank: int, name: str | None = None):
+    name_str = f" (name={name})" if name else ""
+    if NCCL_LOG:
+        print(f"[{_ts()}] [NCCL_LOG SEND_TENSOR] SENDING TENSOR{name_str}", flush=True)
+    dist.send(tensor, dst=draft_runner_rank, group=async_pg)
+    if NCCL_LOG:
+        print(f"[{_ts()}] [NCCL_LOG SEND_TENSOR] TENSOR SENT{name_str}", flush=True)
+
+
 def send_speculation_request(
     cmd: torch.Tensor,
     meta: torch.Tensor,
@@ -72,16 +134,10 @@ def send_speculation_request(
         print(f"[{_ts()}] [NCCL_LOG SEND_SPEC] block_tables shape={block_tables.shape}, values={block_tables.tolist()}", flush=True)
         print(f"[{_ts()}] [NCCL_LOG SEND_SPEC] temps={temps.tolist()}", flush=True)
         print(f"[{_ts()}] {sep}\n", flush=True)
-    dist.send(cmd, dst=draft_runner_rank, group=async_pg)
-    dist.send(meta, dst=draft_runner_rank, group=async_pg)
-    send_int64(
-        async_pg,
-        draft_runner_rank,
-        cache_keys,
-        num_tokens,
-        block_tables.to(torch.int64),
-        temps,
-    )
+    send_tensor(cmd, async_pg, draft_runner_rank, name="speculation request cmd")
+    send_tensor(meta, async_pg, draft_runner_rank, name="speculation request metadata")
+    fused_payload = concat_tensors_as_int64(cache_keys, num_tokens, block_tables, temps)
+    send_tensor(fused_payload, async_pg, draft_runner_rank, name="speculation request fused payload")
 
 
 def receive_speculation_response(
@@ -94,11 +150,11 @@ def receive_speculation_response(
     skip_logits: bool = False,
 ):
     # Receive response into pre-allocated buffers
-    dist.recv(fused_response, src=draft_runner_rank, group=async_pg)
+    fused_response = receive_tensor(fused_response, async_pg, draft_runner_rank, name="fused speculation response")
     cache_hits = fused_response[:B]
     speculations = fused_response[B:].view(B, K)
     if not skip_logits:
-        dist.recv(logits_q, src=draft_runner_rank, group=async_pg)
+        logits_q = receive_tensor(logits_q, async_pg, draft_runner_rank, name="speculation response logits")
     if NCCL_LOG:
         sep = '=' * 80
         print(f"[{_ts()}] \n{sep}", flush=True)
@@ -152,17 +208,12 @@ def send_prefill_request(
         print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
         print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] eagle_acts={'None' if eagle_acts is None else f'shape={eagle_acts.shape}'}", flush=True)
         print(f"[{_ts()}] {sep}\n", flush=True)
-    dist.send(cmd, dst=draft_runner_rank, group=draft_process_group)
-    dist.send(metadata, dst=draft_runner_rank, group=draft_process_group)
-    send_int64(
-        draft_process_group,
-        draft_runner_rank,
-        input_ids,
-        num_tokens,
-        draft_block_table.to(torch.int64),
-    )
+    send_tensor(cmd, draft_process_group, draft_runner_rank, name="prefill request cmd")
+    send_tensor(metadata, draft_process_group, draft_runner_rank, name="prefill request metadata")
+    fused_payload = concat_tensors_as_int64(input_ids, num_tokens, draft_block_table)
+    send_tensor(fused_payload, draft_process_group, draft_runner_rank, name="prefill request fused payload")
     if eagle_acts is not None:
-        dist.send(eagle_acts, dst=draft_runner_rank, group=draft_process_group)
+        send_tensor(eagle_acts, draft_process_group, draft_runner_rank, name="prefill request eagle acts")
 
 
 def prepare_prefill_payload(

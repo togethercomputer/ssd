@@ -9,8 +9,8 @@ from ssd.engine.model_runner import ModelRunner
 from ssd.config import Config
 from ssd.utils.context import set_context, reset_context
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
-from ssd.utils.async_helpers.nccl_pack import recv_int64
 from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
+from ssd.engine.helpers.runner_helpers import receive_tensor, send_tensor
 
 PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
@@ -43,6 +43,8 @@ class DraftRunner(ModelRunner):
         self.is_draft = True # this is is_draft, use self.config.draft for the draft model path 
         self.prev_num_tokens = None
         super().__init__(self.draft_cfg, rank=rank, event=None, is_draft=True, num_tp_gpus=1, init_q=init_q)
+        self._prefill_metadata = torch.empty(5, dtype=torch.int64, device=self.device)
+        self._decode_metadata = torch.empty(4, dtype=torch.int64, device=self.device)
         
         if self.config.use_eagle:
             assert self.config.jit_speculate, \
@@ -62,9 +64,8 @@ class DraftRunner(ModelRunner):
             print(f'[{_ts()}] [draft_async_prefill] DRAFT ASYNC PREFILL STARTING', flush=True)
 
         # 1) Receive metadata then individual tensors
-        # First recv metadata to learn sizes
-        metadata = torch.zeros(5, dtype=torch.int64, device=self.device)
-        dist.recv(metadata, src=0, group=self.async_pg)
+        # First receive prefill metadata to learn sizes
+        metadata = receive_tensor(self._prefill_metadata, self.async_pg, 0, name="prefill metadata")
         total_new_tokens, batch_size, max_blocks, use_eagle, eagle_act_dim = metadata.tolist()
         if use_eagle:
             assert eagle_act_dim == 3 * self.config.d_model_target, (
@@ -75,7 +76,8 @@ class DraftRunner(ModelRunner):
 
         # 2) receive fused int64 payload (input_ids + num_tokens + draft_block_table)
         fused_total = total_new_tokens + batch_size + batch_size * max_blocks
-        fused = recv_int64(self.async_pg, src=0, total_length=fused_total, device=self.device)
+        fused = torch.empty(fused_total, dtype=torch.int64, device=self.device)
+        fused = receive_tensor(fused, self.async_pg, 0, name="fused int64 prefill payload")
         off = 0
         input_ids = fused[off:off + total_new_tokens]
         off += total_new_tokens
@@ -87,10 +89,10 @@ class DraftRunner(ModelRunner):
 
         eagle_acts = None
         if use_eagle:
-            eagle_acts = torch.zeros(
+            eagle_acts = torch.empty(
                 total_new_tokens, eagle_act_dim, dtype=self.hf_config.torch_dtype, device=self.device,
             )
-            dist.recv(eagle_acts, src=0, group=self.async_pg)
+            eagle_acts = receive_tensor(eagle_acts, self.async_pg, 0, name="eagle acts")
 
         if NCCL_LOG:
             sep = '=' * 80
@@ -137,8 +139,7 @@ class DraftRunner(ModelRunner):
     def _reset_tree_cache_tensors(self):
         """Reset tensor-backed tree cache to empty."""
         # initialize as empty keys on correct device; tokens/logits set to None until first populate
-        self.tree_cache_keys = torch.zeros(
-            (0, 3), dtype=torch.int64, device=self.device)
+        self.tree_cache_keys = torch.empty(0, 3, dtype=torch.int64, device=self.device)
         self.tree_cache_tokens = None
         self.tree_cache_logits = None
         self.tree_cache_activations = None
@@ -224,14 +225,14 @@ class DraftRunner(ModelRunner):
         V = self.hf_config.vocab_size
 
         # Init miss slots with valid random logits so token IDs are in-vocab (fixes B>1 crash)
-        out_logits = torch.empty((B, K, V), dtype=self.hf_config.torch_dtype, device=self.device).uniform_()
+        out_logits = torch.empty(B, K, V, dtype=self.hf_config.torch_dtype, device=self.device).uniform_()
         out_tokens = out_logits.argmax(dim=-1)
-        cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
+        cache_hits = torch.empty(B, dtype=torch.int64, device=self.device)
 
         assert request_keys.shape == (B, 3), f"ERROR in hit_cache_and_respond: request_keys should be (B, 3), got {request_keys.shape}"
         
         hidden_size = self.hf_config.hidden_size
-        out_activations = torch.zeros(
+        out_activations = torch.empty(
             B, K, hidden_size,
             dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
@@ -321,13 +322,18 @@ class DraftRunner(ModelRunner):
 
     def _service_spec_request(self):
         """Receives a speculation request, serves it from cache, and sends results back in a single response."""
-        meta = self.recv_tensor((4,), torch.int64)
+        if NCCL_LOG:
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] RECEIVING SPECULATION REQUEST META", flush=True)
+        meta = torch.empty(4, dtype=torch.int64, device=self.device)
+        meta = receive_tensor(meta, self.async_pg, 0, name="speculation request metadata")
         B, K, _, max_blocks = meta.tolist()
+        if NCCL_LOG:
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] SPECULATION REQUEST META RECEIVED, B={B}, K={K}, max_blocks={max_blocks}", flush=True)
 
         # Receive all request payload in one fused int64 burst (includes temperatures encoded as int64)
         fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
-        fused_req = recv_int64(self.async_pg, src=0,
-                               total_length=fused_total, device=self.device)
+        fused_req = torch.empty(fused_total, dtype=torch.int64, device=self.device)
+        fused_req = receive_tensor(fused_req, self.async_pg, 0, name="fused int64 speculation request payload")
         off = 0
         cache_keys = fused_req[off:off + (3 * B)].view(B, 3)
         off += 3 * B
@@ -356,7 +362,7 @@ class DraftRunner(ModelRunner):
             print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] temperatures={temperatures.tolist()}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
 
-        target_recovery_activations = torch.zeros(
+        target_recovery_activations = torch.empty(
             B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
 
@@ -365,21 +371,21 @@ class DraftRunner(ModelRunner):
         extend_token_ids = None
 
         if self.config.use_eagle:
-            dist.recv(target_recovery_activations, src=0, group=self.async_pg)
+            target_recovery_activations = receive_tensor(target_recovery_activations, self.async_pg, 0, name="target recovery activations")
 
             # Receive extend data for fused glue decode
             act_dim = 3 * self.config.d_model_target
-            extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
-            extend_eagle_acts = torch.zeros(B, K, act_dim, dtype=self.hf_config.torch_dtype, device=self.device)
-            extend_token_ids = torch.zeros(B, K, dtype=torch.int64, device=self.device)
-            dist.recv(extend_counts, src=0, group=self.async_pg)
-            dist.recv(extend_eagle_acts, src=0, group=self.async_pg)
-            dist.recv(extend_token_ids, src=0, group=self.async_pg)
+            extend_counts = torch.empty(B, dtype=torch.int64, device=self.device)
+            extend_eagle_acts = torch.empty(B, K, act_dim, dtype=self.hf_config.torch_dtype, device=self.device)
+            extend_token_ids = torch.empty(B, K, dtype=torch.int64, device=self.device)
+            extend_counts = receive_tensor(extend_counts, self.async_pg, 0, name="extend counts")
+            extend_eagle_acts = receive_tensor(extend_eagle_acts, self.async_pg, 0, name="extend eagle acts")
+            extend_token_ids = receive_tensor(extend_token_ids, self.async_pg, 0, name="extend token ids")
 
             if self.config.verbose:
-                print(f"[{_ts()}] [CACHE REQUEST] target_recovery_activations.shape={target_recovery_activations.shape}, {target_recovery_activations.tolist()}", flush=True)
+                print(f"[{_ts()}] [CACHE REQUEST] target_recovery_activations.shape={target_recovery_activations.shape}", flush=True)
                 print(f"[{_ts()}] [CACHE REQUEST] extend_counts.shape={extend_counts.shape}, {extend_counts.tolist()}", flush=True)
-                print(f"[{_ts()}] [CACHE REQUEST] extend_eagle_acts.shape={extend_eagle_acts.shape}, {extend_eagle_acts.tolist()}", flush=True)
+                print(f"[{_ts()}] [CACHE REQUEST] extend_eagle_acts.shape={extend_eagle_acts.shape}", flush=True)
                 print(f"[{_ts()}] [CACHE REQUEST] extend_token_ids.shape={extend_token_ids.shape}, {extend_token_ids.tolist()}", flush=True)
                 recovery_tokens_target = cache_keys[:, 2].clone()
                 print(f"[{_ts()}] \n{'='*80}", flush=True)
@@ -422,9 +428,9 @@ class DraftRunner(ModelRunner):
                 print(f"[{_ts()}]            decoded={spec_text}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
 
-        dist.send(fused_response, dst=0, group=self.async_pg)
+        send_tensor(fused_response, self.async_pg, 0, name="fused response")
         if not self.config.skip_return_logits:
-            dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
+            send_tensor(out_logits[:, :K, :].contiguous(), self.async_pg, 0, name="out logits")
 
         partial_tree_decode_args = {
             "num_tokens": num_tokens,
@@ -452,7 +458,7 @@ class DraftRunner(ModelRunner):
         """
         B = num_tokens.shape[0]
         total = num_tokens.sum().item()
-        cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens_q = torch.empty(B + 1, dtype=torch.int32, device=self.device)
         cu_seqlens_q[1:] = torch.cumsum(num_tokens, dim=0)
         batch_indices = torch.arange(B, device=self.device, dtype=torch.int64).repeat_interleave(num_tokens)
         positions = torch.arange(total, device=self.device, dtype=torch.int64) - cu_seqlens_q[:-1].to(torch.int64).repeat_interleave(num_tokens)
@@ -501,7 +507,7 @@ class DraftRunner(ModelRunner):
 
         context_lens = (num_tokens + pos_offset + K).to(torch.int32)
         seqlen_q = torch.full((B,), K + 1, dtype=torch.int32, device=self.device)
-        cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens_q = torch.empty(B + 1, dtype=torch.int32, device=self.device)
         cu_seqlens_q[1:] = torch.cumsum(seqlen_q, dim=0)
 
         return {
@@ -605,7 +611,7 @@ class DraftRunner(ModelRunner):
             B = partial_tree_decode_args["num_tokens"].shape[0]
             extend_counts = partial_tree_decode_args.get("extend_counts")
             if extend_counts is None:
-                extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
+                extend_counts = torch.empty(B, dtype=torch.int64, device=self.device)
             extend_eagle_acts_batch = partial_tree_decode_args.get("extend_eagle_acts")
             extend_token_ids_batch = partial_tree_decode_args.get("extend_token_ids")
             target_acts = partial_tree_decode_args["target_recovery_activations"]
@@ -619,13 +625,13 @@ class DraftRunner(ModelRunner):
 
             # Variable per-seq lengths: n_ext[b] + K + 1
             seqlens_q = (extend_counts + K + 1).to(torch.int32)
-            cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+            cu_seqlens_q = torch.empty(B + 1, dtype=torch.int32, device=self.device)
             cu_seqlens_q[1:] = torch.cumsum(seqlens_q, 0)
             total_real = int(cu_seqlens_q[-1].item())
 
             # Build packed fused_ids and fused_hs (no padding, no for loops)
-            fused_ids = torch.zeros(total_real, dtype=torch.int64, device=self.device)
-            fused_hs = torch.zeros(total_real, hidden_size, dtype=self.hf_config.torch_dtype, device=self.device)
+            fused_ids = torch.empty(total_real, dtype=torch.int64, device=self.device)
+            fused_hs = torch.empty(total_real, hidden_size, dtype=self.hf_config.torch_dtype, device=self.device)
 
             # Per-token batch index and local offset
             batch_idx = torch.repeat_interleave(torch.arange(B, device=self.device), seqlens_q)
@@ -838,12 +844,12 @@ class DraftRunner(ModelRunner):
         B, K, F, N = payload["metadata_ints"]
 
         V = self.hf_config.vocab_size  # Draft returns full target vocab size after d2t expansion
-        spec_tokens = torch.zeros(
-            (N, K), dtype=torch.int64, device=self.device)
-        spec_logits = torch.zeros(
-            (N, K, V), dtype=self.hf_config.torch_dtype, device=self.device)
-        spec_activations = torch.zeros(
-            (N, K, self.hf_config.hidden_size),
+        spec_tokens = torch.empty(
+            N, K, dtype=torch.int64, device=self.device)
+        spec_logits = torch.empty(
+            N, K, V, dtype=self.hf_config.torch_dtype, device=self.device)
+        spec_activations = torch.empty(
+            N, K, self.hf_config.hidden_size,
             dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
 
@@ -956,7 +962,7 @@ class DraftRunner(ModelRunner):
     def _draft_loop_inner(self):
         while True:
             # 1) Wait for the next command (may be PREFILL, SPEC_REQUEST, or EXIT)
-            cmd = self.recv_cmd()
+            cmd = receive_tensor(self._cmd, self.async_pg, 0, name="cmd")
 
             # PREFILL: run the draft prefill and then loop back
             if cmd == 1:

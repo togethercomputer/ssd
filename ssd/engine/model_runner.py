@@ -1,6 +1,7 @@
 
 import pickle
 import time
+from datetime import datetime
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -19,7 +20,9 @@ from ssd.utils.loader import load_model
 from ssd.engine.helpers.runner_helpers import (
     prepare_decode_tensors_from_seqs, 
     prepare_block_tables_from_seqs, 
-    prepare_prefill_tensors_from_seqs
+    prepare_prefill_tensors_from_seqs,
+    receive_tensor,
+    send_tensor,
 )
 from ssd.engine.helpers.cudagraph_helpers import (
     run_verify_cudagraph,
@@ -32,7 +35,12 @@ from ssd.engine.helpers.cudagraph_helpers import (
     capture_glue_decode_cudagraph,
 )
 from ssd.engine.helpers.mask_helpers import get_custom_mask
-    
+
+NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
+
+def _ts():
+    return f'[[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}]]'
+
 
 class ModelRunner:
 
@@ -48,7 +56,7 @@ class ModelRunner:
                     print(f"Warning: Draft dtype {config.draft_hf_config.torch_dtype} differs from target {config.hf_config.torch_dtype}. Casting draft to {config.hf_config.torch_dtype}.")
                 config.draft_hf_config.torch_dtype = config.hf_config.torch_dtype
             assert (config.draft_hf_config.vocab_size == config.hf_config.vocab_size) or config.use_eagle, "ERROR in ModelRunner: draft_hf_config.vocab_size != hf_config.vocab_size"
-        
+
         self.hf_config = config.hf_config if not is_draft else config.draft_hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
@@ -86,7 +94,9 @@ class ModelRunner:
         self._exiting = False 
         
         torch.cuda.set_device(self.rank)
-        self.device = torch.device(f'cuda:{self.rank}') 
+        self.device = torch.device(f'cuda:{self.rank}')
+        self._cmd = torch.empty(1, dtype=torch.int64, device=self.device)
+
         
         # cudagraph logic for FlashInfer kernels, need diff wrapper for each batch size we make a graph for 
         if is_draft and config.draft_async:
@@ -268,7 +278,7 @@ class ModelRunner:
                 # Cross-node: receive kv_cache_size from target so draft
                 # allocates the same number of KV cache blocks.
                 kv_buf = torch.empty(1, dtype=torch.int64, device=self.device)
-                dist.recv(kv_buf, src=0, group=self.async_pg)
+                kv_buf = receive_tensor(kv_buf, self.async_pg, 0, name="target kv_cache_size")
                 target_kv_cache_size = kv_buf.item()
                 print(f'[model_runner] Received target kv_cache_size={target_kv_cache_size} via NCCL', flush=True)
                 if target_kv_cache_size > 0:
@@ -325,7 +335,7 @@ class ModelRunner:
         elif self.is_draft and self.draft_async and hasattr(self, 'async_pg'):
             # Cross-node mode: no mp.Queue available, signal readiness via NCCL.
             ready_buf = torch.tensor([self.config.num_kvcache_blocks], dtype=torch.int64, device=self.device)
-            dist.send(ready_buf, dst=0, group=self.async_pg)
+            send_tensor(ready_buf, self.async_pg, 0, name="num_kvcache_blocks")
             print(f'[model_runner] Cross-node init: sent num_kvcache_blocks={self.config.num_kvcache_blocks} via NCCL', flush=True)
 
         return model_type
@@ -405,16 +415,6 @@ class ModelRunner:
             self.call(method_name, *args)
             if method_name == "exit":
                 break
-
-    def recv_cmd(self):
-        t = torch.empty(1, dtype=torch.int64, device=self.device)
-        dist.recv(t, src=0, group=self.async_pg)
-        return int(t.item())
-
-    def recv_tensor(self, shape, dtype=torch.int64):
-        t = torch.empty(shape, dtype=dtype, device=self.device)
-        dist.recv(t, src=0, group=self.async_pg)
-        return t
     
     def send_draft_exit_signal(self):
         """
@@ -425,20 +425,29 @@ class ModelRunner:
             return
         try:
             cmd = torch.tensor([2], dtype=torch.int64, device=self.device)
-            dist.send(cmd, dst=self.draft_rank, group=self.async_pg)
+            send_tensor(cmd, self.async_pg, self.draft_rank, name="draft exit signal")
         except Exception:
+            if NCCL_LOG:
+                print(f"[{_ts()}] [NCCL_LOG SEND_DRAFT_EXIT_SIGNAL] ERROR SENDING DRAFT EXIT SIGNAL", flush=True)
             pass
 
     def _wait_for_cmd(self, handle_entry):
         """Waits for a command, using the provided handle if available."""
         if handle_entry:
+            if NCCL_LOG:
+                print(f"[{_ts()}] [NCCL_LOG WAIT_FOR_CMD] WAITING FOR CMD", flush=True)
+
             work_handle, cmd_tensor = handle_entry
             # block until the irecv completes and the buffer is filled
             work_handle.wait()
-            return int(cmd_tensor.item()), None
+            cmd = int(cmd_tensor.item())
+            if NCCL_LOG:
+                print(f"[{_ts()}] [NCCL_LOG WAIT_FOR_CMD] CMD RECEIVED: {cmd}", flush=True)
         else:
             # no pending irecv, fall back to the normal recv path
-            return self.recv_cmd(), None
+            cmd = receive_tensor(self._cmd, self.async_pg, 0, name="cmd")
+
+        return cmd, None
 
     def read_shm(self):
         assert self.world_size > 1 and self.rank

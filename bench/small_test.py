@@ -22,6 +22,7 @@ if __name__ == '__main__':
     parser.add_argument("--jit-speculate", action="store_true")
     parser.add_argument("--num-gpus", type=int, default=2)
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--chat-template", action="store_true")
     args = parser.parse_args()
 
     if args.eagle:
@@ -29,6 +30,7 @@ if __name__ == '__main__':
         args.model = llama_70b_path
         args.num_gpus = 5
         args.jit_speculate = True
+        args.chat_template = True
 
     llm = LLM(
         model=args.model,
@@ -43,14 +45,17 @@ if __name__ == '__main__':
     )
     sampling_params = [SamplingParams(temperature=0.0, max_new_tokens=64, ignore_eos=args.ignore_eos)]
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    tokens = tokenizer.apply_chat_template(
-        [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "What is the capital city of France?"}],
-        add_generation_prompt=True,
-    )
-    token_str = tokenizer.decode(tokens)
-    print(f"Generating response to prompt: {token_str}")
+    if args.chat_template:
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokens = tokenizer.apply_chat_template(
+            [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "What is the capital city of France?"}],
+            add_generation_prompt=True,
+        )
+        token_str = tokenizer.decode(tokens)
+        print(f"Generating response to prompt: {token_str}")
+        outputs, _ = llm.generate([tokens], sampling_params)
 
-    outputs, _ = llm.generate([tokens], sampling_params)
+    else:
+        outputs, _ = llm.generate(["The capital city of France is"], sampling_params)
 
     print(outputs[0]["text"])
