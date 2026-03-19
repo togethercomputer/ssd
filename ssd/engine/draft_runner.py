@@ -227,7 +227,7 @@ class DraftRunner(ModelRunner):
         # Init miss slots with valid random logits so token IDs are in-vocab (fixes B>1 crash)
         out_logits = torch.empty(B, K, V, dtype=self.hf_config.torch_dtype, device=self.device).uniform_()
         out_tokens = out_logits.argmax(dim=-1)
-        cache_hits = torch.empty(B, dtype=torch.int64, device=self.device)
+        cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
 
         assert request_keys.shape == (B, 3), f"ERROR in hit_cache_and_respond: request_keys should be (B, 3), got {request_keys.shape}"
         
@@ -375,7 +375,7 @@ class DraftRunner(ModelRunner):
 
             # Receive extend data for fused glue decode
             act_dim = 3 * self.config.d_model_target
-            extend_counts = torch.empty(B, dtype=torch.int64, device=self.device)
+            extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
             extend_eagle_acts = torch.empty(B, K, act_dim, dtype=self.hf_config.torch_dtype, device=self.device)
             extend_token_ids = torch.empty(B, K, dtype=torch.int64, device=self.device)
             extend_counts = receive_tensor(extend_counts, self.async_pg, 0, name="extend counts")
@@ -458,7 +458,7 @@ class DraftRunner(ModelRunner):
         """
         B = num_tokens.shape[0]
         total = num_tokens.sum().item()
-        cu_seqlens_q = torch.empty(B + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
         cu_seqlens_q[1:] = torch.cumsum(num_tokens, dim=0)
         batch_indices = torch.arange(B, device=self.device, dtype=torch.int64).repeat_interleave(num_tokens)
         positions = torch.arange(total, device=self.device, dtype=torch.int64) - cu_seqlens_q[:-1].to(torch.int64).repeat_interleave(num_tokens)
@@ -507,7 +507,7 @@ class DraftRunner(ModelRunner):
 
         context_lens = (num_tokens + pos_offset + K).to(torch.int32)
         seqlen_q = torch.full((B,), K + 1, dtype=torch.int32, device=self.device)
-        cu_seqlens_q = torch.empty(B + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
         cu_seqlens_q[1:] = torch.cumsum(seqlen_q, dim=0)
 
         return {
@@ -611,7 +611,7 @@ class DraftRunner(ModelRunner):
             B = partial_tree_decode_args["num_tokens"].shape[0]
             extend_counts = partial_tree_decode_args.get("extend_counts")
             if extend_counts is None:
-                extend_counts = torch.empty(B, dtype=torch.int64, device=self.device)
+                extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
             extend_eagle_acts_batch = partial_tree_decode_args.get("extend_eagle_acts")
             extend_token_ids_batch = partial_tree_decode_args.get("extend_token_ids")
             target_acts = partial_tree_decode_args["target_recovery_activations"]
@@ -625,7 +625,7 @@ class DraftRunner(ModelRunner):
 
             # Variable per-seq lengths: n_ext[b] + K + 1
             seqlens_q = (extend_counts + K + 1).to(torch.int32)
-            cu_seqlens_q = torch.empty(B + 1, dtype=torch.int32, device=self.device)
+            cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
             cu_seqlens_q[1:] = torch.cumsum(seqlens_q, 0)
             total_real = int(cu_seqlens_q[-1].item())
 
