@@ -10,7 +10,7 @@ from ssd.config import Config
 from ssd.utils.context import set_context, reset_context
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
 from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
-from ssd.engine.helpers.runner_helpers import receive_tensor, send_tensor
+from ssd.engine.helpers.runner_helpers import receive_tensor, send_tensor, PrefillRequest, SpeculationRequest, SpeculationResponse
 
 PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
@@ -45,6 +45,7 @@ class DraftRunner(ModelRunner):
         super().__init__(self.draft_cfg, rank=rank, event=None, is_draft=True, num_tp_gpus=1, init_q=init_q)
         self._prefill_metadata = torch.empty(5, dtype=torch.int64, device=self.device)
         self._decode_metadata = torch.empty(4, dtype=torch.int64, device=self.device)
+        self.target_rank = 0
         
         if self.config.use_eagle:
             assert self.config.jit_speculate, \
@@ -63,36 +64,12 @@ class DraftRunner(ModelRunner):
         if self.config.verbose:
             print(f'[{_ts()}] [draft_async_prefill] DRAFT ASYNC PREFILL STARTING', flush=True)
 
-        # 1) Receive metadata then individual tensors
-        # First receive prefill metadata to learn sizes
-        metadata = receive_tensor(self._prefill_metadata, self.async_pg, 0, name="prefill metadata")
-        total_new_tokens, batch_size, max_blocks, use_eagle, eagle_act_dim = metadata.tolist()
-        if use_eagle:
-            assert eagle_act_dim == 3 * self.config.d_model_target, (
-                f"EAGLE activation dimension {eagle_act_dim} does not match expected dimension 3 * {self.config.d_model_target}"
-            )
-        if self.config.verbose:
-            print(f'[{_ts()}] [draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, batch_size={batch_size}, max_blocks={max_blocks}, use_eagle={use_eagle}, eagle_act_dim={eagle_act_dim}', flush=True)
-
-        # 2) receive fused int64 payload (input_ids + num_tokens + draft_block_table)
-        fused_total = total_new_tokens + batch_size + batch_size * max_blocks
-        fused = torch.empty(fused_total, dtype=torch.int64, device=self.device)
-        fused = receive_tensor(fused, self.async_pg, 0, name="fused int64 prefill payload")
-        off = 0
-        input_ids = fused[off:off + total_new_tokens]
-        off += total_new_tokens
-        num_tokens = fused[off:off + batch_size]
-        off += batch_size
-        draft_block_table = fused[off:off + batch_size * max_blocks].view(batch_size, max_blocks).to(torch.int32)
-        off += batch_size * max_blocks
-        assert off == fused_total
-
-        eagle_acts = None
-        if use_eagle:
-            eagle_acts = torch.empty(
-                total_new_tokens, eagle_act_dim, dtype=self.hf_config.torch_dtype, device=self.device,
-            )
-            eagle_acts = receive_tensor(eagle_acts, self.async_pg, 0, name="eagle acts")
+        prefill_request = PrefillRequest.receive(self.async_pg, self.target_rank, self.device, metadata_buffer=self._prefill_metadata)
+        total_new_tokens, batch_size, max_blocks, use_eagle, eagle_act_dim = prefill_request.metadata.tolist()
+        input_ids = prefill_request.input_ids
+        num_tokens = prefill_request.num_tokens
+        draft_block_table = prefill_request.draft_block_table
+        eagle_acts = prefill_request.eagle_acts
 
         if NCCL_LOG:
             sep = '=' * 80
@@ -105,6 +82,14 @@ class DraftRunner(ModelRunner):
             print(f"[{_ts()}] {sep}\n", flush=True)
 
         prefill_ctxt = self.prepare_prefill_ctxt(num_tokens, draft_block_table)
+
+        if use_eagle:
+            assert eagle_act_dim == 3 * self.config.d_model_target, (
+                f"EAGLE activation dimension {eagle_act_dim} does not match expected dimension 3 * {self.config.d_model_target}"
+            )
+        if self.config.verbose:
+            print(f'[{_ts()}] [draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, batch_size={batch_size}, max_blocks={max_blocks}, use_eagle={use_eagle}, eagle_act_dim={eagle_act_dim}', flush=True)
+
 
         # 5) set up context exactly like prepare_prefill() does:
         set_context(
@@ -324,81 +309,24 @@ class DraftRunner(ModelRunner):
         """Receives a speculation request, serves it from cache, and sends results back in a single response."""
         if NCCL_LOG:
             print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] RECEIVING SPECULATION REQUEST META", flush=True)
-        meta = torch.empty(4, dtype=torch.int64, device=self.device)
-        meta = receive_tensor(meta, self.async_pg, 0, name="speculation request metadata")
-        B, K, _, max_blocks = meta.tolist()
-        if NCCL_LOG:
-            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] SPECULATION REQUEST META RECEIVED, B={B}, K={K}, max_blocks={max_blocks}", flush=True)
 
-        # Receive all request payload in one fused int64 burst (includes temperatures encoded as int64)
-        fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
-        fused_req = torch.empty(fused_total, dtype=torch.int64, device=self.device)
-        fused_req = receive_tensor(fused_req, self.async_pg, 0, name="fused int64 speculation request payload")
-        off = 0
-        cache_keys = fused_req[off:off + (3 * B)].view(B, 3)
-        off += 3 * B
-        seq_ids = cache_keys[:, 0]
-        num_tokens = fused_req[off:off + B].to(torch.int64)
-        off += B
-        draft_block_tables = fused_req[off:off + B *
-                                       max_blocks].view(B, max_blocks).to(torch.int32)
-        off += B * max_blocks
-        temps_as_int64 = fused_req[off:off + B]
-        off += B
-        assert off == fused_total
-        temperatures = temps_as_int64.to(torch.int32).view(torch.float32)
+        speculation_request = SpeculationRequest.receive(
+            async_pg=self.async_pg,
+            target_rank=self.target_rank,
+            device=self.device,
+            draft_dtype=self.hf_config.torch_dtype,
+            tokenizer=self.tokenizer,
+            verbose=self.config.verbose,
+        )
 
-        if NCCL_LOG:
-            sep = '=' * 80
-            print(f"[{_ts()}] \n{sep}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] meta=[B={B}, K={K}]", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] cache_keys shape={cache_keys.shape}", flush=True)
-            for i in range(B):
-                seq_id, accept_len, verified_id = cache_keys[i].tolist()
-                verified_text = self.tokenizer.decode([int(verified_id)])
-                print(f"[{_ts()}]   req[{i}]: seq_id={seq_id}, accept_len={accept_len}, verified_id={int(verified_id)} ('{verified_text}')", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] num_tokens={num_tokens.tolist()}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] draft_block_tables shape={draft_block_tables.shape}, values={draft_block_tables.tolist()}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] temperatures={temperatures.tolist()}", flush=True)
-            print(f"[{_ts()}] {sep}\n", flush=True)
-
-        target_recovery_activations = torch.empty(
-            B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
-        ) if self.config.use_eagle else None
-
-        extend_counts = None
-        extend_eagle_acts = None
-        extend_token_ids = None
-
-        if self.config.use_eagle:
-            target_recovery_activations = receive_tensor(target_recovery_activations, self.async_pg, 0, name="target recovery activations")
-
-            # Receive extend data for fused glue decode
-            act_dim = 3 * self.config.d_model_target
-            extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
-            extend_eagle_acts = torch.empty(B, K, act_dim, dtype=self.hf_config.torch_dtype, device=self.device)
-            extend_token_ids = torch.empty(B, K, dtype=torch.int64, device=self.device)
-            extend_counts = receive_tensor(extend_counts, self.async_pg, 0, name="extend counts")
-            extend_eagle_acts = receive_tensor(extend_eagle_acts, self.async_pg, 0, name="extend eagle acts")
-            extend_token_ids = receive_tensor(extend_token_ids, self.async_pg, 0, name="extend token ids")
-
-            if self.config.verbose:
-                print(f"[{_ts()}] [CACHE REQUEST] target_recovery_activations.shape={target_recovery_activations.shape}", flush=True)
-                print(f"[{_ts()}] [CACHE REQUEST] extend_counts.shape={extend_counts.shape}, {extend_counts.tolist()}", flush=True)
-                print(f"[{_ts()}] [CACHE REQUEST] extend_eagle_acts.shape={extend_eagle_acts.shape}", flush=True)
-                print(f"[{_ts()}] [CACHE REQUEST] extend_token_ids.shape={extend_token_ids.shape}, {extend_token_ids.tolist()}", flush=True)
-                recovery_tokens_target = cache_keys[:, 2].clone()
-                print(f"[{_ts()}] \n{'='*80}", flush=True)
-                print(f"[{_ts()}] [CACHE REQUEST] Batch size: {B}, Spec depth: {K}", flush=True)
-                for i in range(B):
-                    seq_id = cache_keys[i, 0].item()
-                    keep_idx = cache_keys[i, 1].item()
-                    rec_token_target = recovery_tokens_target[i].item()
-                    rec_token_text = self.tokenizer.decode([rec_token_target])
-                    n_ext = extend_counts[i].item()
-                    print(f"[{_ts()}]   Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}'), n_ext={n_ext}", flush=True)
-                print(f"[{_ts()}] {'='*80}\n", flush=True)
-
+        B, K, _, _, _ = speculation_request.metadata.tolist()
+        cache_keys, num_tokens, draft_block_tables, temperatures, target_recovery_activations = (
+            speculation_request.cache_keys,
+            speculation_request.num_tokens,
+            speculation_request.block_tables,
+            speculation_request.temps,
+            speculation_request.recovery_activations,
+        )
         out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
             cache_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations)
 
@@ -428,22 +356,22 @@ class DraftRunner(ModelRunner):
                 print(f"[{_ts()}]            decoded={spec_text}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
 
-        send_tensor(fused_response, self.async_pg, 0, name="fused response")
+        send_tensor(fused_response, self.async_pg, self.target_rank, name="fused response")
         if not self.config.skip_return_logits:
-            send_tensor(out_logits[:, :K, :].contiguous(), self.async_pg, 0, name="out logits")
+            send_tensor(out_logits[:, :K, :].contiguous(), self.async_pg, self.target_rank, name="out logits")
 
         partial_tree_decode_args = {
             "num_tokens": num_tokens,
-            "seq_ids": seq_ids,
+            "seq_ids": speculation_request.cache_keys[:, 0],
             "temperatures": temperatures,
             "dbt": draft_block_tables,
             "cache_hits": cache_hits,
             "returned_tokens": out_tokens,
             "target_recovery_activations": target_recovery_activations,
             "previous_activations": out_activations,
-            "extend_counts": extend_counts,
-            "extend_eagle_acts": extend_eagle_acts,
-            "extend_token_ids": extend_token_ids,
+            "extend_counts": speculation_request.extend_counts,
+            "extend_eagle_acts": speculation_request.extend_activations,
+            "extend_token_ids": speculation_request.extend_token_ids,
         }
 
         return glue_decode_input_ids, partial_tree_decode_args
@@ -962,7 +890,7 @@ class DraftRunner(ModelRunner):
     def _draft_loop_inner(self):
         while True:
             # 1) Wait for the next command (may be PREFILL, SPEC_REQUEST, or EXIT)
-            cmd = receive_tensor(self._cmd, self.async_pg, 0, name="cmd")
+            cmd = receive_tensor(self._cmd, self.async_pg, self.target_rank, name="cmd")
 
             # PREFILL: run the draft prefill and then loop back
             if cmd == 1:

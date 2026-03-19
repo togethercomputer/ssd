@@ -285,6 +285,8 @@ class LLMEngine:
                     draft_dtype=config.draft_hf_config.torch_dtype,
                     kvcache_block_size=config.kvcache_block_size,
                     max_model_len=config.max_model_len,
+                    eagle=config.use_eagle,
+                    eagle_act_dim=3 * config.hf_config.hidden_size if config.use_eagle else 0,
                     async_pg=self.model_runner.async_pg,
                     draft_runner_rank=self.num_tp_gpus,
                     tokenizer=self.tokenizer,
