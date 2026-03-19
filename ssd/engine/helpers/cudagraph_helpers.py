@@ -373,7 +373,7 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         False, -1,
     ]
     if wrapper._backend == "fa2":
-        plan_args.extend([-1, False])
+        plan_args.extend([-1, False, 0])
     wrapper._plan_info = wrapper._cached_module.plan(*plan_args)
 
     if PROFILE_DRAFT:
