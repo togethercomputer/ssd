@@ -171,8 +171,11 @@ class SpeculationRequest:
         self.metadata = torch.tensor([B, K, self.max_blocks, self.eagle_act_dim, self.vocab_size], dtype=torch.int64, device=self.device)
         self.cache_keys = torch.empty(B, 3, dtype=torch.int64, device=self.device)
         self.num_tokens = torch.empty(B, dtype=torch.int64, device=self.device)
-        self.temps = torch.empty(B, dtype=torch.float32, device=self.device)
-        self.block_tables = torch.full((B, self.max_blocks), -1, dtype=torch.int32, device=self.device)
+        self.temps = torch.zeros(B, dtype=torch.float32, device=self.device)
+        if self.max_blocks > 0:
+            self.block_tables = torch.full((B, self.max_blocks), -1, dtype=torch.int32, device=self.device)
+        else:
+            self.block_tables = None
         if self.eagle:
             self.recovery_activations = torch.empty(B, self.eagle_act_dim, dtype=self.draft_dtype, device=self.device)
             self.extend_activations = torch.empty(B, K, self.eagle_act_dim, dtype=self.draft_dtype, device=self.device)
@@ -184,10 +187,10 @@ class SpeculationRequest:
             self.extend_counts = None
             self.extend_token_ids = None
 
-    def maybe_update_buffers(self, batch_size: int):
+    def maybe_update_buffers(self, batch_size: int, max_blocks: int = -1):
         if batch_size != self.batch_size:
             self.batch_size = batch_size
-            self._alloc_buffers()
+            self._alloc_buffers(max_blocks=max_blocks)
 
     def send(self, async_pg: dist.ProcessGroup, draft_rank: int):
         send_tensor(self.cmd, async_pg, draft_rank, name="speculation request cmd")
