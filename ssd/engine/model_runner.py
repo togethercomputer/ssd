@@ -18,6 +18,7 @@ from ssd.layers.sampler import Sampler
 from ssd.utils.context import set_context, reset_context, get_context
 from ssd.utils.loader import load_model
 from ssd.engine.helpers.runner_helpers import (
+    COMMAND,
     prepare_decode_tensors_from_seqs, 
     prepare_block_tables_from_seqs, 
     prepare_prefill_tensors_from_seqs,
@@ -431,7 +432,7 @@ class ModelRunner:
                 print(f"[{_ts()}] [NCCL_LOG SEND_DRAFT_EXIT_SIGNAL] ERROR SENDING DRAFT EXIT SIGNAL", flush=True)
             pass
 
-    def _wait_for_cmd(self, handle_entry):
+    def _wait_for_cmd(self, handle_entry=None):
         """Waits for a command, using the provided handle if available."""
         if handle_entry:
             if NCCL_LOG:
@@ -440,14 +441,14 @@ class ModelRunner:
             work_handle, cmd_tensor = handle_entry
             # block until the irecv completes and the buffer is filled
             work_handle.wait()
-            cmd = int(cmd_tensor.item())
-            if NCCL_LOG:
-                print(f"[{_ts()}] [NCCL_LOG WAIT_FOR_CMD] CMD RECEIVED: {cmd}", flush=True)
         else:
             # no pending irecv, fall back to the normal recv path
-            cmd = receive_tensor(self._cmd, self.async_pg, 0, name="cmd")
+            cmd_tensor = receive_tensor(self._cmd, self.async_pg, 0, name="cmd")
 
-        return cmd, None
+        command = COMMAND(cmd_tensor.item())
+        if NCCL_LOG:
+            print(f"[{_ts()}] [NCCL_LOG WAIT_FOR_CMD] CMD RECEIVED: {command}", flush=True)
+        return command, None
 
     def read_shm(self):
         assert self.world_size > 1 and self.rank

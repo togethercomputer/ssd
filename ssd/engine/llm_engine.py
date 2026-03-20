@@ -243,35 +243,48 @@ class LLMEngine:
                 print(
                     f"[metrics] Avg target verify time (ms): {sum(METRICS['target_verify_times']) * 1000 / len(METRICS['target_verify_times']):.2f}", flush=True)
             if self.config.draft_async:
-                print(
-                    f"[metrics] Avg Cache Hits: {sum(METRICS['cache_hits']) / len(METRICS['cache_hits']):.2f}", flush=True)
-                # Log separate metrics for cache hits
-                if METRICS['accepted_suffix_lens_on_hit']:
-                    avg_suffix_len_on_hit = sum(
-                        METRICS['accepted_suffix_lens_on_hit']) / len(METRICS['accepted_suffix_lens_on_hit'])
-                    print(
-                        f"[metrics] Avg Tokens per step on Cache Hit: {avg_suffix_len_on_hit:.2f}", flush=True)
-                    
-                    # Calculate empirical frequencies of accepted_suffix_lens_on_hit - 1
-                    adjusted_lens = [length - 1 for length in METRICS['accepted_suffix_lens_on_hit']]
-                    total_count = len(adjusted_lens)
-                    freq_counts = {}
-                    for length in adjusted_lens:
-                        freq_counts[length] = freq_counts.get(length, 0) + 1
-                    
-                    # Print normalized empirical probabilities for range [0, K]
-                    print(f"[metrics] Empirical frequencies of accepted_suffix_lens_on_hit - 1:", flush=True)
-                    for k in range(self.config.speculate_k + 1):
-                        prob = freq_counts.get(k, 0) / total_count
-                        print(f"  {k}: {prob:.3f}", flush=True)
-                if METRICS['accepted_suffix_lens_on_miss']:
-                    avg_suffix_len_on_miss = sum(
-                        METRICS['accepted_suffix_lens_on_miss']) / len(METRICS['accepted_suffix_lens_on_miss'])
-                    print(
-                        f"[metrics] Avg Tokens per step on Cache Miss: {avg_suffix_len_on_miss:.2f}", flush=True)
+                if METRICS['accepted_suffix_lens_with_recovery']:
+                    print(f"[metrics] Avg Tokens per step (incl recovery): {sum(METRICS['accepted_suffix_lens_with_recovery']) / len(METRICS['accepted_suffix_lens_with_recovery']):.2f}", flush=True)
+                else:
+                    print(f"[metrics] Avg Tokens per step (incl recovery): N/A (THIS MAY INDICATE A BUG)", flush=True)
+
+                if not self.config.communicate_cache_hits:
+                    # TODO: Compute these metrics on the draft side?
+                    print(f"Skipping metrics based on cache hits vs misses because communicate_cache_hits is False", flush=True)
                 else:
                     print(
-                        f"[metrics] Avg Tokens per step on Cache Hit: N/A (no cache hits)", flush=True)
+                        f"[metrics] Avg Cache Hits: {sum(METRICS['cache_hits']) / len(METRICS['cache_hits']):.2f}", flush=True)
+                    # Log separate metrics for cache hits
+                    if METRICS['accepted_suffix_lens_on_hit']:
+                        avg_suffix_len_on_hit = sum(
+                            METRICS['accepted_suffix_lens_on_hit']) / len(METRICS['accepted_suffix_lens_on_hit'])
+                        print(
+                            f"[metrics] Avg Tokens per step on Cache Hit: {avg_suffix_len_on_hit:.2f}", flush=True)
+
+                        # Calculate empirical frequencies of accepted_suffix_lens_on_hit - 1
+                        adjusted_lens = [length - 1 for length in METRICS['accepted_suffix_lens_on_hit']]
+                        total_count = len(adjusted_lens)
+                        freq_counts = {}
+                        for length in adjusted_lens:
+                            freq_counts[length] = freq_counts.get(length, 0) + 1
+
+                        # Print normalized empirical probabilities for range [0, K]
+                        print(f"[metrics] Empirical frequencies of accepted_suffix_lens_on_hit - 1:", flush=True)
+                        for k in range(self.config.speculate_k + 1):
+                            prob = freq_counts.get(k, 0) / total_count
+                            print(f"  {k}: {prob:.3f}", flush=True)
+                    else:
+                        print(
+                            f"[metrics] Avg Tokens per step on Cache Hit: N/A (no cache hits)", flush=True)
+
+                    if METRICS['accepted_suffix_lens_on_miss']:
+                        avg_suffix_len_on_miss = sum(
+                            METRICS['accepted_suffix_lens_on_miss']) / len(METRICS['accepted_suffix_lens_on_miss'])
+                        print(
+                            f"[metrics] Avg Tokens per step on Cache Miss: {avg_suffix_len_on_miss:.2f}", flush=True)
+                    else:
+                        print(
+                            f"[metrics] Avg Tokens per step on Cache Miss: N/A (no cache misses)", flush=True)
 
     def create_inference_step(self, config: Config) -> InferenceStep:
         if config.speculate:
@@ -287,6 +300,8 @@ class LLMEngine:
                     max_model_len=config.max_model_len,
                     eagle=config.use_eagle,
                     eagle_act_dim=3 * config.hf_config.hidden_size if config.use_eagle else 0,
+                    communicate_logits=config.communicate_logits,
+                    communicate_cache_hits=config.communicate_cache_hits,
                     async_pg=self.model_runner.async_pg,
                     draft_runner_rank=self.num_tp_gpus,
                     tokenizer=self.tokenizer,

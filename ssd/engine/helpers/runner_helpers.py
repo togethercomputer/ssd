@@ -1,6 +1,7 @@
 from datetime import datetime
 from dataclasses import dataclass
 import os
+import enum
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
@@ -12,6 +13,12 @@ NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 
 def _ts():
     return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+@enum.unique
+class COMMAND(enum.IntEnum):
+    PREFILL = 0
+    SPECULATION = 1
+    DRAFT_EXIT = 2
 
 
 @dataclass
@@ -54,9 +61,9 @@ class PrefillRequest:
             metadata_buffer[:] = metadata
 
         if cmd_buffer is None:
-            cmd_buffer = torch.tensor([1], dtype=torch.int64, device=device)
+            cmd_buffer = torch.tensor([COMMAND.PREFILL], dtype=torch.int64, device=device)
         else:
-            cmd_buffer[0] = 1
+            cmd_buffer[0] = COMMAND.PREFILL
 
         prefill_request = cls(
             cmd=cmd_buffer,
@@ -66,8 +73,7 @@ class PrefillRequest:
             draft_block_table=draft_block_table,
             eagle_acts=eagle_acts,
         )
-        if tokenizer is not None:
-            prefill_request.tokenizer = tokenizer
+        prefill_request.tokenizer = tokenizer
         return prefill_request
 
     def send(self, async_pg: dist.ProcessGroup, draft_rank: int):
@@ -82,12 +88,12 @@ class PrefillRequest:
             print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] draft_block_table shape={self.draft_block_table.shape}, values={self.draft_block_table.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] eagle_acts={'None' if self.eagle_acts is None else f'shape={self.eagle_acts.shape}'}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
-        send_tensor(self.cmd, async_pg, draft_rank, name="prefill request cmd")
-        send_tensor(self.metadata, async_pg, draft_rank, name="prefill request metadata")
+        send_tensor(self.cmd, async_pg, draft_rank, name="cmd", prefix="[TARGET:PrefillRequest.send]")
+        send_tensor(self.metadata, async_pg, draft_rank, name="metadata", prefix="[TARGET:PrefillRequest.send]")
         fused_payload = concat_tensors_as_int64(self.input_ids, self.num_tokens, self.draft_block_table)
-        send_tensor(fused_payload, async_pg, draft_rank, name="prefill request fused payload")
+        send_tensor(fused_payload, async_pg, draft_rank, name="fused payload", prefix="[TARGET:PrefillRequest.send]")
         if self.eagle_acts is not None:
-            send_tensor(self.eagle_acts, async_pg, draft_rank, name="prefill request eagle acts")
+            send_tensor(self.eagle_acts, async_pg, draft_rank, name="eagle acts", prefix="[TARGET:PrefillRequest.send]")
 
     @classmethod
     def receive(cls, async_pg: dist.ProcessGroup, target_rank: int, device: torch.device, metadata_buffer: torch.Tensor=None, eagle_act_dtype: torch.dtype=torch.bfloat16):
@@ -97,13 +103,13 @@ class PrefillRequest:
         if metadata_buffer is None:
             metadata_buffer = torch.empty(5, dtype=torch.int64, device=device)
 
-        metadata = receive_tensor(metadata_buffer, async_pg, target_rank, name="prefill metadata")
+        metadata = receive_tensor(metadata_buffer, async_pg, target_rank, name="metadata", prefix="[DRAFT:PrefillRequest.receive]")
         total_new_tokens, batch_size, max_blocks, use_eagle, eagle_act_dim = metadata.tolist()
 
         # 2) receive fused int64 payload (input_ids + num_tokens + draft_block_table)
         fused_total = total_new_tokens + batch_size + batch_size * max_blocks
         fused = torch.empty(fused_total, dtype=torch.int64, device=device)
-        fused = receive_tensor(fused, async_pg, target_rank, name="fused int64 prefill payload")
+        fused = receive_tensor(fused, async_pg, target_rank, name="fused payload", prefix="[DRAFT:PrefillRequest.receive]")
         off = 0
         input_ids = fused[off:off + total_new_tokens]
         off += total_new_tokens
@@ -118,7 +124,7 @@ class PrefillRequest:
             eagle_acts = torch.empty(
                 total_new_tokens, eagle_act_dim, dtype=eagle_act_dtype, device=device,
             )
-            eagle_acts = receive_tensor(eagle_acts, async_pg, target_rank, name="eagle acts")
+            eagle_acts = receive_tensor(eagle_acts, async_pg, target_rank, name="eagle acts", prefix="[DRAFT:PrefillRequest.receive]")
 
         return cls(
             cmd=None,
@@ -130,6 +136,7 @@ class PrefillRequest:
         )
 
 
+@dataclass
 class SpeculationRequest:
     cmd: torch.Tensor | None
     metadata: torch.Tensor
@@ -142,8 +149,9 @@ class SpeculationRequest:
     extend_counts: torch.Tensor | None
     extend_token_ids: torch.Tensor | None
 
-    def __init__(
-        self,
+    @classmethod
+    def prepare(
+        cls,
         batch_size: int,
         lookahead: int,
         max_blocks: int,
@@ -154,20 +162,22 @@ class SpeculationRequest:
         eagle_act_dim: int = 0,
         tokenizer: AutoTokenizer = None,
     ):
-        self.batch_size = batch_size
-        self.lookahead = lookahead
-        self.max_blocks = max_blocks
-        self.vocab_size = vocab_size
-        self.draft_dtype = draft_dtype
-        self.eagle = eagle
-        self.eagle_act_dim = eagle_act_dim
-        self.device = device
-        self.tokenizer = tokenizer
-        self._alloc_buffers()
+        speculation_request = cls(*([None] * 10))
+        speculation_request.batch_size = batch_size
+        speculation_request.lookahead = lookahead
+        speculation_request.max_blocks = max_blocks
+        speculation_request.vocab_size = vocab_size
+        speculation_request.draft_dtype = draft_dtype
+        speculation_request.eagle = eagle
+        speculation_request.eagle_act_dim = eagle_act_dim
+        speculation_request.device = device
+        speculation_request.tokenizer = tokenizer
+        speculation_request._alloc_buffers()
+        return speculation_request
 
     def _alloc_buffers(self):
         B, K = self.batch_size, self.lookahead
-        self.cmd = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self.cmd = torch.tensor([COMMAND.SPECULATION], dtype=torch.int64, device=self.device)
         self.metadata = torch.tensor([B, K, self.max_blocks, self.eagle_act_dim, self.vocab_size], dtype=torch.int64, device=self.device)
         self.cache_keys = torch.empty(B, 3, dtype=torch.int64, device=self.device)
         self.num_tokens = torch.empty(B, dtype=torch.int64, device=self.device)
@@ -193,31 +203,31 @@ class SpeculationRequest:
             self._alloc_buffers(max_blocks=max_blocks)
 
     def send(self, async_pg: dist.ProcessGroup, draft_rank: int):
-        send_tensor(self.cmd, async_pg, draft_rank, name="speculation request cmd")
-        send_tensor(self.metadata, async_pg, draft_rank, name="speculation request metadata")
+        send_tensor(self.cmd, async_pg, draft_rank, name="cmd", prefix="[TARGET:SpeculationRequest.send]")
+        send_tensor(self.metadata, async_pg, draft_rank, name="metadata", prefix="[TARGET:SpeculationRequest.send]")
         fused_payload = concat_tensors_as_int64(
             self.cache_keys,
             self.num_tokens,
             self.block_tables.to(torch.int64),
             self.temps.view(torch.int32).to(torch.int64),
         )
-        send_tensor(fused_payload, async_pg, draft_rank, name="speculation request fused payload")
+        send_tensor(fused_payload, async_pg, draft_rank, name="speculation request fused payload", prefix="[TARGET:SpeculationRequest.send]")
         if self.eagle:
-            send_tensor(self.recovery_activations, async_pg, draft_rank, name="recovery activations")
-            send_tensor(self.extend_counts, async_pg, draft_rank, name="extend counts")
-            send_tensor(self.extend_activations, async_pg, draft_rank, name="extend activations")
-            send_tensor(self.extend_token_ids, async_pg, draft_rank, name="extend token ids")
+            send_tensor(self.recovery_activations, async_pg, draft_rank, name="EAGLE recovery_activations", prefix="[TARGET:SpeculationRequest.send]")
+            send_tensor(self.extend_counts, async_pg, draft_rank, name="EAGLE extend_counts", prefix="[TARGET:SpeculationRequest.send]")
+            send_tensor(self.extend_activations, async_pg, draft_rank, name="EAGLE extend_activations", prefix="[TARGET:SpeculationRequest.send]")
+            send_tensor(self.extend_token_ids, async_pg, draft_rank, name="EAGLE extend_token_ids", prefix="[TARGET:SpeculationRequest.send]")
 
     @classmethod
     def receive(cls, async_pg: dist.ProcessGroup, target_rank: int, device: torch.device, draft_dtype: torch.dtype, tokenizer: AutoTokenizer = None, verbose: bool = False):
         meta = torch.empty(5, dtype=torch.int64, device=device)
-        meta = receive_tensor(meta, async_pg, target_rank, name="speculation request metadata")
+        meta = receive_tensor(meta, async_pg, target_rank, name="metadata", prefix="[DRAFT:SpeculationRequest.receive]")
         B, K, max_blocks, eagle_act_dim, vocab_size = meta.tolist()
         if NCCL_LOG:
             print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] SPECULATION REQUEST META RECEIVED, B={B}, K={K}, max_blocks={max_blocks}", flush=True)
 
         eagle = eagle_act_dim > 0
-        speculation_request = cls(
+        speculation_request = cls.prepare(
             batch_size=B,
             lookahead=K,
             max_blocks=max_blocks,
@@ -232,7 +242,7 @@ class SpeculationRequest:
         # Receive all request payload in one fused int64 burst (includes temperatures encoded as int64)
         fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
         fused_req = torch.empty(fused_total, dtype=torch.int64, device=device)
-        fused_req = receive_tensor(fused_req, async_pg, target_rank, name="fused int64 speculation request payload")
+        fused_req = receive_tensor(fused_req, async_pg, target_rank, name="fused payload", prefix="[DRAFT:SpeculationRequest.receive]")
         off = 0
         speculation_request.cache_keys = fused_req[off:off + (3 * B)].view(B, 3)
         off += 3 * B
@@ -266,10 +276,10 @@ class SpeculationRequest:
             print(f"[{_ts()}] {sep}\n", flush=True)
 
         if eagle:
-            target_recovery_activations = receive_tensor(speculation_request.recovery_activations, async_pg, target_rank, name="target recovery activations")
-            extend_counts = receive_tensor(speculation_request.extend_counts, async_pg, target_rank, name="extend counts")
-            extend_eagle_acts = receive_tensor(speculation_request.extend_activations, async_pg, target_rank, name="extend eagle acts")
-            extend_token_ids = receive_tensor(speculation_request.extend_token_ids, async_pg, target_rank, name="extend token ids")
+            target_recovery_activations = receive_tensor(speculation_request.recovery_activations, async_pg, target_rank, name="EAGLE recovery_activations", prefix="[DRAFT:SpeculationRequest.receive]")
+            extend_counts = receive_tensor(speculation_request.extend_counts, async_pg, target_rank, name="EAGLE extend_counts", prefix="[DRAFT:SpeculationRequest.receive]")
+            extend_eagle_acts = receive_tensor(speculation_request.extend_activations, async_pg, target_rank, name="EAGLE extend_activations", prefix="[DRAFT:SpeculationRequest.receive]")
+            extend_token_ids = receive_tensor(speculation_request.extend_token_ids, async_pg, target_rank, name="EAGLE extend_token_ids", prefix="[DRAFT:SpeculationRequest.receive]")
 
             if verbose:
                 print(f"[{_ts()}] [CACHE REQUEST] target_recovery_activations.shape={target_recovery_activations.shape}", flush=True)
@@ -300,41 +310,89 @@ class SpeculationResponse:
     logits_q: torch.Tensor | None
     cache_hits: torch.Tensor | None
 
-    def __init__(
-        self,
+    @classmethod
+    def prepare(
+        cls,
         lookahead: int,
-        vocab_size: int,
         device: torch.device,
+        draft_dtype: torch.dtype = torch.bfloat16,
+        batch_size: int = 1,
+        vocab_size: int = -1,
         communicate_logits: bool = False,
         communicate_cache_hits: bool = False,
         tokenizer: AutoTokenizer = None,
     ):
-        self.batch_size = 1
-        self.lookahead = lookahead
-        self.vocab_size = vocab_size
-        self.device = device
-        self.communicate_logits = communicate_logits
-        self.communicate_cache_hits = communicate_cache_hits
-        self.tokenizer = tokenizer
-        self._alloc_buffers()
+        response = cls(
+            speculations=None,
+            logits_q=None,
+            cache_hits=None,
+        )
+        response.batch_size = batch_size
+        response.lookahead = lookahead
+        response.draft_dtype = draft_dtype
+        response.device = device
+        response.vocab_size = vocab_size
+        response.communicate_logits = communicate_logits
+        response.communicate_cache_hits = communicate_cache_hits
+        response.tokenizer = tokenizer
+        response._alloc_buffers()
+        return response
 
     def _alloc_buffers(self):
         self.speculations = torch.empty(self.batch_size, self.lookahead, dtype=torch.int64, device=self.device)
-        if self.communicate_logits:
+        if getattr(self, 'communicate_logits', False):
             self.logits_q = torch.empty(self.batch_size, self.lookahead, self.vocab_size, dtype=self.draft_dtype, device=self.device)
-        else:
-            self.logits_q = None
-        if self.communicate_cache_hits:
-            self.cache_hits = torch.empty(self.batch_size, dtype=torch.int64, device=self.device)
-        else:
-            self.cache_hits = None
+        if getattr(self, 'communicate_cache_hits', False):
+            self.cache_hits = torch.zeros(self.batch_size, dtype=torch.int64, device=self.device)
 
-    def send(self):
-        pass
+    def maybe_update_buffers(self, batch_size: int = -1):
+        if batch_size > 0 and batch_size != self.batch_size:
+            self.batch_size = batch_size
+            self._alloc_buffers()
+
+    def send(self, async_pg: dist.ProcessGroup, target_rank: int):
+        send_tensor(self.speculations, async_pg, target_rank, name="speculations", prefix="[DRAFT:SpeculationResponse.send]")
+        if self.logits_q is not None:
+            assert getattr(self, 'communicate_logits', True), "logits_q is not None but communicate_logits is False"
+            send_tensor(self.logits_q, async_pg, target_rank, name="logits", prefix="[DRAFT:SpeculationResponse.send]")
+        if self.cache_hits is not None:
+            assert getattr(self, 'communicate_cache_hits', True), "cache_hits is not None but communicate_cache_hits is False"
+            send_tensor(self.cache_hits, async_pg, target_rank, name="cache hits", prefix="[DRAFT:SpeculationResponse.send]")
 
     @classmethod
-    def receive(cls, receive_logits: bool = True, receive_cache_hits: bool = True):
-        pass
+    def receive(
+        cls,
+        async_pg: dist.ProcessGroup,
+        draft_rank: int,
+        batch_size: int,
+        lookahead: int,
+        device: torch.device,
+        draft_dtype: torch.dtype = torch.bfloat16,
+        receive_logits: bool = False,
+        receive_cache_hits: bool = False,
+        vocab_size: int = -1,
+        tokenizer: AutoTokenizer = None,
+    ):
+        speculation_response = cls.prepare(
+            batch_size=batch_size,
+            lookahead=lookahead,
+            device=device,
+            draft_dtype=draft_dtype,
+            communicate_logits=receive_logits,
+            communicate_cache_hits=receive_cache_hits,
+            vocab_size=vocab_size,
+            tokenizer=tokenizer,
+        )
+        speculation_response.receive(async_pg, draft_rank, batch_size=batch_size)
+        return speculation_response
+
+    def receive(self, async_pg: dist.ProcessGroup, draft_rank: int, batch_size: int=-1):
+        self.maybe_update_buffers(batch_size=batch_size)
+        self.speculations = receive_tensor(self.speculations, async_pg, draft_rank, name="speculations", prefix="[TARGET:SpeculationResponse.receive]")
+        if self.communicate_logits:
+            self.logits_q = receive_tensor(self.logits_q, async_pg, draft_rank, name="logits", prefix="[TARGET:SpeculationResponse.receive]")
+        if self.communicate_cache_hits:
+            self.cache_hits = receive_tensor(self.cache_hits, async_pg, draft_rank, name="cache hits", prefix="[TARGET:SpeculationResponse.receive]")
 
 
 def _decode_ids(ids_tensor, tokenizer: AutoTokenizer = None):
@@ -344,15 +402,6 @@ def _decode_ids(ids_tensor, tokenizer: AutoTokenizer = None):
     if isinstance(ids, int):
         ids = [ids]
     return tokenizer.decode(ids)
-
-
-def _decode_id_list(ids_tensor, tokenizer: AutoTokenizer = None):
-    if tokenizer is None:
-        return []
-    ids = ids_tensor.cpu().tolist()
-    if isinstance(ids, int):
-        ids = [ids]
-    return [tokenizer.decode([t]) for t in ids]
 
 
 def concat_tensors_as_int64(*tensors: torch.Tensor) -> torch.Tensor:
@@ -369,55 +418,52 @@ def concat_tensors_as_int64(*tensors: torch.Tensor) -> torch.Tensor:
     return torch.cat(parts, dim=0)
 
 
-def receive_tensor(tensor: torch.Tensor, async_pg: dist.ProcessGroup, draft_runner_rank: int, name: str | None = None) -> torch.Tensor:
-    name_str = f" (name={name})" if name else ""
+def receive_tensor(
+    tensor: torch.Tensor,
+    async_pg: dist.ProcessGroup,
+    draft_runner_rank: int,
+    name: str = "",
+    prefix: str = "",
+    print_shape: bool = True,
+    print_values: bool = False,
+) -> torch.Tensor:
     if NCCL_LOG:
-        print(f"[{_ts()}] [NCCL_LOG RECV_TENSOR] RECEIVING TENSOR{name_str}", flush=True)
+        tensor_str = name
+        if print_shape:
+            tensor_str += (", " if tensor_str else "") + f"shape={tensor.shape}"
+        print(f"[{_ts()}][NCCL:START_RECEIVE_TENSOR]{prefix} {tensor_str}", flush=True)
     
     dist.recv(tensor, src=draft_runner_rank, group=async_pg)
+
     if NCCL_LOG:
-        print(f"[{_ts()}] [NCCL_LOG RECV_TENSOR] TENSOR RECEIVED{name_str}", flush=True)
+        if print_values:
+            tensor_str += (", " if tensor_str else "") + f"values={tensor.tolist()}"
+        print(f"[{_ts()}][NCCL:END_RECEIVE_TENSOR]{prefix} {tensor_str}", flush=True)
+
     return tensor
 
 
-def send_tensor(tensor: torch.Tensor, async_pg: dist.ProcessGroup, draft_runner_rank: int, name: str | None = None):
-    name_str = f" (name={name})" if name else ""
-    if NCCL_LOG:
-        print(f"[{_ts()}] [NCCL_LOG SEND_TENSOR] SENDING TENSOR{name_str}", flush=True)
-    dist.send(tensor, dst=draft_runner_rank, group=async_pg)
-    if NCCL_LOG:
-        print(f"[{_ts()}] [NCCL_LOG SEND_TENSOR] TENSOR SENT{name_str}", flush=True)
-
-
-def receive_speculation_response(
-    B,
-    K, # Lookahead
-    fused_response: torch.Tensor,
-    logits_q: torch.Tensor,
+def send_tensor(
+    tensor: torch.Tensor,
     async_pg: dist.ProcessGroup,
     draft_runner_rank: int,
-    skip_logits: bool = False,
-    tokenizer: AutoTokenizer = None,
-):
-    # Receive response into pre-allocated buffers
-    fused_response = receive_tensor(fused_response, async_pg, draft_runner_rank, name="fused speculation response")
-    cache_hits = fused_response[:B]
-    speculations = fused_response[B:].view(B, K)
-    if not skip_logits:
-        logits_q = receive_tensor(logits_q, async_pg, draft_runner_rank, name="speculation response logits")
+    name: str = "",
+    prefix: str = "",
+    print_shape: bool = True,
+    print_values: bool = False,
+) -> None:
     if NCCL_LOG:
-        sep = '=' * 80
-        print(f"[{_ts()}] \n{sep}", flush=True)
-        print(f"[{_ts()}] [NCCL_LOG RECV_SPEC_RESP] B={B}, K={K}", flush=True)
-        print(f"[{_ts()}] [NCCL_LOG RECV_SPEC_RESP] cache_hits={cache_hits.tolist()}", flush=True)
-        for i in range(B):
-            spec_ids = speculations[i].tolist()
-            spec_text = _decode_id_list(speculations[i], tokenizer)
-            print(f"[{_ts()}]   req[{i}]: speculations={spec_ids}", flush=True)
-            print(f"[{_ts()}]            decoded={spec_text}", flush=True)
-        print(f"[{_ts()}] [NCCL_LOG RECV_SPEC_RESP] skip_logits={skip_logits}", flush=True)
-        print(f"[{_ts()}] {sep}\n", flush=True)
-    return speculations, logits_q, cache_hits
+        tensor_str = name
+        if print_shape:
+            tensor_str += (", " if tensor_str else "") + f"shape={tensor.shape}"
+        print(f"[{_ts()}][NCCL:START_SEND_TENSOR]{prefix} {tensor_str}", flush=True)
+
+    dist.send(tensor, dst=draft_runner_rank, group=async_pg)
+
+    if NCCL_LOG:
+        if print_values:
+            tensor_str += (", " if tensor_str else "") + f"values={tensor.tolist()}"
+        print(f"[{_ts()}][NCCL:END_SEND_TENSOR]{prefix} {tensor_str}", flush=True)
 
 
 def prepare_decode_tensors_from_seqs(

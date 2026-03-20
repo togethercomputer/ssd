@@ -35,7 +35,8 @@ class Config:
     jit_speculate: bool = False
     async_nccl_port: int | None = None
     async_nccl_host: str = "127.0.0.1"
-    skip_return_logits: bool = False
+    communicate_logits: bool = False
+    communicate_cache_hits: bool = False
 
     # eagle3
     use_eagle: bool = False 
@@ -81,7 +82,7 @@ class Config:
                 if self.fan_out_list_miss is None:
                     self.fan_out_list_miss = self.fan_out_list 
                 assert sum(self.fan_out_list_miss) == sum(self.fan_out_list), "ERROR in Config: fan_out_list_miss must be the same as fan_out_list"
-                
+
         if self.use_eagle:
             if self.eagle_layers is None:
                 L = self.hf_config.num_hidden_layers
@@ -103,7 +104,11 @@ class Config:
                 if target_max_pos != draft_max_pos:
                     print(f'[Config] Overriding eagle draft max_position_embeddings: {draft_max_pos} -> {target_max_pos}', flush=True)
                     self.draft_hf_config.max_position_embeddings = target_max_pos
-        
+
+        if self.sampler_x is not None and not self.communicate_cache_hits:
+            self.communicate_cache_hits = True
+            print(f'[Config] Setting communicate_cache_hits to True because sampler_x is not None', flush=True)
+
         # assert self.max_num_batched_tokens >= self.max_model_len
         if self.max_num_batched_tokens < self.max_model_len:
             print(f'[Config] Warning: max_num_batched_tokens ({self.max_num_batched_tokens}) is less than max_model_len ({self.max_model_len})', flush=True)

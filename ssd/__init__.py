@@ -20,5 +20,7 @@ from ssd.engine.helpers.runner_helpers import (
     prepare_decode_tensors_from_seqs,
     prepare_block_tables_from_seqs,
     prepare_prefill_tensors_from_seqs,
-    receive_speculation_response,
+    PrefillRequest,
+    SpeculationRequest,
+    SpeculationResponse,
 )

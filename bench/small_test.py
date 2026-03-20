@@ -23,6 +23,8 @@ if __name__ == '__main__':
     parser.add_argument("--num-gpus", type=int, default=2)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--chat-template", action="store_true")
+    parser.add_argument("--communicate-logits", action="store_true")
+    parser.add_argument("--communicate-cache-hits", action="store_true")
     args = parser.parse_args()
 
     if args.eagle:
@@ -42,6 +44,8 @@ if __name__ == '__main__':
         num_gpus=args.num_gpus,
         jit_speculate=args.jit_speculate,
         verbose=True,
+        communicate_logits=args.communicate_logits,
+        communicate_cache_hits=args.communicate_cache_hits,
     )
     sampling_params = [SamplingParams(temperature=0.0, max_new_tokens=64, ignore_eos=args.ignore_eos)]
 
