@@ -1,3 +1,4 @@
+import re
 from transformers import AutoTokenizer
 
 
@@ -22,3 +23,9 @@ def decode_tokens(token_ids: list[int], tokenizer: AutoTokenizer) -> list[str]:
         except Exception:
             decoded.append(f"<token_id:{token}>")
     return decoded
+
+
+def compress_neg_ones_and_zeros(long_str: str) -> str:
+    sub1 = re.sub(r'-1(?:, -1){2,}', '-1, ..., -1', long_str)
+    sub2 = re.sub(r'0(?:, 0){2,}', '0, ..., 0', sub1)
+    return sub2

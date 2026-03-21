@@ -443,7 +443,7 @@ class ModelRunner:
             work_handle.wait()
         else:
             # no pending irecv, fall back to the normal recv path
-            cmd_tensor = receive_tensor(self._cmd, self.async_pg, 0, name="cmd")
+            cmd_tensor = receive_tensor(self._cmd, self.async_pg, 0, name="cmd", prefix="DRAFT:wait_for_cmd")
 
         command = COMMAND(cmd_tensor.item())
         if NCCL_LOG:

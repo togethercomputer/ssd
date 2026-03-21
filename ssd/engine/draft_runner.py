@@ -8,6 +8,7 @@ import dataclasses
 from ssd.engine.model_runner import ModelRunner
 from ssd.config import Config
 from ssd.utils.context import set_context, reset_context
+from ssd.utils.misc import compress_neg_ones_and_zeros
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
 from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
 from ssd.engine.helpers.runner_helpers import PrefillRequest, SpeculationRequest, SpeculationResponse, COMMAND
@@ -34,11 +35,11 @@ class DraftRunner(ModelRunner):
             gpu_memory_utilization = (0.75 if not cfg.draft_async else 0.8), # REMAINING SPACE if not draft_async
             tokenizer_path=cfg.model if cfg.use_eagle else None,
             d_model_target=cfg.hf_config.hidden_size if cfg.use_eagle and cfg.hf_config else None,
-            enforce_eager=cfg.enforce_eager,
         )
         return draft_cfg
 
     def __init__(self, draft_cfg: Config, rank: int = 0, init_q = None):
+        print(f'[DraftRunner.__init__] draft_cfg={draft_cfg}', flush=True)
         self.draft_cfg = draft_cfg
         self.is_draft = True # this is is_draft, use self.config.draft for the draft model path 
         self.prev_num_tokens = None
@@ -79,7 +80,8 @@ class DraftRunner(ModelRunner):
             print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] input_ids shape={input_ids.shape}, values={input_ids.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] input_ids decoded='{self.tokenizer.decode(input_ids.cpu().tolist())}'", flush=True)
             print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] num_tokens={num_tokens.tolist()}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
+            draft_block_table_values_str = compress_neg_ones_and_zeros(f"{draft_block_table.tolist()}")
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table_values_str}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] eagle_acts={'None' if eagle_acts is None else f'shape={eagle_acts.shape}'}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
 
@@ -143,14 +145,16 @@ class DraftRunner(ModelRunner):
         self._arange_kp1 = torch.arange(K + 1, device=d, dtype=torch.int64)
         self._arange_2kp1 = torch.arange(2 * K + 1, device=d, dtype=torch.int64)
 
-    def jit_speculate(self, 
-                      request_keys: torch.Tensor, 
-                      num_tokens: torch.Tensor, 
-                      out_logits: torch.Tensor, 
-                      out_tokens: torch.Tensor, 
-                      temperatures: torch.Tensor, 
-                      draft_block_tables: torch.Tensor,
-                      target_recovery_activations: torch.Tensor = None):
+    def jit_speculate(
+        self,
+        request_keys: torch.Tensor,
+        num_tokens: torch.Tensor,
+        out_logits: torch.Tensor,
+        out_tokens: torch.Tensor,
+        temperatures: torch.Tensor,
+        draft_block_tables: torch.Tensor,
+        target_recovery_activations: torch.Tensor = None,
+    ):
         
         input_ids = request_keys[:, -1]
         pos_offset = -1 if self.config.use_eagle else 0
@@ -882,7 +886,11 @@ class DraftRunner(ModelRunner):
                 print(f"[{_ts()}] [draft] Target disconnected, shutting down gracefully.", flush=True)
                 self.exit()
                 return
-            raise
+            print(f"[{_ts()}] [draft] Error in draft_loop: {e}", flush=True)
+            raise e
+        except Exception as e:
+            print(f"[{_ts()}] [draft] Error in draft_loop: {e}", flush=True)
+            raise e
 
     def _draft_loop_inner(self):
         while True:
