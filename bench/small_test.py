@@ -18,13 +18,15 @@ if __name__ == '__main__':
     parser.add_argument("--model", type=str, default=llama_1b_path)
     parser.add_argument("--draft", type=str, default=llama_1b_path)
     parser.add_argument("--eagle", action="store_true")
-    parser.add_argument("--k", type=int, default=6)
+    parser.add_argument("--k", type=int, default=7)
     parser.add_argument("--jit-speculate", action="store_true")
     parser.add_argument("--num-gpus", type=int, default=2)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--chat-template", action="store_true")
     parser.add_argument("--communicate-logits", action="store_true")
     parser.add_argument("--communicate-cache-hits", action="store_true")
+    parser.add_argument("--mary", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     if args.eagle:
@@ -43,23 +45,28 @@ if __name__ == '__main__':
         draft_async=True,
         num_gpus=args.num_gpus,
         jit_speculate=args.jit_speculate,
-        verbose=True,
+        verbose=args.verbose,
         communicate_logits=args.communicate_logits,
         communicate_cache_hits=args.communicate_cache_hits,
     )
     sampling_params = [SamplingParams(temperature=0.0, max_new_tokens=64, ignore_eos=args.ignore_eos)]
 
+    if args.mary:
+            text = "Can you please tell me the lyrics to Mary had a little lamb, and can you repeat it 10 times?"
+    else:
+        text = "What is the capital city of France?"
     if args.chat_template:
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         tokens = tokenizer.apply_chat_template(
-            [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "What is the capital city of France?"}],
+            [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
             add_generation_prompt=True,
         )
         token_str = tokenizer.decode(tokens)
-        print(f"Generating response to prompt: {token_str}")
+        print(f"Generating response to prompt: '{token_str}'")
+        print(f"=============================================================")
         outputs, _ = llm.generate([tokens], sampling_params)
 
     else:
-        outputs, _ = llm.generate(["The capital city of France is"], sampling_params)
+        outputs, _ = llm.generate([text], sampling_params)
 
     print(outputs[0]["text"])
