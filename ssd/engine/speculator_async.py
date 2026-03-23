@@ -75,18 +75,17 @@ class SpeculatorAsync(SpeculatorBase):
         eagle_acts = verify_result.eagle_acts
         input_id_list = [seq.token_ids for seq in seqs]
 
-        # EAGLE token-conditioning shift: token at position j gets conditioning
-        # from target act at position j-1. Skip first token per seq and drop
-        # last eagle_act per seq so they align correctly.
+        # EAGLE/Phoenix token-conditioning shift: we duplicate the first target activation for each sequence.
+        # [t0, h0], [t1, h0], [t2, h1], [t3, h2], ...
         if eagle_acts is not None:
             sliced = []
             offset = 0
             for ids in input_id_list:
                 seq_len = len(ids)
+                sliced.append(eagle_acts[offset:offset + 1])
                 sliced.append(eagle_acts[offset:offset + seq_len - 1])
                 offset += seq_len
             eagle_acts = torch.cat(sliced, dim=0)
-            input_id_list = [ids[1:] for ids in input_id_list]
 
         max_blocks = (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
         input_ids_flat = []

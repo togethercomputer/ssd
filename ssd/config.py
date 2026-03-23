@@ -38,8 +38,9 @@ class Config:
     communicate_logits: bool = False
     communicate_cache_hits: bool = False
 
-    # eagle3
+    # eagle3 / phoenix
     use_eagle: bool = False 
+    use_phoenix: bool = False
     eagle_layers: list[int] | None = None   
     d_model_target: int | None = None
     tokenizer_path: str | None = None
@@ -52,6 +53,10 @@ class Config:
     @property
     def max_blocks(self): 
         return (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
+
+    @property
+    def use_eagle_or_phoenix(self):
+        return self.use_eagle or self.use_phoenix
 
     def __post_init__(self):
         model = self.model
@@ -79,12 +84,16 @@ class Config:
                 if self.fan_out_list is None: 
                     self.fan_out_list = [self.async_fan_out] * (self.speculate_k + 1)
                     self.MQ_LEN = sum(self.fan_out_list)
-                if self.fan_out_list_miss is None:
-                    self.fan_out_list_miss = self.fan_out_list 
+                if not self.jit_speculate:
+                    print(f'[Config] Setting fan_out_list_miss to [sum(fan_out_list)] + [0] * speculate_k because jit_speculate is False', flush=True)
+                    self.fan_out_list_miss = [sum(self.fan_out_list)] + [0] * self.speculate_k
+                elif self.fan_out_list_miss is None:
+                    self.fan_out_list_miss = self.fan_out_list
+
                 assert sum(self.fan_out_list_miss) == sum(self.fan_out_list), "ERROR in Config: fan_out_list_miss must be the same as fan_out_list"
 
-        if self.use_eagle:
-            if self.eagle_layers is None:
+        if self.use_eagle_or_phoenix:
+            if self.use_eagle and self.eagle_layers is None:
                 L = self.hf_config.num_hidden_layers
                 # self.eagle_layers = [3, L//2, L-3]
                 self.eagle_layers = [2, L//2, L-3] # [2, 16, 29] outputs, ie. [3, L//2+1, L-2] inputs
