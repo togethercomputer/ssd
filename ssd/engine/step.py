@@ -28,18 +28,19 @@ class InferenceStep(ABC):
 
 class AutoRegressiveStep(InferenceStep):
 
-    def __init__(self, scheduler: Scheduler, model_runner: ModelRunner, tokenizer: AutoTokenizer):
+    def __init__(self, scheduler: Scheduler, model_runner: ModelRunner, tokenizer: AutoTokenizer, verbose: bool = False):
         super().__init__(scheduler)
         self.model_runner = model_runner
         self.tokenizer = tokenizer
+        self.verbose = verbose
 
     def step(self, seqs: list[Sequence], is_prefill: bool, step_num: int = 0) -> int:
-        if __debug__:
+        if self.verbose:
             print(f'[auto_regressive_step] is_prefill={is_prefill}', flush=True)
 
         token_ids = self.model_runner.call("run", seqs, is_prefill)
 
-        if __debug__:
+        if self.verbose:
             decoded_tokens = decode_tokens(token_ids, self.tokenizer)
             print(f"[auto_regressive_step] generated tokens: {decoded_tokens}", flush=True)
 
@@ -63,6 +64,7 @@ class SpecDecodeStep(InferenceStep):
         eagle: bool,
         tokenizer: AutoTokenizer,
         async_spec: bool,
+        verbose: bool = False,
     ):
         super().__init__(scheduler)
         self.speculator = speculator
@@ -70,6 +72,7 @@ class SpecDecodeStep(InferenceStep):
         self.eagle = eagle
         self.tokenizer = tokenizer
         self.async_spec = async_spec
+        self.verbose = verbose
 
     def prefill(self, seqs: list[Sequence], step_num: int = 0) -> int:
         # When doing async speculation and not Eagle, we can do draft and target prefills in parallel.
@@ -79,15 +82,15 @@ class SpecDecodeStep(InferenceStep):
         #     self.speculator.prefill(seqs, empty_verify_result)
         #     verify_result = self.verifier.prefill(seqs, eagle=False)
         # else:
-        if __debug__:
+        if self.verbose:
             print(f"[SpecDecodeStep] Verifier prefill {step_num}", flush=True)
         verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
 
-        if __debug__:
+        if self.verbose:
             print(f"[SpecDecodeStep] Speculator prefill {step_num}", flush=True)
         self.speculator.prefill(seqs, verify_result)
 
-        if __debug__:
+        if self.verbose:
             print(f"[SpecDecodeStep] Prefill {step_num} complete", flush=True)
 
         for seq in seqs:
@@ -122,7 +125,7 @@ class SpecDecodeStep(InferenceStep):
             torch.cuda.synchronize()
             _t1 = perf_counter()
 
-        if __debug__:
+        if self.verbose:
             speculations = speculate_result.speculations
             print(f"[SpecDecodeStep] speculations {step_num}: {speculations}", flush=True)
             speculations_list = speculations.tolist()
@@ -138,7 +141,7 @@ class SpecDecodeStep(InferenceStep):
             torch.cuda.synchronize()
             _t2 = perf_counter()
 
-        if __debug__:
+        if self.verbose:
             recovery_tokens = out_verify_result.recovery_tokens
             new_suffixes = out_verify_result.new_suffixes
             for i, new_suffix in enumerate(new_suffixes):

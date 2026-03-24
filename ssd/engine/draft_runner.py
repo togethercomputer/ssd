@@ -15,10 +15,10 @@ from ssd.engine.helpers.runner_helpers import PrefillRequest, SpeculationRequest
 
 PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
-
+BRIEF_LOG = os.environ.get("SSD_BRIEF_LOG", "0") == "1"
 
 def _ts():
-    return f'[[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}]]'
+    return f'{datetime.now().strftime('%H:%M:%S.%f')[:-3]}'
 
 
 ttl = 0
@@ -350,7 +350,14 @@ class DraftRunner(ModelRunner):
             cache_hits=cache_hits.reshape(-1) if self.communicate_cache_hits else None,
             logits_q=out_logits[:, :K, :].contiguous() if self.communicate_logits else None,
         )
-        speculation_response.send(self.async_pg, self.target_rank)
+        if BRIEF_LOG:
+            for i in range(B):
+                cache_hit = cache_hits[i].item()
+                # We pretend we are actually sending it, for clarify in debugging.
+                cache_hit_text = "HIT" if cache_hit == 1 else "MISS"
+                print(f"[{_ts()}] [SpeculationResponse.send] req[{i}]: CACHE {cache_hit_text}", flush=True)
+
+        speculation_response.send(self.async_pg, self.target_rank, tokenizer=self.tokenizer)
 
         if NCCL_LOG:
             sep = '=' * 80

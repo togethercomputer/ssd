@@ -10,10 +10,32 @@ from ssd.engine.sequence import Sequence
 from ssd.utils.misc import compress_neg_ones_and_zeros
 
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
-
+BRIEF_LOG = os.environ.get("SSD_BRIEF_LOG", "0") == "1"
+DUMP_TENSORS_DIR = os.environ.get("SSD_DUMP_TENSORS_DIR", "")
+RUN_NAME = os.environ.get("SSD_RUN_NAME", "")
 
 def _ts():
     return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+def _dump_ts():
+    if RUN_NAME:
+        return RUN_NAME
+    else:
+        return datetime.now().strftime('%H_%M_%S.%f')[:-4]
+
+if DUMP_TENSORS_DIR:
+    print(f"[{_ts()}] BANANA: Dumping tensors to {DUMP_TENSORS_DIR}")
+    os.makedirs(DUMP_TENSORS_DIR, exist_ok=True)
+    DUMP_TENSORS = True
+
+def list_to_str(lst: list[float] | list[list[float]], num_decimals: int = 4) -> str:
+    assert len(lst) > 0
+    if isinstance(lst[0], float):
+         return str([round(v, 4) for v in lst])
+    else:
+        assert isinstance(lst[0], list)
+        return str([[round(v, 4) for v in row] for row in lst])
+
 
 @enum.unique
 class COMMAND(enum.IntEnum):
@@ -98,8 +120,15 @@ class PrefillRequest:
             send_tensor(self.eagle_acts, async_pg, draft_rank, name="eagle acts", prefix="TARGET:PrefillRequest.send")
 
     @classmethod
-    def receive(cls, async_pg: dist.ProcessGroup, target_rank: int, device: torch.device, metadata_buffer: torch.Tensor=None, eagle_act_dtype: torch.dtype=torch.bfloat16):
-
+    def receive(
+        cls,
+        async_pg: dist.ProcessGroup,
+        target_rank: int,
+        device: torch.device,
+        metadata_buffer: torch.Tensor=None,
+        eagle_act_dtype: torch.dtype=torch.bfloat16,
+        tokenizer: AutoTokenizer = None,
+    ):
         # 1) Receive metadata then individual tensors
         # First receive prefill metadata to learn sizes
         if metadata_buffer is None:
@@ -127,6 +156,27 @@ class PrefillRequest:
                 total_new_tokens, eagle_act_dim, dtype=eagle_act_dtype, device=device,
             )
             eagle_acts = receive_tensor(eagle_acts, async_pg, target_rank, name="eagle acts", prefix="DRAFT:PrefillRequest.receive")
+
+        if BRIEF_LOG:
+            print(f"[{_ts()}] [PrefillRequest.receive] metadata={metadata.tolist()}", flush=True)
+            print(f"[{_ts()}] [PrefillRequest.receive] num_tokens={num_tokens.tolist()}", flush=True)
+            decoded_input_ids = _decode_ids(input_ids, tokenizer)
+            print(f"[{_ts()}] [PrefillRequest.receive] input_ids shape={input_ids.shape}, values={input_ids.tolist()}, decoded='{decoded_input_ids}'", flush=True)
+            if eagle_acts is not None:
+                print(f"[{_ts()}] [PrefillRequest.receive] eagle_acts shape={eagle_acts.shape}, eagle_acts[:3, :3]={list_to_str(eagle_acts[:3, :3].tolist())}", flush=True)
+
+        print(f"[{_ts()}] [PrefillRequest.receive] BANANA LOADING EAGLE ACTS FROM SSD")
+        prefill_request_from_ssd = torch.load('/work/avner/git/ssd/tensor_dump_ssd/prefill_request_12_59_28.84.pt', map_location='cpu', weights_only=False)
+        eagle_acts = prefill_request_from_ssd['eagle_acts'].to(eagle_act_dtype).to(device)
+
+        if DUMP_TENSORS:
+            torch.save({
+                'metadata': metadata.cpu(),
+                'input_ids': input_ids.cpu(),
+                'num_tokens': num_tokens.cpu(),
+                'draft_block_table': draft_block_table.cpu(),
+                'eagle_acts': eagle_acts.cpu() if eagle_acts is not None else None,
+            }, f"{DUMP_TENSORS_DIR}/prefill_request_{_dump_ts()}.pt")
 
         return cls(
             cmd=None,
@@ -221,7 +271,15 @@ class SpeculationRequest:
             send_tensor(self.extend_token_ids, async_pg, draft_rank, name="EAGLE extend_token_ids", prefix="TARGET:SpeculationRequest.send")
 
     @classmethod
-    def receive(cls, async_pg: dist.ProcessGroup, target_rank: int, device: torch.device, draft_dtype: torch.dtype, tokenizer: AutoTokenizer = None, verbose: bool = False):
+    def receive(
+        cls,
+        async_pg: dist.ProcessGroup,
+        target_rank: int,
+        device: torch.device,
+        draft_dtype: torch.dtype,
+        tokenizer: AutoTokenizer = None,
+        verbose: bool = False,
+    ):
         meta = torch.empty(5, dtype=torch.int64, device=device)
         meta = receive_tensor(meta, async_pg, target_rank, name="metadata", prefix="DRAFT:SpeculationRequest.receive")
         B, K, max_blocks, eagle_act_dim, vocab_size = meta.tolist()
@@ -304,6 +362,42 @@ class SpeculationRequest:
                     print(f"[{_ts()}]   Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target}{rec_token_text}, n_ext={n_ext}", flush=True)
                 print(f"[{_ts()}] {'='*80}\n", flush=True)
 
+        if BRIEF_LOG:
+            cache_keys = speculation_request.cache_keys
+            num_tokens = speculation_request.num_tokens
+            # block_tables = speculation_request.block_tables
+            # temps = speculation_request.temps
+            recovery_activations = speculation_request.recovery_activations
+            extend_activations = speculation_request.extend_activations
+            extend_counts = speculation_request.extend_counts
+            extend_token_ids = speculation_request.extend_token_ids
+            print(f"[{_ts()}] [SpeculationRequest.receive] {B=}, {K=}, {max_blocks=}, {eagle_act_dim=}", flush=True)
+            for i in range(B):
+                seq_id, accept_len, verified_id = cache_keys[i].tolist()
+                verified_text = _decode_ids(verified_id, tokenizer)
+                # print(f"[{_ts()}]      req[{i}]: seq_id={seq_id}, accept_len={accept_len}, verified_id={int(verified_id)} ({verified_text})", flush=True)
+                print(f"[{_ts()}]      req[{i}]: ACCEPT_LENGTH={accept_len}, VERIFIED_TEXT={verified_text}", flush=True)
+                if eagle:
+                    print(f"[{_ts()}]      req[{i}]: recovery_activations shape={recovery_activations.shape}, values[i, :3]={list_to_str(recovery_activations[i, :3].tolist())}", flush=True)
+                    print(f"[{_ts()}]      req[{i}]: extend_activations shape={extend_activations.shape}, values[i, :, :3]={list_to_str(extend_activations[i, :, :3].tolist())}", flush=True)
+                    num_extend = extend_counts[i].item()
+                    print(f"[{_ts()}]      req[{i}]: extend_counts shape={extend_counts.shape}, values[i]={num_extend}", flush=True)
+                    decoded_extend_token_ids = _decode_ids(extend_token_ids[i, :num_extend], tokenizer)
+                    print(f"[{_ts()}]      req[{i}]: extend_token_ids shape={extend_token_ids.shape}, values={extend_token_ids[i].tolist()}, decoded[:, :{num_extend}]='{decoded_extend_token_ids}'", flush=True)
+
+        if DUMP_TENSORS:
+            torch.save({
+                'metadata': speculation_request.metadata.cpu(),
+                'cache_keys': speculation_request.cache_keys.cpu(),
+                'num_tokens': speculation_request.num_tokens.cpu(),
+                'block_tables': speculation_request.block_tables.cpu() if speculation_request.block_tables is not None else None,
+                'temps': speculation_request.temps.cpu(),
+                'recovery_activations': speculation_request.recovery_activations.cpu() if speculation_request.recovery_activations is not None else None,
+                'extend_counts': speculation_request.extend_counts.cpu() if speculation_request.extend_counts is not None else None,
+                'extend_activations': speculation_request.extend_activations.cpu() if speculation_request.extend_activations is not None else None,
+                'extend_token_ids': speculation_request.extend_token_ids.cpu() if speculation_request.extend_token_ids is not None else None,
+            }, f"{DUMP_TENSORS_DIR}/speculation_request_{_dump_ts()}.pt")
+
         return speculation_request
 
 
@@ -353,8 +447,19 @@ class SpeculationResponse:
             self.batch_size = batch_size
             self._alloc_buffers()
 
-    def send(self, async_pg: dist.ProcessGroup, target_rank: int):
+    def send(self, async_pg: dist.ProcessGroup, target_rank: int, tokenizer: AutoTokenizer = None):
         send_tensor(self.speculations, async_pg, target_rank, name="speculations", prefix="DRAFT:SpeculationResponse.send")
+
+        if BRIEF_LOG:
+            decoded_speculations = _decode_ids(self.speculations, tokenizer)
+            print(f"[{_ts()}] [SpeculationResponse.send] SPECULATION: '{decoded_speculations}'", flush=True)
+            print(f"[{_ts()}] {'='*80}\n", flush=True)
+
+        if DUMP_TENSORS:
+            torch.save({
+                'speculations': self.speculations.cpu(),
+            }, f"{DUMP_TENSORS_DIR}/speculation_response_{_dump_ts()}.pt")
+
         if self.logits_q is not None:
             assert getattr(self, 'communicate_logits', True), "logits_q is not None but communicate_logits is False"
             send_tensor(self.logits_q, async_pg, target_rank, name="logits", prefix="DRAFT:SpeculationResponse.send")
@@ -401,9 +506,12 @@ class SpeculationResponse:
 def _decode_ids(ids_tensor, tokenizer: AutoTokenizer = None):
     if tokenizer is None:
         return "<no tokenizer>"
-    ids = ids_tensor.cpu().tolist()
-    if isinstance(ids, int):
-        ids = [ids]
+    if isinstance(ids_tensor, int):
+        ids = [ids_tensor]
+    else:
+        ids = ids_tensor.cpu().tolist()
+        if isinstance(ids, int):
+            ids = [ids]
     return tokenizer.decode(ids)
 
 
