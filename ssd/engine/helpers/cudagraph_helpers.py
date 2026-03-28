@@ -199,6 +199,10 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         context.tree_cu_seqlens_q = graph_vars["tree_cu_seqlens_q"][wrapper_bs]
         context.tree_mask_bias = graph_vars["tree_mask_bias"]
 
+    # in the case where we pad, we'll need cache_hits.shape[0] to match the padded batch size
+    if cache_hits.shape[0] < B:
+        cache_hits = torch.cat([cache_hits, torch.zeros(B - cache_hits.shape[0], device=cache_hits.device)])
+
     if PROFILE:
         torch.cuda.synchronize()
         start_time = torch.cuda.Event(enable_timing=True)

@@ -498,6 +498,7 @@ class ModelRunner:
         )
 
         print(f"allocate_kv_cache(): kv_cache shape = {self.kv_cache.shape}", flush=True)
+
         # Create tree_score_mod once (shared across all attention layers)
         tree_score_mod = None
         if self.is_draft and self.draft_async:
