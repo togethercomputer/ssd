@@ -59,7 +59,7 @@ class ModelRunner:
         self.hf_config = config.hf_config if not is_draft else config.draft_hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path if config.tokenizer_path else config.model, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path if config.tokenizer_path else config.model, use_fast=True, trust_remote_code=True)
         self.max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
 
         assert self.hf_config is not None, "ERROR in ModelRunner: hf_config is None" # this implies boundedness to the end 
