@@ -8,7 +8,6 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from transformers import AutoTokenizer, AutoConfig
 import os
-import flashinfer
 from ssd.config import Config
 from ssd.engine.sequence import Sequence
 from ssd.models.qwen3 import Qwen3ForCausalLM
@@ -36,7 +35,6 @@ from ssd.engine.helpers.cudagraph_helpers import (
     capture_fi_tree_decode_cudagraph,
     capture_glue_decode_cudagraph,
 )
-from ssd.engine.helpers.mask_helpers import get_custom_mask
 
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 
@@ -100,11 +98,7 @@ class ModelRunner:
         self.device = torch.device(f'cuda:{self.rank}')
         self._cmd = torch.empty(1, dtype=torch.int64, device=self.device)
 
-        
-        # cudagraph logic for FlashInfer kernels, need diff wrapper for each batch size we make a graph for 
-        if is_draft and config.draft_async:
-            self._init_flashinfer_wrappers()
-        
+
         if self.verbose: print(f'INSIDE MODEL RUNNER INIT, DRAFT={is_draft}', flush=True)
         self.tp_pg = None 
 
@@ -168,56 +162,6 @@ class ModelRunner:
                 self.loop()
                 
         if self.verbose: print(f'-----{model_type}MODEL RUNNER INITIALIZED----', flush=True)
-
-    def _init_flashinfer_wrappers(self):
-        """Initialize FlashInfer wrappers for draft async mode."""
-        self.workspace_buffer = torch.zeros(
-            768 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}")
-        
-        if self.config.enforce_eager: 
-            self.only_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
-        else: 
-            max_bs = min(self.config.max_num_seqs, 512)
-            max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
-            
-            # FlashInfer kernel tensors
-            # pages_for_max_len = (self.config.max_model_len + self.block_size - 1) // self.block_size
-            last_page_len_max_len = self.config.max_model_len % self.block_size
-            last_page_len_max_len = self.block_size if last_page_len_max_len == 0 else last_page_len_max_len
-            MQ_LEN = self.config.async_fan_out * (self.config.speculate_k + 1)
-            
-            cu_seqlens_q = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
-            kv_indptr = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
-            kv_indices = torch.empty(max_bs * max_num_blocks, dtype=torch.int32, device=self.device)
-            kv_last_page_len = torch.empty(max_bs, dtype=torch.int32, device=self.device)
-            custom_mask_buf = torch.empty(max_bs * MQ_LEN * self.config.max_model_len, dtype=torch.uint8, device=self.device)
-            mask_indptr_buf = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
-            
-            # Create graph_bs_list to match what will be used in cudagraph_helpers.py
-            graph_bs_list = [1]
-            for bs in [2, 4, 8] + list(range(16, max_bs + 1, 16)):
-                if bs <= max_bs:
-                    graph_bs_list.append(bs)
-            if max_bs not in graph_bs_list:
-                graph_bs_list.append(max_bs)
-            graph_bs_list.sort()
-            
-            # Create a dict of wrappers, one for each bs we will touch in cudagraph_helpers.py
-            self.prefill_wrappers = {}
-            print(f'[model_runner about to wrapper.init()] graph_bs_list={graph_bs_list}', flush=True)
-            for bs in graph_bs_list:
-                self.prefill_wrappers[bs] = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer, "NHD", 
-                    use_cuda_graph=True, 
-                    qo_indptr_buf=cu_seqlens_q[:bs + 1],
-                    paged_kv_indptr_buf=kv_indptr[:bs + 1],
-                    paged_kv_indices_buf=kv_indices[:bs * max_num_blocks],
-                    paged_kv_last_page_len_buf=kv_last_page_len[:bs],
-                    custom_mask_buf=custom_mask_buf[:bs * MQ_LEN * self.config.max_model_len],
-                    mask_indptr_buf=mask_indptr_buf[:bs + 1],
-                )
-            print(f'wrapper backend is {self.prefill_wrappers[bs]._backend}', flush=True)
-
 
     def setup_and_warmup_model_and_cudagraphs(self, config: Config, hf_config: AutoConfig, init_q=None, is_draft=False):
         # cudagraphs 
@@ -554,15 +498,20 @@ class ModelRunner:
         )
 
         print(f"allocate_kv_cache(): kv_cache shape = {self.kv_cache.shape}", flush=True)
+        # Create tree_score_mod once (shared across all attention layers)
+        tree_score_mod = None
+        if self.is_draft and self.draft_async:
+            from ssd.layers.tree_mask import create_tree_score_mod
+            tree_score_mod = create_tree_score_mod(config.max_model_len)
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
-                if self.is_draft and self.draft_async and not self.enforce_eager:
-                    module.prefill_wrappers = self.prefill_wrappers
-                elif self.is_draft and self.draft_async and self.enforce_eager:
-                    module.only_prefill_wrapper = self.only_prefill_wrapper # this will make it not None so it can be used on fwd
+                if self.is_draft and self.draft_async:
+                    module.max_seqlen_k = config.max_model_len
+                    module.tree_score_mod = tree_score_mod
                 layer_id += 1
 
     
@@ -613,45 +562,21 @@ class ModelRunner:
         return temperatures
 
     def eager_tree_decode_plan(self, input_ids, positions, step, cache_hits):
-        """Plan FlashInfer for tree decode in eager mode"""
+        """Set up context metadata for FA4 tree decode in eager mode."""
         assert self.is_draft and self.config.draft_async, "ERROR in eager_tree_decode_plan: not a draft async model"
+        from ssd.layers.tree_mask import build_tree_mask_bias
         context = get_context()
-        
-        K, F = self.config.speculate_k, self.config.async_fan_out
-        # MQ_LEN = F * (K+1)
+        K = self.config.speculate_k
         MQ_LEN = self.config.MQ_LEN
-        flat_batch_size = input_ids.size(0) 
-        B = flat_batch_size // MQ_LEN # [N] tokens = B * sum(fan_out_list)
-        
-        # Convert block_tables to FlashInfer format
-        block_tables = context.block_tables # [B, M]
-        context_lens = context.context_lens # [B]
-        
-        counts = (context_lens + self.block_size - 1) // self.block_size # [B]
-        kv_indptr = torch.cat([torch.tensor([0], device=block_tables.device),
-                               counts.cumsum(dim=0)]).to(torch.int32)  
-        mask = torch.arange(block_tables.size(1), device=block_tables.device)[None, :] < counts[:, None]
-        kv_indices = block_tables[mask]                    # flattened page ids
-        
-        # Last-page actual token count per request
-        kv_last_page_len = (context_lens % self.block_size)
-        kv_last_page_len[kv_last_page_len == 0] = self.block_size
-        kv_last_page_len = kv_last_page_len.to(torch.int32)
-        cu_seqlens_q = torch.arange(B + 1, device=self.device, dtype=torch.int32) * MQ_LEN # assumes same MQ_LEN across batch dimension 
-        custom_mask = get_custom_mask(self.config, context_lens, step, K, F, B, device=self.device, cache_hits=cache_hits)
-        
-        self.only_prefill_wrapper.plan(
-            cu_seqlens_q,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            self.hf_config.num_attention_heads,
-            self.hf_config.num_key_value_heads,
-            self.hf_config.head_dim,
-            self.block_size,
-            custom_mask=custom_mask,
-            q_data_type=self.hf_config.torch_dtype,
-            kv_data_type=self.hf_config.torch_dtype,
+        B = input_ids.size(0) // MQ_LEN
+        context.tree_cu_seqlens_q = torch.arange(B + 1, device=self.device, dtype=torch.int32) * MQ_LEN
+        context.tree_mask_bias = build_tree_mask_bias(
+            context.context_lens, step=step, K=K, MQ_LEN=MQ_LEN,
+            fan_out_list=self.config.fan_out_list,
+            fan_out_list_miss=self.config.fan_out_list_miss,
+            cache_hits=cache_hits,
+            max_kv_stride=self.config.max_model_len,
+            device=self.device,
         )
 
     @property

@@ -1,7 +1,6 @@
 import os
 import math
 import torch
-import numpy as np
 
 from ssd.utils.context import set_context, get_context, reset_context
 from time import perf_counter
@@ -122,9 +121,6 @@ def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_va
     return logits
 
 
-cache = {}
-
-_plan_event = None  # Lazy-init CUDA event for plan() sync
 PROFILE = os.environ.get("SSD_PROFILE", "0") == "1"
 PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
 _draft_events = []  # [(step, label, start_event, end_event), ...]
@@ -149,30 +145,23 @@ def flush_draft_profile():
 
 @torch.inference_mode()
 def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, step, cache_hits, hidden_states=None):
-    # bs != len(input_ids, positions) now in multi-query seting, also need step-dependent mask
     context = get_context()
-    assert context.cu_seqlens_q is None, "ERROR in run_fi_tree_decode_cudagraph: cu_seqlens_q should be set to None so we don't take FA path"
 
-    K, F = model_runner.config.speculate_k, model_runner.config.async_fan_out
-    # MQ_LEN = F * (K+1)
     MQ_LEN = sum(model_runner.config.fan_out_list)
     orig_flat = input_ids.size(0)
     assert orig_flat % MQ_LEN == 0, f"ERROR in run_fi_tree_decode_cudagraph: flat_batch_size should be divisible by MQ_LEN, got {orig_flat} and {MQ_LEN}"
     orig_B = orig_flat // MQ_LEN
 
-    # Pick CUDA graph and wrapper bucket
+    # Pick CUDA graph bucket
     wrapper_bs = next(
         x for x in model_runner.graph_bs_list["fi_tree_decode"] if x >= orig_B)
     graph = model_runner.graphs["fi_tree_decode"][wrapper_bs]
-    wrapper = model_runner.prefill_wrappers[wrapper_bs]
 
     # Prepare padded inputs/context if needed
     if wrapper_bs > orig_B:
-        # print(f'PADDING--')
         pad_B = wrapper_bs - orig_B
         pad_flat = pad_B * MQ_LEN
 
-        # Pad queries (ids/rope positions)
         pad_ids = torch.zeros(
             pad_flat, dtype=input_ids.dtype, device=input_ids.device)
         pad_pos = torch.zeros(
@@ -180,13 +169,11 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         input_ids = torch.cat([input_ids, pad_ids], dim=0)
         positions = torch.cat([positions, pad_pos], dim=0)
 
-        # Pad slot_mapping with -1 to skip KV writes for padded queries
         slot_map = torch.cat(
             [context.slot_mapping,
              torch.full((pad_flat,), -1, dtype=context.slot_mapping.dtype, device=context.slot_mapping.device)]
         )
 
-        # Pad block_tables/context_lens by repeating the last real row
         bt = context.block_tables
         cl = context.context_lens
         pad_bt = bt[orig_B - 1:orig_B].expand(pad_B, -1).contiguous()
@@ -194,19 +181,23 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         bt = torch.cat([bt, pad_bt], dim=0)
         cl = torch.cat([cl, pad_cl], dim=0)
 
-        # Set padded context for this replay
         set_context(is_prefill=False, slot_mapping=slot_map,
-                    context_lens=cl, block_tables=bt)
+                    context_lens=cl, block_tables=bt,
+                    tree_cu_seqlens_q=graph_vars["tree_cu_seqlens_q"][wrapper_bs],
+                    tree_mask_bias=graph_vars["tree_mask_bias"])
 
         block_tables = bt
         context_lens = cl
-        flat_batch_size = input_ids.size(0)  # == wrapper_bs * MQ_LEN
+        flat_batch_size = input_ids.size(0)
         B = wrapper_bs
     else:
         block_tables = context.block_tables
         context_lens = context.context_lens
         flat_batch_size = orig_flat
         B = orig_B
+        # Set tree decode metadata on context for FA4
+        context.tree_cu_seqlens_q = graph_vars["tree_cu_seqlens_q"][wrapper_bs]
+        context.tree_mask_bias = graph_vars["tree_mask_bias"]
 
     if PROFILE:
         torch.cuda.synchronize()
@@ -214,185 +205,26 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         end_time = torch.cuda.Event(enable_timing=True)
         start_time.record()
 
-    # in the case where we pad, we'll need cache_hits.shape[0] to match the padded batch size
-    if cache_hits.shape[0] < B:
-        cache_hits = torch.cat([cache_hits, torch.zeros(B - cache_hits.shape[0], device=cache_hits.device)])
+    # Build tree mask bias for this step and copy into pre-allocated buffer
+    from ssd.layers.tree_mask import build_tree_mask_bias
+    K = model_runner.config.speculate_k
+    mask_bias = build_tree_mask_bias(
+        context_lens, step=step, K=K, MQ_LEN=MQ_LEN,
+        fan_out_list=model_runner.config.fan_out_list,
+        fan_out_list_miss=model_runner.config.fan_out_list_miss,
+        cache_hits=cache_hits,
+        max_kv_stride=model_runner.config.max_model_len,
+        device=model_runner.device,
+    )
+    graph_vars["tree_mask_bias"][:len(mask_bias)] = mask_bias
 
-    # PERFORMANCE: Step 0 -- precompute KV page metadata on CPU for all K steps.
-    # CPU tensors let plan() skip its internal .to("cpu") GPU->CPU syncs.
-    # For B<=8, CPU slicing also avoids GPU boolean indexing.
-    if step == 0:
-        cache["cu_seqlens_q_cpu"] = torch.arange(B + 1, dtype=torch.int32) * MQ_LEN
-        context_lens_list = context_lens.tolist()
-        cache["block_tables"] = block_tables
-        block_size = model_runner.block_size
-        cache["precomputed_kv"] = []
-        cache["plan_cpu_args"] = []
-
-        if B <= 8:
-            # PERFORMANCE: CPU-only kv_indices via slicing (no GPU boolean indexing)
-            for s in range(K):
-                step_cls = [int(cl) + s * MQ_LEN for cl in context_lens_list]
-                step_counts = [(cl + block_size - 1) // block_size for cl in step_cls]
-                if B == 1:
-                    kv_indices_s = block_tables[0, :step_counts[0]]
-                else:
-                    kv_indices_s = torch.cat([block_tables[b, :step_counts[b]] for b in range(B)])
-                cache["precomputed_kv"].append(kv_indices_s)
-                kv_indptr_cpu = torch.zeros(B + 1, dtype=torch.int32)
-                kv_indptr_cpu[1:] = torch.tensor(step_counts, dtype=torch.int32).cumsum(0)
-                kv_lpl_cpu = torch.tensor(
-                    [cl % block_size if cl % block_size != 0 else block_size for cl in step_cls],
-                    dtype=torch.int32)
-                cache["plan_cpu_args"].append((kv_indptr_cpu, kv_lpl_cpu))
-        else:
-            # Large batch: GPU boolean indexing for kv_indices, CPU tensors for plan args
-            bt_upcast = torch.arange(block_tables.size(1), device=block_tables.device)[None, :]
-            step_offsets = torch.arange(K + 2, device=context_lens.device) * MQ_LEN
-            all_step_cls = context_lens.unsqueeze(1) + step_offsets.unsqueeze(0)
-            all_counts = (all_step_cls + block_size - 1) // block_size
-            all_masks = bt_upcast.unsqueeze(1) < all_counts.unsqueeze(2)
-            for s in range(K):
-                cache["precomputed_kv"].append(block_tables[all_masks[:, s, :]])
-                step_cls = [int(cl) + s * MQ_LEN for cl in context_lens_list]
-                step_counts = [(cl + block_size - 1) // block_size for cl in step_cls]
-                kv_indptr_cpu = torch.zeros(B + 1, dtype=torch.int32)
-                kv_indptr_cpu[1:] = torch.tensor(step_counts, dtype=torch.int32).cumsum(0)
-                kv_lpl_cpu = torch.tensor(
-                    [cl % block_size if cl % block_size != 0 else block_size for cl in step_cls],
-                    dtype=torch.int32)
-                cache["plan_cpu_args"].append((kv_indptr_cpu, kv_lpl_cpu))
-
-        # CPU mask precompute: build all K packed masks using numpy at step 0.
-        # Eliminates per-step get_custom_mask (GPU) + segment_packbits + GPU->CPU syncs.
-        cache_hits_list = cache_hits[:B].tolist()
-
-        if "glue_hit_np" not in cache:
-            _fol = model_runner.config.fan_out_list
-            _fol_miss = model_runner.config.fan_out_list_miss
-            _tril = np.tril(np.ones((K + 1, K + 1), dtype=np.uint8))
-            cache["glue_hit_np"] = np.repeat(_tril, _fol, axis=0)
-            cache["glue_miss_np"] = np.repeat(_tril, _fol_miss, axis=0)
-
-        _glue_hit = cache["glue_hit_np"]
-        _glue_miss = cache["glue_miss_np"]
-        _rows_np = np.arange(MQ_LEN)
-
-        cache["cpu_packed_masks"] = []
-        cache["cpu_packed_indptrs"] = []
-
-        for s in range(K):
-            ttl_added_s = (s + 1) * MQ_LEN + (K + 1)
-            packed_segs = []
-            seg_packed_sizes = []
-
-            for b in range(B):
-                cols_b = int(context_lens_list[b]) + s * MQ_LEN
-                prefix_len_b = cols_b - ttl_added_s
-
-                mask_b = np.zeros((MQ_LEN, cols_b), dtype=np.uint8)
-                mask_b[:, :prefix_len_b] = 1
-                glue = _glue_hit if int(cache_hits_list[b]) == 1 else _glue_miss
-                mask_b[:, prefix_len_b:prefix_len_b + K + 1] = glue
-                diag_start = prefix_len_b + K + 1
-                for blk in range(s + 1):
-                    mask_b[_rows_np, diag_start + blk * MQ_LEN + _rows_np] = 1
-
-                packed = np.packbits(mask_b.ravel(), bitorder='little')
-                packed_segs.append(packed)
-                seg_packed_sizes.append(len(packed))
-
-            full_packed = np.concatenate(packed_segs) if B > 1 else packed_segs[0]
-            indptr = np.zeros(B + 1, dtype=np.int32)
-            indptr[1:] = np.cumsum(seg_packed_sizes)
-
-            cache["cpu_packed_masks"].append(
-                torch.from_numpy(full_packed.copy()).to(model_runner.device, non_blocking=True))
-            cache["cpu_packed_indptrs"].append(
-                torch.from_numpy(indptr.copy()).to(model_runner.device, non_blocking=True))
-
-        # Pre-transfer KV metadata to GPU (eliminates per-step pageable H2D transfers)
-        cache["qo_indptr_gpu"] = cache["cu_seqlens_q_cpu"].to(model_runner.device, non_blocking=True)
-        cache["kv_indptr_gpu"] = []
-        cache["kv_lpl_gpu"] = []
-        cache["kv_lens_gpu"] = []
-        for s in range(K):
-            ki, kl = cache["plan_cpu_args"][s]
-            cache["kv_indptr_gpu"].append(ki.to(model_runner.device, non_blocking=True))
-            cache["kv_lpl_gpu"].append(kl.to(model_runner.device, non_blocking=True))
-            kv_lens = ((ki[1:] - ki[:-1] - 1) * model_runner.block_size + kl).to(torch.int32)
-            cache["kv_lens_gpu"].append(kv_lens.to(model_runner.device, non_blocking=True))
-
-    if PROFILE:
-        end_time.record()
-        torch.cuda.synchronize()
-        precompute_time = start_time.elapsed_time(end_time)
-        start_time.record()
-
-    # Use precomputed CPU-packed masks (built at step 0)
-    if PROFILE_DRAFT:
-        _ev_mask0 = torch.cuda.Event(enable_timing=True); _ev_mask0.record()
-
-    kv_indices = cache["precomputed_kv"][step]
-    kv_indptr_cpu, kv_lpl_cpu = cache["plan_cpu_args"][step]
-    qo_indptr_cpu = cache["cu_seqlens_q_cpu"]
-
-    packed_mask = cache["cpu_packed_masks"][step]
-    packed_indptr = cache["cpu_packed_indptrs"][step]
-    wrapper._custom_mask_buf[:len(packed_mask)].copy_(packed_mask, non_blocking=True)
-    wrapper._mask_indptr_buf.copy_(packed_indptr, non_blocking=True)
-
-    # GPU-to-GPU copies from pre-transferred tensors (no pageable H2D)
-    wrapper._qo_indptr_buf.copy_(cache["qo_indptr_gpu"], non_blocking=True)
-    wrapper._paged_kv_indptr_buf.copy_(cache["kv_indptr_gpu"][step], non_blocking=True)
-    wrapper._paged_kv_last_page_len_buf.copy_(cache["kv_lpl_gpu"][step], non_blocking=True)
-    wrapper._paged_kv_indices_buf[:len(kv_indices)].copy_(kv_indices, non_blocking=True)
-
-    total_num_rows = int(qo_indptr_cpu[-1].item())
-    wrapper._kv_lens_buffer[:len(kv_indptr_cpu) - 1].copy_(cache["kv_lens_gpu"][step], non_blocking=True)
-
-    # Event-based sync: only wait for this stream's copies, not all CUDA streams.
-    global _plan_event
-    if _plan_event is None:
-        _plan_event = torch.cuda.Event()
-    _plan_event.record()
-    _plan_event.synchronize()
-
-    if PROFILE_DRAFT:
-        _ev_plan0 = torch.cuda.Event(enable_timing=True); _ev_plan0.record()
-
-    plan_args = [
-        wrapper._float_workspace_buffer, wrapper._int_workspace_buffer,
-        wrapper._pin_memory_int_workspace_buffer,
-        qo_indptr_cpu, kv_indptr_cpu, cache["kv_lens_gpu"][step],
-        wrapper._max_total_num_rows or total_num_rows,
-        B, model_runner.hf_config.num_attention_heads,
-        model_runner.hf_config.num_key_value_heads,
-        model_runner.block_size, wrapper.is_cuda_graph_enabled,
-        model_runner.hf_config.head_dim, model_runner.hf_config.head_dim,
-        False, -1,
-    ]
-    if wrapper._backend == "fa2":
-        plan_args.extend([-1, False, 0])  # fixed_split_size, disable_split_kv, num_colocated_ctas
-    wrapper._plan_info = wrapper._cached_module.plan(*plan_args)
-
-    if PROFILE_DRAFT:
-        _ev_plan1 = torch.cuda.Event(enable_timing=True); _ev_plan1.record()
-
-    if PROFILE:
-        end_time.record()
-        torch.cuda.synchronize()
-        plan_time = start_time.elapsed_time(end_time)
-        start_time.record()
-
-    # Copy inputs/context into graph buffers for padded size
+    # Copy inputs/context into graph buffers
     graph_vars["input_ids"][:flat_batch_size] = input_ids
     graph_vars["positions"][:flat_batch_size] = positions
     graph_vars["slot_mapping"][:flat_batch_size] = get_context().slot_mapping
     graph_vars["context_lens"][:B] = context_lens
     if hidden_states is not None and "hidden_states" in graph_vars:
         if hidden_states.shape[0] < flat_batch_size:
-            # Pad hidden_states to match padded batch
             pad_n = flat_batch_size - hidden_states.shape[0]
             hidden_states = torch.cat([hidden_states, torch.zeros(pad_n, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)])
         graph_vars["hidden_states"][:flat_batch_size] = hidden_states
@@ -412,8 +244,6 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
 
     if PROFILE_DRAFT:
         _ev_replay1 = torch.cuda.Event(enable_timing=True); _ev_replay1.record()
-        _draft_events.append((step, "mask+buf", _ev_mask0, _ev_plan0))
-        _draft_events.append((step, "plan", _ev_plan0, _ev_plan1))
         _draft_events.append((step, "replay", _ev_replay0, _ev_replay1))
 
     if PROFILE:
@@ -421,14 +251,12 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         torch.cuda.synchronize()
         replay_time = start_time.elapsed_time(end_time)
 
-    # Extract logits from graph_vars instead of computing them separately
     logits_all = graph_vars["logits"][:flat_batch_size]
 
     if PROFILE:
-        print(f"[cuda_graph_helpers.run_fi_tree_decode_cudagraph] step {step}: precompute={precompute_time:.3f}ms, plan={plan_time:.3f}ms, buffer={buffer_prep_time:.3f}ms, replay={replay_time:.3f}ms", flush=True)
+        print(f"[cuda_graph_helpers.run_fi_tree_decode_cudagraph] step {step}: buffer={buffer_prep_time:.3f}ms, replay={replay_time:.3f}ms", flush=True)
 
     logits_out = logits_all[:orig_flat]
-    # EAGLE draft: also return prenorm (outputs) for self-conditioning
     if "hidden_states" in graph_vars:
         prenorm = graph_vars["outputs"][:orig_flat]
         return logits_out, prenorm
@@ -793,8 +621,6 @@ def capture_fi_tree_decode_cudagraph(model_runner):
     config = model_runner.config
     hf_config = config.hf_config
     max_bs = min(model_runner.config.max_num_seqs, 512)
-    K, F = model_runner.config.speculate_k, model_runner.config.async_fan_out
-    # MQ_LEN = F * (K+1)
     MQ_LEN = sum(model_runner.config.fan_out_list)
     max_flat_batch_size = max_bs * MQ_LEN
 
@@ -803,12 +629,11 @@ def capture_fi_tree_decode_cudagraph(model_runner):
     input_ids = torch.zeros(max_flat_batch_size, dtype=torch.int64, device=model_runner.device)
     positions = torch.zeros(max_flat_batch_size, dtype=torch.int64, device=model_runner.device)
     slot_mapping = torch.zeros(max_flat_batch_size, dtype=torch.int32, device=model_runner.device)
-    context_lens = torch.full((max_bs,), config.max_model_len, dtype=torch.int32, device=model_runner.device) # make sure these are consistent with our dummy example
+    context_lens = torch.full((max_bs,), config.max_model_len, dtype=torch.int32, device=model_runner.device)
     block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=model_runner.device)
     outputs = torch.empty(max_flat_batch_size, hf_config.hidden_size, device=model_runner.device)
     logits = torch.empty(max_flat_batch_size, hf_config.vocab_size, device=model_runner.device)
 
-    # Create graph_bs_list to match what will be used in cudagraph_helpers.py
     graph_bs_list = [1]
     for bs in [2, 4, 8] + list(range(16, max_bs + 1, 16)):
         if bs <= max_bs:
@@ -820,9 +645,6 @@ def capture_fi_tree_decode_cudagraph(model_runner):
     graphs = {}
     graph_pool = None
 
-    # Eagle draft needs hidden_states for forward (d_model_draft, NOT 3*d_model_target)
-    # All callers project target acts via fc() BEFORE passing to CG
-    # MUST be outside the for-loop so all graphs share the same tensor
     fi_hidden_states = None
     if config.use_eagle_or_phoenix and model_runner.is_draft:
         fi_hidden_states = torch.zeros(
@@ -832,52 +654,30 @@ def capture_fi_tree_decode_cudagraph(model_runner):
             device=model_runner.device,
         )
 
-    print(f'[cuda_graph_helpers.capture_fi_tree_decode_cudagraph] About to capture FI cudagraphs for bs={graph_bs_list}', flush=True)
+    # Pre-allocate tree_cu_seqlens_q per batch size bucket (constant values, used by FA4)
+    tree_cu_seqlens_q_dict = {}
+    for bs in graph_bs_list:
+        tree_cu_seqlens_q_dict[bs] = torch.arange(
+            bs + 1, dtype=torch.int32, device=model_runner.device) * MQ_LEN
+
+    # Pre-allocate tree mask bias at max size (shared across all batch sizes, updated before replay)
+    tree_mask_bias = torch.zeros(
+        max_flat_batch_size * config.max_model_len,
+        dtype=torch.float32, device=model_runner.device)
+
+    print(f'[cuda_graph_helpers.capture_fi_tree_decode_cudagraph] About to capture FA4 tree decode cudagraphs for bs={graph_bs_list}', flush=True)
 
     for bs in reversed(graph_bs_list):
         graph = torch.cuda.CUDAGraph()
 
-        # Build a self-consistent fake plan for capture:
-        # - q_len = MQ_LEN for each request
-        # - k_len = max_model_len for each request (use maximum context length)
-
-        cu_seqlens_q = torch.arange(
-            bs + 1, dtype=torch.int32, device=model_runner.device) * MQ_LEN
-        # Use max_num_blocks pages per request for maximum context length
-        kv_indptr = torch.arange(
-            bs + 1, dtype=torch.int32, device=model_runner.device) * max_num_blocks
-        kv_indices = torch.zeros(int(
-            kv_indptr[-1].item()), dtype=torch.int32, device=model_runner.device)  # page ids (dummy)
-        # Last page length for max model len context
-        last_page_len = config.max_model_len % model_runner.block_size
-        if last_page_len == 0:
-            last_page_len = model_runner.block_size
-        kv_last_page_len = torch.full(
-            (bs,), last_page_len, dtype=torch.int32, device=model_runner.device)
-        custom_mask = torch.ones(bs * MQ_LEN * config.max_model_len,
-                                 dtype=torch.bool, device=model_runner.device)
-
-        # Set the fi_tensors buffers with our fake data
-        model_runner.prefill_wrappers[bs].plan(
-            cu_seqlens_q,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            hf_config.num_attention_heads,
-            hf_config.num_key_value_heads,
-            hf_config.head_dim,
-            model_runner.block_size,
-            custom_mask=custom_mask,
-            q_data_type=hf_config.torch_dtype,
-            kv_data_type=hf_config.torch_dtype,
-        )
-
-        # Set minimal context needed for run
+        # Set context with FA4 metadata
         set_context(
             is_prefill=False,
             slot_mapping=slot_mapping[:bs * MQ_LEN],
             context_lens=context_lens[:bs],
-            block_tables=block_tables[:bs]
+            block_tables=block_tables[:bs],
+            tree_cu_seqlens_q=tree_cu_seqlens_q_dict[bs],
+            tree_mask_bias=tree_mask_bias,
         )
 
         # Warmup run
@@ -913,6 +713,8 @@ def capture_fi_tree_decode_cudagraph(model_runner):
         context_lens=context_lens,
         outputs=outputs,
         logits=logits,
+        tree_cu_seqlens_q=tree_cu_seqlens_q_dict,
+        tree_mask_bias=tree_mask_bias,
     )
     if fi_hidden_states is not None:
         graph_vars["hidden_states"] = fi_hidden_states

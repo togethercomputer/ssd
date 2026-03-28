@@ -27,6 +27,8 @@ if DUMP_TENSORS_DIR:
     print(f"[{_ts()}] BANANA: Dumping tensors to {DUMP_TENSORS_DIR}")
     os.makedirs(DUMP_TENSORS_DIR, exist_ok=True)
     DUMP_TENSORS = True
+else:
+    DUMP_TENSORS = False
 
 def list_to_str(lst: list[float] | list[list[float]], num_decimals: int = 4) -> str:
     assert len(lst) > 0
