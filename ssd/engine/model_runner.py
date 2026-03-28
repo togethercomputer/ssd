@@ -249,15 +249,14 @@ class ModelRunner:
             assert sum(config.fan_out_list) == sum(config.fan_out_list_miss) == config.async_fan_out * (config.speculate_k + 1), "ERROR in ModelRunner: fancy sampling only supported for constant fan out for now."
 
         self.sampler = Sampler(sampler_x=config.sampler_x, async_fan_out=config.async_fan_out)
-        if self.verbose:
-            print(f'-----WARMING UP {model_type}MODEL----', flush=True)
+        print(f'[model_runner] Warming up {model_type}model...', flush=True)
         self.warmup_model()
-        if self.verbose:
-            print(f'-----ALLOCATING {model_type}KV CACHE----', flush=True)
+        print(f'[model_runner] Allocating {model_type}KV cache...', flush=True)
         self.allocate_kv_cache()
 
         if not self.enforce_eager:
-            # if not self.is_draft or (self.is_draft and self.config.draft_async and self.config.speculate): 
+            print(f'[model_runner] Capturing CUDA graphs for {model_type}model...', flush=True)
+            # if not self.is_draft or (self.is_draft and self.config.draft_async and self.config.speculate):
             decode_graph_vars, decode_graph_pool, decode_graphs, decode_graph_bs_list = capture_cudagraph(self)  # decode cudagraph, draft needs in spec and target in normal
             self.graph_vars["decode"] = decode_graph_vars
             self.graph_pools["decode"] = decode_graph_pool
@@ -282,6 +281,7 @@ class ModelRunner:
                 self.graphs["glue_decode"] = glue_graphs
                 self.graph_bs_list["glue_decode"] = glue_bs_list
 
+        print(f'[model_runner] {model_type}model initialization complete.', flush=True)
         if init_q is not None:
             # Signal the scheduler that we're fully initialized (model loaded,
             # KV cache allocated, CUDA graphs captured).  Must happen after
