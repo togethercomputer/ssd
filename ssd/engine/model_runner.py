@@ -218,6 +218,12 @@ class ModelRunner:
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
             if config.async_nccl_port is not None:
+                print(
+                    f'[model_runner] Waiting for target server at '
+                    f'{config.async_nccl_host}:{config.async_nccl_port} '
+                    f'to form NCCL process group...',
+                    flush=True,
+                )
                 from torch.distributed import TCPStore
                 from ssd.utils.dist_utils import init_custom_process_group
                 store = TCPStore(config.async_nccl_host, port=config.async_nccl_port,
