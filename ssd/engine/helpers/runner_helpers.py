@@ -167,10 +167,6 @@ class PrefillRequest:
             if eagle_acts is not None:
                 print(f"[{_ts()}] [PrefillRequest.receive] eagle_acts shape={eagle_acts.shape}, eagle_acts[:3, :3]={list_to_str(eagle_acts[:3, :3].tolist())}", flush=True)
 
-        print(f"[{_ts()}] [PrefillRequest.receive] BANANA LOADING EAGLE ACTS FROM SSD")
-        prefill_request_from_ssd = torch.load('/work/avner/git/ssd/tensor_dump_ssd/prefill_request_12_59_28.84.pt', map_location='cpu', weights_only=False)
-        eagle_acts = prefill_request_from_ssd['eagle_acts'].to(eagle_act_dtype).to(device)
-
         if DUMP_TENSORS:
             torch.save({
                 'metadata': metadata.cpu(),
