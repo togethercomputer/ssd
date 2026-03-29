@@ -232,6 +232,7 @@ class ModelRunner:
                     self.async_pg = init_custom_process_group(
                         backend="nccl", store=store, world_size=2, rank=1,
                         group_name="async_spec")
+                print('[model_runner] NCCL process group formed, now receiving kv_cache_size...', flush=True)
                 # Cross-node: receive kv_cache_size from target so draft
                 # allocates the same number of KV cache blocks.
                 kv_buf = torch.empty(1, dtype=torch.int64, device=self.device)
