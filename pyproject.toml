@@ -14,7 +14,7 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
     "torch==2.9.1",
     "triton",
-    "transformers==4.57.1",
+    "transformers>=5.3.0",
     "xxhash",
     "numpy",
     "safetensors",
@@ -25,7 +25,7 @@ dependencies = [
     "hf_transfer",
     "tiktoken",
     # Install from source for now, for latest support on Hopper
-    "flash-attn-4 @ git+ssh://git@github.com/Dao-AILab/flash-attention.git#subdirectory=flash_attn/cute",
+    "flash-attn-4 @ git+ssh://git@github.com/Dao-AILab/flash-attention.git@5301a359f59ef8fa10f211618d9f7a69716a8898#subdirectory=flash_attn/cute",
 ]
 
 [project.urls]
