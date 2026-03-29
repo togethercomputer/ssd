@@ -3,7 +3,6 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from flash_attn.cute.interface import flash_attn_varlen_func as fa4_varlen_func
 from ssd.layers.tree_mask import create_tree_score_mod
 from ssd.utils.context import get_context
@@ -89,7 +88,7 @@ class Attention(nn.Module):
                 k, v = k_cache, v_cache
 
             k, v = k.view(-1, self.num_kv_heads, self.head_dim), v.view(-1, self.num_kv_heads, self.head_dim)
-            o = flash_attn_varlen_func(q, k, v,
+            o, _ = fa4_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True)
@@ -106,10 +105,14 @@ class Attention(nn.Module):
 
             if verify_or_glue:
                 assert context.context_lens is not None
-                o = flash_attn_with_kvcache(q, k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, page_table=context.block_tables,
+                o, _ = fa4_varlen_func(q, k_cache, v_cache,
+                                        cu_seqlens_q=context.cu_seqlens_q,
+                                        cu_seqlens_k=None,
+                                        max_seqlen_q=context.max_seqlen_q,
+                                        max_seqlen_k=self.max_seqlen_k,
+                                        seqused_k=context.context_lens,
+                                        page_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True,
-                                        cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
                                         )
 
             elif tree_decode:
@@ -132,9 +135,15 @@ class Attention(nn.Module):
                     **score_mod_kwargs,
                 )
             else: # single query decode
-                q = q.unsqueeze(1)
-                o = flash_attn_with_kvcache(q, k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, page_table=context.block_tables,
+                batch_size = context.context_lens.shape[0]
+                cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=q.device)
+                o, _ = fa4_varlen_func(q, k_cache, v_cache,
+                                            cu_seqlens_q=cu_seqlens_q,
+                                            cu_seqlens_k=None,
+                                            max_seqlen_q=1,
+                                            max_seqlen_k=self.max_seqlen_k,
+                                            seqused_k=context.context_lens,
+                                            page_table=context.block_tables,
                                             softmax_scale=self.scale, causal=True,
                                             )
 
