@@ -96,11 +96,25 @@ class LLMEngine:
 
         # do this after so we can launch model runner above so that the q is actually populated
         if config.speculate and config.draft_async:
+            _timeout_s = 1200  # 20 minutes
+            _banner = "=" * 80
+            print(
+                f'\n{_banner}\n'
+                f'>>> TARGET: WAITING for draft runner to send kv_cache_size (timeout={_timeout_s}s) ...\n'
+                f'{_banner}\n',
+                flush=True,
+            )
             try:
-                num_blocks = init_q.get(timeout=180)  # seconds
+                num_blocks = init_q.get(timeout=_timeout_s)
             except Exception as e:
                 raise RuntimeError(
-                    "ERROR: Timed out waiting for draft kv cache size") from e
+                    f"ERROR: Timed out after {_timeout_s}s waiting for draft kv cache size") from e
+            print(
+                f'\n{_banner}\n'
+                f'>>> TARGET: Received draft kv_cache_size={num_blocks}!\n'
+                f'{_banner}\n',
+                flush=True,
+            )
 
             init_q.close()
             self.draft_cfg = DraftRunner.create_draft_config(config)

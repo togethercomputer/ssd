@@ -1,7 +1,7 @@
 
 import pickle
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -218,21 +218,26 @@ class ModelRunner:
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
             if config.async_nccl_port is not None:
+                _nccl_timeout = timedelta(minutes=20)
+                _banner = "=" * 80
                 print(
-                    f'[model_runner] Waiting for target server at '
+                    f'\n{_banner}\n'
+                    f'>>> DRAFT: WAITING for target server at '
                     f'{config.async_nccl_host}:{config.async_nccl_port} '
-                    f'to form NCCL process group...',
+                    f'to form NCCL process group (timeout={_nccl_timeout}) ...\n'
+                    f'{_banner}\n',
                     flush=True,
                 )
                 from torch.distributed import TCPStore
                 from ssd.utils.dist_utils import init_custom_process_group
                 store = TCPStore(config.async_nccl_host, port=config.async_nccl_port,
-                                 world_size=2, is_master=False)
+                                 world_size=2, is_master=False,
+                                 timeout=_nccl_timeout)
                 with torch.cuda.device(self.device):
                     self.async_pg = init_custom_process_group(
                         backend="nccl", store=store, world_size=2, rank=1,
-                        group_name="async_spec")
-                print('[model_runner] NCCL process group formed, now receiving kv_cache_size...', flush=True)
+                        group_name="async_spec", timeout=_nccl_timeout)
+                print(f'\n{_banner}\n>>> DRAFT: NCCL process group formed! Now receiving kv_cache_size...\n{_banner}\n', flush=True)
                 # Cross-node: receive kv_cache_size from target so draft
                 # allocates the same number of KV cache blocks.
                 kv_buf = torch.empty(1, dtype=torch.int64, device=self.device)
