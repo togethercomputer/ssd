@@ -6,19 +6,18 @@ CUDA_ARCH = os.environ.get("SSD_CUDA_ARCH", "9.0")
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", CUDA_ARCH)
 
 
-def _required_env(var_name: str, note: str) -> str:
-    value = os.environ.get(var_name)
-    if value:
-        return value
-    raise RuntimeError(f"Missing required env var {var_name}. {note}")
-
-
 # root directory where huggingface model snapshots are stored. each model
 # lives under this as models--org--name/snapshots/<hash>/. if you downloaded
 # models with `huggingface-cli download`, this is your HF_HOME/hub directory.
-HF_CACHE_DIR = _required_env(
+HF_CACHE_DIR = os.environ.get(
     "SSD_HF_CACHE",
-    "Set it to your HuggingFace cache hub directory (for example: /path/to/huggingface/hub).",
+    os.environ.get(
+        "HF_HUB_CACHE",
+        os.environ.get(
+            "HF_HOME",
+            os.path.expanduser("~/.cache/huggingface"),
+        )
+    )
 )
 
 # default target and draft model snapshot paths. these are full paths to the
@@ -50,9 +49,15 @@ EAGLE3_QWEN_32B = os.environ.get(
 # directory containing preprocessed benchmark datasets (jsonl files).
 # each dataset is a subdirectory with a file like humaneval_data_10000.jsonl.
 # you can generate these with scripts/get_data_from_hf.py.
-DATASET_DIR = _required_env(
+DATASET_DIR = os.environ.get(
     "SSD_DATASET_DIR",
-    "Set it to your processed dataset directory (for example: /path/to/processed_datasets).",
+    os.environ.get(
+        "HF_DATASETS_CACHE",
+        os.environ.get(
+            "HF_HOME",
+            os.path.expanduser("~/.cache/huggingface"),
+        )
+    )
 )
 DATASET_PATHS = {
     "humaneval":     f"{DATASET_DIR}/humaneval/humaneval_data_10000.jsonl",
