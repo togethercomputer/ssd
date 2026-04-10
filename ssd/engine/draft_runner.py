@@ -357,7 +357,7 @@ class DraftRunner(ModelRunner):
             for i in range(B):
                 accept_len = cache_keys[i, 1].item() + 1
                 self._acceptance_lengths.append(accept_len)
-                self._cache_hits.append(cache_hits[i].item())
+                self._cache_hits.append(int(cache_hits[i].item()))
 
         speculation_response = SpeculationResponse(
             speculations=out_tokens.reshape(-1).to(torch.int64),
