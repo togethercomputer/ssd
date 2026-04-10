@@ -37,7 +37,7 @@ def parse_arguments():
     parser.add_argument("--fl", type=int, nargs='+', default=None, help="Fan out list (e.g., --fl 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flh", type=int, nargs='+', default=None, help="Fan out list (e.g., --flh 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flm", type=int, nargs='+', default=None, help="Fan out list miss (e.g., --flm 1 3 4 becomes [1, 3, 4])")
-    parser.add_argument("--backup", type=str, choices=["jit", "fast"], default="jit", help="Backup strategy (jit or fast)")
+    parser.add_argument("--backup", type=str, choices=["jit", "force-jit", "fast"], default="jit", help="Backup strategy (jit or fast)")
 
     # Memory and batching configuration
     parser.add_argument("--block_sz", type=int, default=256, help="KV cache block size (see config.py: kvcache_block_size)")
@@ -129,7 +129,7 @@ def initialize_wandb(args, run_name):
             "gpus": args.gpus,
             "speculative_decoding": args.spec,
             "async_speculative": getattr(args, 'async', False),
-            "jit_speculative": args.backup == "jit",
+            "backup_strategy": args.backup,
             "k": args.k if args.spec else None,
             "f": args.f,
             "fan_out_list": args.flh,
@@ -172,8 +172,11 @@ def create_llm_kwargs(args, draft_path):
         max_num_seqs=args.b,
         max_model_len=args.max_model_len,
         sampler_x=args.x,
-        jit_speculate=(args.backup == "jit"),
+        jit_speculate=(args.backup == "jit" or args.backup == "force-jit"),
+        force_jit_speculate=(args.backup == "force-jit"),
         max_steps=args.max_steps,
+        communicate_cache_hits=True,
+        communicate_logits=True,
     )
 
     if args.flh is not None:

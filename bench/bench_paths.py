@@ -52,6 +52,10 @@ MODELS = {
         "BENCH_LLAMA_1B",
         f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.2-1B-Instruct",
     ),
+    "qwen_8b": os.environ.get(
+        "BENCH_QWEN_8B",
+        f"{HF_CACHE_DIR}/models--Qwen--Qwen3-8B",
+    ),
     "qwen_32b": os.environ.get(
         "BENCH_QWEN_32B",
         f"{HF_CACHE_DIR}/models--Qwen--Qwen3-32B",
@@ -62,11 +66,15 @@ MODELS = {
     ),
     "eagle3_llama_70b": os.environ.get(
         "BENCH_EAGLE3_LLAMA_70B",
-        "lmsys/SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge",
+        f"{HF_CACHE_DIR}/models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge",
     ),
     "eagle3_qwen_32b": os.environ.get(
         "BENCH_EAGLE3_QWEN_32B",
         "Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3",
+    ),
+    "phoenix2_qwen_8b": os.environ.get(
+        "BENCH_PHOENIX2_QWEN_8B",
+        "togethercomputer/phnx2-llama-decagon-4layer-v1.0",
     ),
 }
 
