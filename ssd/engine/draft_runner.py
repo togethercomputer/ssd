@@ -54,6 +54,11 @@ class DraftRunner(ModelRunner):
             self._reset_tree_cache_tensors()
             self._init_prealloc_buffers()
             self._draft_step_times = []
+            self._acceptance_lengths = []
+            self._cache_hits = []
+            self._acceptance_rate_log_path = os.environ.get("ACCEPTANCE_RATE_LOG", None)
+            if self._acceptance_rate_log_path:
+                print(f'[{_ts()}] DraftRunner will log acceptance rate to: {self._acceptance_rate_log_path}', flush=True)
             print(f'[{_ts()}] DraftRunner set up, starting draft_loop', flush=True)
             self.draft_loop()
 
@@ -219,7 +224,7 @@ class DraftRunner(ModelRunner):
         # Init miss slots with valid random logits so token IDs are in-vocab (fixes B>1 crash)
         out_logits = torch.empty(B, K, V, dtype=self.hf_config.torch_dtype, device=self.device).uniform_()
         out_tokens = out_logits.argmax(dim=-1)
-        cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
+        cache_hits = torch.zeros(B, dtype=torch.bool, device=self.device)
 
         assert request_keys.shape == (B, 3), f"ERROR in hit_cache: request_keys should be (B, 3), got {request_keys.shape}"
 
@@ -227,24 +232,24 @@ class DraftRunner(ModelRunner):
             B, K, self.hidden_states_dim,
             dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle_or_phoenix else None
-        
+
         # Statistics
         ttl += int(B)
-        
+
         if self.config.verbose:
             print(f"[{_ts()}] [hit_cache] Request keys: {request_keys}", flush=True)
             for i in range(B):
                 rec_token = request_keys[i, 2].item()
                 rec_text = self.tokenizer.decode([rec_token])
                 print(f"[{_ts()}]   Req {i}: token={rec_token} ('{rec_text}')", flush=True)
-        
+
         if self.tree_cache_keys.numel() > 0:
             # Vectorized membership against tensor cache
             eq = (request_keys.unsqueeze(1) == self.tree_cache_keys.unsqueeze(0))  # [B,T,3]
             match = torch.all(eq, dim=2)  # [B,T]
             cache_hits = match.any(dim=1)  # [B]
             ttl_hit += int(cache_hits.sum().item())
-            
+
             if self.config.verbose:
                 print(f"[{_ts()}] [hit_cache] Cache hits: {cache_hits.sum().item()}/{B}", flush=True)
                 print(f"[{_ts()}] [hit_cache] Cache: {self.tree_cache_keys.shape[0]} entries", flush=True)
@@ -263,9 +268,9 @@ class DraftRunner(ModelRunner):
                     rec_text = self.tokenizer.decode([rec_token])
                     hit_marker = "[HIT]" if i in hit_indices else ""
                     print(f"[{_ts()}]     [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
-            
+
             # Fill hits
-            if (cache_hits.any() and not self.config.jit_speculate) or (cache_hits.all() and self.config.jit_speculate):
+            if not self.config.force_jit_speculate and ((cache_hits.any() and not self.config.jit_speculate) or (cache_hits.all() and self.config.jit_speculate)):
                 # print(f'[hit_cache] got all cache hits, using cached logits and tokens', flush=True)
                 # [B], arbitrary if no match but masked out
                 idx = match.float().argmax(dim=1).to(torch.int64)
@@ -306,7 +311,7 @@ class DraftRunner(ModelRunner):
                 )
             if self.config.use_eagle_or_phoenix:
                 out_activations = jit_acts
-            
+
         rec_toks = request_keys[:, 2]
 
         if self.config.verbose:
@@ -345,9 +350,18 @@ class DraftRunner(ModelRunner):
         out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache(
             cache_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations)
 
+        if self._acceptance_rate_log_path:
+            # Collect per-step metrics for logging.
+            # cache_keys[:, 1] is last_spec_step_accepted_len - 1 from the target;
+            # first request has -1 (forced miss).
+            for i in range(B):
+                accept_len = cache_keys[i, 1].item() + 1
+                self._acceptance_lengths.append(accept_len)
+                self._cache_hits.append(cache_hits[i].item())
+
         speculation_response = SpeculationResponse(
             speculations=out_tokens.reshape(-1).to(torch.int64),
-            cache_hits=cache_hits.reshape(-1) if self.communicate_cache_hits else None,
+            cache_hits=cache_hits.reshape(-1).to(torch.int64) if self.communicate_cache_hits else None,
             logits_q=out_logits[:, :K, :].contiguous() if self.communicate_logits else None,
         )
         if BRIEF_LOG:
@@ -972,6 +986,20 @@ class DraftRunner(ModelRunner):
                 if self._draft_step_times:
                     avg_ms = sum(self._draft_step_times) * 1000 / len(self._draft_step_times)
                     print(f"[{_ts()}] [metrics] Avg draft step time (ms): {avg_ms:.2f}", flush=True)
+                if self._acceptance_rate_log_path and self._acceptance_lengths:
+                        import json
+                        avg_acc = sum(self._acceptance_lengths) / len(self._acceptance_lengths)
+                        hit_rate = sum(self._cache_hits) / len(self._cache_hits) if self._cache_hits else 0
+                        print(f"[{_ts()}] [metrics] Avg acceptance length: {avg_acc:.2f} ({len(self._acceptance_lengths)} steps)", flush=True)
+                        print(f"[{_ts()}] [metrics] Cache hit rate: {hit_rate:.2%} ({sum(self._cache_hits)}/{len(self._cache_hits)})", flush=True)
+                        print(f"[{_ts()}] [metrics] All acceptance lengths: {self._acceptance_lengths}", flush=True)
+                        print(f"[{_ts()}] [metrics] All cache hits: {self._cache_hits}", flush=True)
+                        print(f"[{_ts()}] [metrics] Logging acceptance lengths and cache hits to: {self._acceptance_rate_log_path}", flush=True)
+                        with open(self._acceptance_rate_log_path, "w") as f:
+                            json.dump({
+                                "acceptance_lengths": self._acceptance_lengths,
+                                "cache_hits": self._cache_hits,
+                            }, f)
                 self.exit()
                 break
 

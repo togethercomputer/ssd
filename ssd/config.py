@@ -33,6 +33,7 @@ class Config:
     fan_out_list_miss: list[int] | None = None
     sampler_x: float | None = None 
     jit_speculate: bool = False
+    force_jit_speculate: bool = False
     async_nccl_port: int | None = None
     async_nccl_host: str = "127.0.0.1"
     communicate_logits: bool = False
@@ -88,6 +89,7 @@ class Config:
                     print(f'[Config] Setting fan_out_list_miss to [sum(fan_out_list)] + [0] * speculate_k because jit_speculate is False', flush=True)
                     self.fan_out_list_miss = [sum(self.fan_out_list)] + [0] * self.speculate_k
                 elif self.fan_out_list_miss is None:
+                    # If you are jit speculating, always use the same fan_out_list for misses as for hits.
                     self.fan_out_list_miss = self.fan_out_list
 
                 assert sum(self.fan_out_list_miss) == sum(self.fan_out_list), "ERROR in Config: fan_out_list_miss must be the same as fan_out_list"
