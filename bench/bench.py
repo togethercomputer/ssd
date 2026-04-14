@@ -85,6 +85,8 @@ def parse_arguments():
         assert args.llama, "Eagle currently only supports llama models"
         assert args.temp == 0.0 and args.dtemp is None, "Eagle currently only supports greedy decoding (temp=0)"
         assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
+    if getattr(args, 'async', False):
+        args.spec = True
     return args
 
 
@@ -176,7 +178,7 @@ def create_llm_kwargs(args, draft_path):
         force_jit_speculate=(args.backup == "force-jit"),
         max_steps=args.max_steps,
         communicate_cache_hits=True,
-        communicate_logits=True,
+        communicate_logits=False,
     )
 
     if args.flh is not None:
