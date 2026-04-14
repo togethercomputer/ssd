@@ -255,18 +255,22 @@ class SpeculationRequest:
     def send(self, async_pg: dist.ProcessGroup, draft_rank: int):
         send_tensor(self.cmd, async_pg, draft_rank, name="cmd", prefix="TARGET:SpeculationRequest.send")
         send_tensor(self.metadata, async_pg, draft_rank, name="metadata", prefix="TARGET:SpeculationRequest.send")
-        fused_payload = concat_tensors_as_int64(
-            self.cache_keys,
-            self.num_tokens,
-            self.block_tables.to(torch.int64),
-            self.temps.view(torch.int32).to(torch.int64),
-        )
-        send_tensor(fused_payload, async_pg, draft_rank, name="fused payload", prefix="TARGET:SpeculationRequest.send")
+        # Fuse all payload fields (including EAGLE) into a single NCCL send
+        int64_parts = [
+            self.cache_keys.reshape(-1),
+            self.num_tokens.reshape(-1),
+            self.block_tables.to(torch.int64).reshape(-1),
+            self.temps.view(torch.int32).to(torch.int64).reshape(-1),
+        ]
         if self.eagle:
-            send_tensor(self.recovery_activations, async_pg, draft_rank, name="EAGLE recovery_activations", prefix="TARGET:SpeculationRequest.send")
-            send_tensor(self.extend_counts, async_pg, draft_rank, name="EAGLE extend_counts", prefix="TARGET:SpeculationRequest.send")
-            send_tensor(self.extend_activations, async_pg, draft_rank, name="EAGLE extend_activations", prefix="TARGET:SpeculationRequest.send")
-            send_tensor(self.extend_token_ids, async_pg, draft_rank, name="EAGLE extend_token_ids", prefix="TARGET:SpeculationRequest.send")
+            int64_parts.extend([
+                self.recovery_activations.contiguous().reshape(-1).view(torch.int64),
+                self.extend_counts.reshape(-1),
+                self.extend_activations.contiguous().reshape(-1).view(torch.int64),
+                self.extend_token_ids.reshape(-1),
+            ])
+        fused_payload = torch.cat(int64_parts)
+        send_tensor(fused_payload, async_pg, draft_rank, name="fused payload", prefix="TARGET:SpeculationRequest.send")
 
     @classmethod
     def receive(
@@ -297,8 +301,14 @@ class SpeculationRequest:
             tokenizer=tokenizer,
         )
 
-        # Receive all request payload in one fused int64 burst (includes temperatures encoded as int64)
-        fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
+        # Receive all payload (including EAGLE tensors) in one fused int64 burst
+        _dsz = torch.finfo(draft_dtype).bits // 8 if eagle else 0  # draft dtype element size
+        fused_total = (3 * B) + B + (B * max_blocks) + B  # cache_keys + num_tokens + block_tables + temps
+        if eagle:
+            fused_total += B * eagle_act_dim * _dsz // 8  # recovery_activations as int64
+            fused_total += B                                # extend_counts
+            fused_total += B * K * eagle_act_dim * _dsz // 8  # extend_activations as int64
+            fused_total += B * K                            # extend_token_ids
         fused_req = torch.empty(fused_total, dtype=torch.int64, device=device)
         fused_req = receive_tensor(fused_req, async_pg, target_rank, name="fused payload", prefix="DRAFT:SpeculationRequest.receive")
         off = 0
@@ -310,8 +320,19 @@ class SpeculationRequest:
         off += B * max_blocks
         temps_as_int64 = fused_req[off:off + B]
         off += B
-        assert off == fused_total
         speculation_request.temps = temps_as_int64.to(torch.int32).view(torch.float32)
+        if eagle:
+            n_rec = B * eagle_act_dim * _dsz // 8
+            speculation_request.recovery_activations = fused_req[off:off + n_rec].view(draft_dtype).view(B, eagle_act_dim)
+            off += n_rec
+            speculation_request.extend_counts = fused_req[off:off + B]
+            off += B
+            n_ext = B * K * eagle_act_dim * _dsz // 8
+            speculation_request.extend_activations = fused_req[off:off + n_ext].view(draft_dtype).view(B, K, eagle_act_dim)
+            off += n_ext
+            speculation_request.extend_token_ids = fused_req[off:off + B * K].view(B, K)
+            off += B * K
+        assert off == fused_total
 
         cache_keys, draft_block_tables, temperatures, num_tokens = (
             speculation_request.cache_keys, speculation_request.block_tables, speculation_request.temps, speculation_request.num_tokens
@@ -334,31 +355,29 @@ class SpeculationRequest:
             print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] temperatures={temperatures.tolist()}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
 
-        if eagle:
-            target_recovery_activations = receive_tensor(speculation_request.recovery_activations, async_pg, target_rank, name="EAGLE recovery_activations", prefix="DRAFT:SpeculationRequest.receive")
-            extend_counts = receive_tensor(speculation_request.extend_counts, async_pg, target_rank, name="EAGLE extend_counts", prefix="DRAFT:SpeculationRequest.receive")
-            extend_eagle_acts = receive_tensor(speculation_request.extend_activations, async_pg, target_rank, name="EAGLE extend_activations", prefix="DRAFT:SpeculationRequest.receive")
-            extend_token_ids = receive_tensor(speculation_request.extend_token_ids, async_pg, target_rank, name="EAGLE extend_token_ids", prefix="DRAFT:SpeculationRequest.receive")
-
-            if verbose:
-                print(f"[{_ts()}] [CACHE REQUEST] target_recovery_activations.shape={target_recovery_activations.shape}", flush=True)
-                print(f"[{_ts()}] [CACHE REQUEST] extend_counts.shape={extend_counts.shape}, {extend_counts.tolist()}", flush=True)
-                print(f"[{_ts()}] [CACHE REQUEST] extend_eagle_acts.shape={extend_eagle_acts.shape}", flush=True)
-                print(f"[{_ts()}] [CACHE REQUEST] extend_token_ids.shape={extend_token_ids.shape}, {extend_token_ids.tolist()}", flush=True)
-                recovery_tokens_target = cache_keys[:, 2].clone()
-                print(f"[{_ts()}] \n{'='*80}", flush=True)
-                print(f"[{_ts()}] [CACHE REQUEST] Batch size: {B}, Spec depth: {K}", flush=True)
-                for i in range(B):
-                    seq_id = cache_keys[i, 0].item()
-                    keep_idx = cache_keys[i, 1].item()
-                    rec_token_target = recovery_tokens_target[i].item()
-                    if tokenizer is not None:
-                        rec_token_text = f" (f'{tokenizer.decode([rec_token_target])}')"
-                    else:
-                        rec_token_text = ""
-                    n_ext = extend_counts[i].item()
-                    print(f"[{_ts()}]   Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target}{rec_token_text}, n_ext={n_ext}", flush=True)
-                print(f"[{_ts()}] {'='*80}\n", flush=True)
+        if eagle and verbose:
+            target_recovery_activations = speculation_request.recovery_activations
+            extend_counts = speculation_request.extend_counts
+            extend_eagle_acts = speculation_request.extend_activations
+            extend_token_ids = speculation_request.extend_token_ids
+            print(f"[{_ts()}] [CACHE REQUEST] target_recovery_activations.shape={target_recovery_activations.shape}", flush=True)
+            print(f"[{_ts()}] [CACHE REQUEST] extend_counts.shape={extend_counts.shape}, {extend_counts.tolist()}", flush=True)
+            print(f"[{_ts()}] [CACHE REQUEST] extend_eagle_acts.shape={extend_eagle_acts.shape}", flush=True)
+            print(f"[{_ts()}] [CACHE REQUEST] extend_token_ids.shape={extend_token_ids.shape}, {extend_token_ids.tolist()}", flush=True)
+            recovery_tokens_target = cache_keys[:, 2].clone()
+            print(f"[{_ts()}] \n{'='*80}", flush=True)
+            print(f"[{_ts()}] [CACHE REQUEST] Batch size: {B}, Spec depth: {K}", flush=True)
+            for i in range(B):
+                seq_id = cache_keys[i, 0].item()
+                keep_idx = cache_keys[i, 1].item()
+                rec_token_target = recovery_tokens_target[i].item()
+                if tokenizer is not None:
+                    rec_token_text = f" (f'{tokenizer.decode([rec_token_target])}')"
+                else:
+                    rec_token_text = ""
+                n_ext = extend_counts[i].item()
+                print(f"[{_ts()}]   Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target}{rec_token_text}, n_ext={n_ext}", flush=True)
+            print(f"[{_ts()}] {'='*80}\n", flush=True)
 
         if BRIEF_LOG:
             cache_keys = speculation_request.cache_keys
