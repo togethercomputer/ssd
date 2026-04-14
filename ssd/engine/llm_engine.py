@@ -45,7 +45,7 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size 
 
         assert config.num_gpus > 1 or not config.draft_async, "ERROR: draft_async requires at least 2 gpus"
-            
+
         # Check that target and draft are from the same family
         if config.speculate:
             target_family = infer_model_family(config.model)
@@ -56,18 +56,22 @@ class LLMEngine:
         self.events = []
 
         ctx = mp.get_context("spawn")
-        self.num_tp_gpus = config.num_gpus if not self.config.draft_async else config.num_gpus - 1
+        draft_tp = config.draft_tp_size if self.config.draft_async else 1
+        self.num_tp_gpus = config.num_gpus - draft_tp if self.config.draft_async else config.num_gpus
+        draft_leader_rank = self.num_tp_gpus  # first draft rank = N-M
 
         if config.speculate and config.draft_async:
             self.draft_ps = None
+            self.draft_tp_ps = []
+            self.draft_tp_events = []
 
+        # 1) Spawn target TP followers (ranks 1..num_tp_gpus-1)
         for i in range(1, self.num_tp_gpus):
             if self.config.verbose:
                 print(f'creating ModelRunner process {i}', flush=True)
             event = ctx.Event()
-            # can't pass kwargs through ctx.Process args
             process = ctx.Process(target=ModelRunner, args=(
-                config, i, event, False, self.num_tp_gpus))
+                config, i, event, False, self.num_tp_gpus, None, draft_tp))
             process.start()
             self.ps.append(process)
             self.events.append(event)
@@ -77,22 +81,35 @@ class LLMEngine:
                 f'config.speculate = {config.speculate} and config.draft_async = {config.draft_async} about to create draft runner', flush=True)
 
         if config.speculate and config.draft_async:
+            # 2) Spawn draft TP followers (ranks draft_leader_rank+1..num_gpus-1)
+            if draft_tp > 1:
+                draft_config = DraftRunner.create_draft_config(config)
+                for i in range(draft_leader_rank + 1, config.num_gpus):
+                    event = ctx.Event()
+                    process = ctx.Process(target=ModelRunner, args=(
+                        draft_config, i, event, True, draft_tp, None, draft_tp))
+                    process.start()
+                    self.draft_tp_ps.append(process)
+                    self.draft_tp_events.append(event)
+
+            # 3) Spawn draft leader
             init_q = ctx.Queue()
-            draft_rank = config.num_gpus - 1
             self.draft_ps = ctx.Process(
                 target=DraftRunner, args=(
                     DraftRunner.create_draft_config(config),
-                    draft_rank,
+                    draft_leader_rank,
                     init_q,
+                    draft_tp,
+                    self.draft_tp_events if draft_tp > 1 else None,
                 ),
             )
             self.draft_ps.start()
             print(
-                f'Draft runner created on rank {draft_rank} (async)!', flush=True)
+                f'Draft runner created on rank {draft_leader_rank} (async, draft_tp={draft_tp})!', flush=True)
 
-        # modelRunner(0) will wait on all 5 processes, so other 4 need to have launched by now
+        # 4) Create target rank 0 ModelRunner — must be after all other processes launched
         self.model_runner = ModelRunner(
-            config, 0, self.events, is_draft=False, num_tp_gpus=self.num_tp_gpus)
+            config, 0, self.events, is_draft=False, num_tp_gpus=self.num_tp_gpus, draft_tp_size=draft_tp)
 
         # do this after so we can launch model runner above so that the q is actually populated
         if config.speculate and config.draft_async:
@@ -174,6 +191,15 @@ class LLMEngine:
                 if self.draft_ps.is_alive():
                     self.draft_ps.terminate()
                     self.draft_ps.join(timeout=2)
+        except Exception:
+            pass
+        # 4b) Draft TP follower processes
+        try:
+            for p in getattr(self, 'draft_tp_ps', []):
+                p.join(timeout=3)
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=2)
         except Exception:
             pass
         # 5) Kill resource tracker so it doesn't print spurious warnings,

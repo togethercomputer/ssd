@@ -45,8 +45,8 @@ def _ts():
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event], is_draft: bool = False, num_tp_gpus: int = -1, init_q = None):
-        if config.verbose: print(f'ModelRunner init got args: rank={rank}, is_draft={is_draft}, num_tp_gpus={num_tp_gpus}', flush=True)
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], is_draft: bool = False, num_tp_gpus: int = -1, init_q = None, draft_tp_size: int = 1):
+        if config.verbose: print(f'ModelRunner init got args: rank={rank}, is_draft={is_draft}, num_tp_gpus={num_tp_gpus}, draft_tp_size={draft_tp_size}', flush=True)
         self.config = config
         
         assert is_draft in [True, False], "ERROR in ModelRunner: is_draft must be True or False"
@@ -66,33 +66,43 @@ class ModelRunner:
 
         assert self.hf_config is not None, "ERROR in ModelRunner: hf_config is None" # this implies boundedness to the end 
         
-        # TODO: Get rid of this.
         if self.is_draft:
-            should_use_dist = self.config.draft_async and self.config.async_nccl_port is None
+            # Draft needs dist when same-node async, OR when cross-node with draft TP > 1
+            should_use_dist = (self.config.draft_async and self.config.async_nccl_port is None) or draft_tp_size > 1
         else:
             should_use_dist = self.config.num_gpus > 1
 
         # determines whether we create a process group and our process is aware of others, etc
-        self.world_size = config.num_gpus if should_use_dist else 1
+        self.draft_tp_size = draft_tp_size
+        _is_cross_node_draft_tp = self.is_draft and self.config.async_nccl_port is not None and draft_tp_size > 1
+        if _is_cross_node_draft_tp:
+            self.world_size = draft_tp_size  # cross-node draft TP: world is just the draft ranks
+        else:
+            self.world_size = config.num_gpus if should_use_dist else 1
         self.rank = rank
         self.use_eagle = config.use_eagle
 
         if config.draft_async:
-            self.draft_rank = config.num_gpus - 1
+            self.draft_rank = config.num_gpus - self.draft_tp_size  # draft leader rank
             if self.is_draft:
                 # [N, 3] int64, {(seq_id, len(new_suffix), rec_token): (speculated_tokens, logits_q)}
                 self.prev_fork_keys: torch.Tensor | None = None
                 self.prev_fork_block_tables: torch.Tensor | None = None  # [N, M] int32 with -1 padding
 
         self.num_tp_gpus = num_tp_gpus # will be in [1 if no dist, num_gpus if not async, num_gpus-1 if async]
-        
-        if self.world_size == 1: # sync speculation or genuine single gpu 
+        # is_tp_leader: True for target rank 0 and draft leader, used to gate SHM writes
+        if self.is_draft:
+            self.is_tp_leader = (rank == self.draft_rank) if config.draft_async else True
+        else:
+            self.is_tp_leader = (rank == 0)
+
+        if self.world_size == 1: # sync speculation or genuine single gpu
             assert (config.speculate and not config.draft_async) or self.num_tp_gpus == 1, "ERROR in ModelRunner: draft and async must be False or num_tp_gpus=1"
 
         self.verbose = config.verbose
         self.draft_async = config.draft_async
         self.event = event
-        self._exiting = False 
+        self._exiting = False
         
         torch.cuda.set_device(self.rank)
         self.device = torch.device(f'cuda:{self.rank}')
@@ -104,26 +114,52 @@ class ModelRunner:
             self._init_flashinfer_wrappers()
         
         if self.verbose: print(f'INSIDE MODEL RUNNER INIT, DRAFT={is_draft}', flush=True)
-        self.tp_pg = None 
+        self.tp_pg = None
 
-        if should_use_dist: 
-            default_port = 1223 
-            dist.init_process_group(
-                "nccl", f"tcp://localhost:{default_port}",
-                world_size=self.world_size,
-                rank=self.rank,
-                device_id=self.device,
-            )
+        if should_use_dist:
+            _is_cross_node_draft = self.is_draft and self.config.async_nccl_port is not None
+            if _is_cross_node_draft:
+                # Cross-node draft TP: draft ranks form their own process group
+                _draft_dist_port = 1224
+                _local_rank = self.rank  # rank is already local (0..M-1) in cross-node
+                dist.init_process_group(
+                    "nccl", f"tcp://localhost:{_draft_dist_port}",
+                    world_size=self.draft_tp_size,
+                    rank=_local_rank,
+                    device_id=self.device,
+                )
+                self.tp_pg = dist.new_group(ranks=list(range(self.draft_tp_size)))
+            else:
+                # Same-node: all N ranks share one process group
+                default_port = 1223
+                dist.init_process_group(
+                    "nccl", f"tcp://localhost:{default_port}",
+                    world_size=self.world_size,
+                    rank=self.rank,
+                    device_id=self.device,
+                )
 
-            self.tp_pg = dist.new_group(ranks=list(range(self.num_tp_gpus))) # everyone should see the new_group init even if not in group 
+                # Target TP group — all N ranks must call new_group (collective)
+                target_tp_pg = dist.new_group(ranks=list(range(self.num_tp_gpus)))
+
+                # Draft TP group — all N ranks must call new_group if draft_tp > 1
+                draft_tp_pg = None
+                if self.draft_tp_size > 1:
+                    draft_ranks = list(range(self.num_tp_gpus, self.num_tp_gpus + self.draft_tp_size))
+                    draft_tp_pg = dist.new_group(ranks=draft_ranks)
+
+                # Assign the correct TP group
+                if self.is_draft:
+                    self.tp_pg = draft_tp_pg  # None when draft_tp=1 (same as before)
+                else:
+                    self.tp_pg = target_tp_pg
 
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        
-        if self.is_draft:
-            assert num_tp_gpus == 1, "ERROR in ModelRunner: draft should have tp_size=1"
-            self.tp_pg = None # every rank is given an object from self.tp_pg, even tho draft doesnt participate it gets GROUP_NON_MEMBER object != None back, so we can't assert None here, we 
+
+        if self.is_draft and self.num_tp_gpus == 1:
+            self.tp_pg = None  # single-GPU draft: no TP group needed
         
         print(f'[model_runner] about to setup and warmup model and cudagraphs, is use_eagle={self.use_eagle}', flush=True)
         model_type = self.setup_and_warmup_model_and_cudagraphs(config, self.hf_config, init_q, is_draft)
@@ -145,23 +181,39 @@ class ModelRunner:
             self.config.MQ_LEN = sum(self.config.fan_out_list)
             print(f'F={self.config.async_fan_out}, fan_out_list={self.config.fan_out_list}, fan_out_list_miss={self.config.fan_out_list_miss}, MQ_LEN={self.config.MQ_LEN}', flush=True)
 
-        if should_use_dist: # (draft model when async=False or just single gpu logic) doesn't even enter this loop 
-            if self.is_draft and self.draft_async: 
-                pass # handled on draft runner after this init, includes doing draft_loop
-            elif self.rank == 0: # target in a distributed setup 
+        if should_use_dist: # (draft model when async=False or just single gpu logic) doesn't even enter this loop
+            if self.is_draft and self.draft_async:
+                if self.draft_tp_size > 1:
+                    if self.is_tp_leader:  # draft leader: create SHM for draft TP followers
+                        try:
+                            existing_shm = SharedMemory(name="ssd_draft")
+                            existing_shm.close()
+                            existing_shm.unlink()
+                        except FileNotFoundError:
+                            pass
+                        self.shm = SharedMemory(name="ssd_draft", create=True, size=2**28)
+                        dist.barrier(group=self.tp_pg, device_ids=[self.rank])
+                        # Return to DraftRunner.__init__ which will enter draft_loop
+                    else:  # draft TP follower
+                        dist.barrier(group=self.tp_pg, device_ids=[self.rank])
+                        self.shm = SharedMemory(name="ssd_draft")
+                        self.draft_follower_loop()
+                else:
+                    pass  # single-GPU draft, handled on draft runner after this init
+            elif self.rank == 0: # target in a distributed setup
                 # Try to clean up any existing shared memory first
                 try:
                     existing_shm = SharedMemory(name="ssd")
-                    existing_shm.close() # here we bind it 
+                    existing_shm.close() # here we bind it
                     existing_shm.unlink()
                 except FileNotFoundError:
-                    # can proceed, nothing to clean up 
+                    # can proceed, nothing to clean up
                     pass
-                
+
                 self.shm = SharedMemory(name="ssd", create=True, size=2**28)
-                dist.barrier(group=self.tp_pg, device_ids=[self.rank]) # leader on tp_group 
-            else: 
-                dist.barrier(group=self.tp_pg, device_ids=[self.rank]) # follower on tp_group, don't want them hooking onto shm before its been created 
+                dist.barrier(group=self.tp_pg, device_ids=[self.rank]) # leader on tp_group
+            else:
+                dist.barrier(group=self.tp_pg, device_ids=[self.rank]) # follower on tp_group, don't want them hooking onto shm before its been created
                 self.shm = SharedMemory(name="ssd")
                 self.loop()
                 
@@ -385,7 +437,7 @@ class ModelRunner:
         try:
             if hasattr(self, "shm") and self.shm is not None:
                 self.shm.close()
-                if self.rank == 0:
+                if self.is_tp_leader:
                     try:
                         self.shm.unlink()
                     except Exception:
@@ -405,8 +457,10 @@ class ModelRunner:
             except Exception:
                 pass
             try:
-                # Default group
-                if (self.world_size > 1 or (self.draft_async and self.is_draft)) and self.config.async_nccl_port is None:
+                # Default group (same-node shared group, or cross-node draft TP group)
+                _has_dist_group = (self.world_size > 1 or (self.draft_async and self.is_draft)) and self.config.async_nccl_port is None
+                _has_cross_node_draft_tp = self.is_draft and self.config.async_nccl_port is not None and self.draft_tp_size > 1
+                if _has_dist_group or _has_cross_node_draft_tp:
                     dist.destroy_process_group()
             except Exception:
                 pass
@@ -463,7 +517,7 @@ class ModelRunner:
         return command, None
 
     def read_shm(self):
-        assert self.world_size > 1 and self.rank
+        assert not self.is_tp_leader, "read_shm should only be called by TP followers"
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
@@ -471,7 +525,7 @@ class ModelRunner:
         return method_name, args
 
     def write_shm(self, method_name, *args):
-        assert self.world_size > 1 and not self.rank
+        assert self.is_tp_leader, "write_shm should only be called by TP leaders"
         data = pickle.dumps([method_name, *args])
         n = len(data)
         assert n + 4 <= self.shm.size, f"SHM overflow: {n+4} > {self.shm.size}. Increase SHM buffer size."
@@ -481,12 +535,29 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
+        if self.world_size > 1 and self.is_tp_leader:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         if method is None:
             raise AttributeError(f"Method '{method_name}' not found")
         return method(*args)
+
+    def draft_follower_loop(self):
+        """TP follower loop for draft model. Receives run_model calls from draft leader via SHM."""
+        from ssd.utils.context import set_context_from_dict
+        while True:
+            self.event.wait()
+            n = int.from_bytes(self.shm.buf[0:4], "little")
+            data = pickle.loads(self.shm.buf[4:n+4])
+            self.event.clear()
+            method_name = data[0]
+            if method_name == "exit":
+                break
+            # data = ["run_model", ctx_dict, arg1, arg2, ...]
+            ctx_dict = data[1]
+            args = data[2:]
+            set_context_from_dict(ctx_dict)
+            ModelRunner.run_model(self, *args)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -646,8 +717,8 @@ class ModelRunner:
             kv_indptr,
             kv_indices,
             kv_last_page_len,
-            self.hf_config.num_attention_heads,
-            self.hf_config.num_key_value_heads,
+            self.hf_config.num_attention_heads // self.num_tp_gpus,
+            self.hf_config.num_key_value_heads // self.num_tp_gpus,
             self.hf_config.head_dim,
             self.block_size,
             custom_mask=custom_mask,

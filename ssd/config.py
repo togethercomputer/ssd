@@ -38,8 +38,11 @@ class Config:
     communicate_logits: bool = False
     communicate_cache_hits: bool = False
 
+    # draft tensor parallelism
+    draft_tp_size: int = 1
+
     # eagle3
-    use_eagle: bool = False 
+    use_eagle: bool = False
     eagle_layers: list[int] | None = None   
     d_model_target: int | None = None
     tokenizer_path: str | None = None
@@ -57,7 +60,12 @@ class Config:
         model = self.model
         assert os.path.isdir(model)
 
-        assert 1 <= self.num_gpus <= 8 # this codebase only works on one node 
+        assert 1 <= self.num_gpus <= 8 # this codebase only works on one node
+        assert 1 <= self.draft_tp_size, "draft_tp_size must be >= 1"
+        if self.draft_async and self.async_nccl_port is None:
+            assert self.num_gpus > self.draft_tp_size, (
+                f"Same-node draft_async requires num_gpus ({self.num_gpus}) > draft_tp_size ({self.draft_tp_size})"
+            )
         self.hf_config = AutoConfig.from_pretrained(model)
 
         if not self.speculate:

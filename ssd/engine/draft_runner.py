@@ -7,7 +7,7 @@ import dataclasses
 
 from ssd.engine.model_runner import ModelRunner
 from ssd.config import Config
-from ssd.utils.context import set_context, reset_context
+from ssd.utils.context import set_context, reset_context, get_context, context_to_dict
 from ssd.utils.misc import compress_neg_ones_and_zeros
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
 from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
@@ -38,12 +38,13 @@ class DraftRunner(ModelRunner):
         )
         return draft_cfg
 
-    def __init__(self, draft_cfg: Config, rank: int = 0, init_q = None):
-        print(f'[DraftRunner.__init__] draft_cfg={draft_cfg}', flush=True)
+    def __init__(self, draft_cfg: Config, rank: int = 0, init_q = None, draft_tp_size: int = 1, draft_tp_events=None):
+        print(f'[DraftRunner.__init__] draft_cfg={draft_cfg}, draft_tp_size={draft_tp_size}', flush=True)
         self.draft_cfg = draft_cfg
-        self.is_draft = True # this is is_draft, use self.config.draft for the draft model path 
+        self.is_draft = True # this is is_draft, use self.config.draft for the draft model path
         self.prev_num_tokens = None
-        super().__init__(self.draft_cfg, rank=rank, event=None, is_draft=True, num_tp_gpus=1, init_q=init_q)
+        super().__init__(self.draft_cfg, rank=rank, event=draft_tp_events, is_draft=True,
+                         num_tp_gpus=draft_tp_size, init_q=init_q, draft_tp_size=draft_tp_size)
         self._prefill_metadata = torch.empty(5, dtype=torch.int64, device=self.device)
         self._decode_metadata = torch.empty(4, dtype=torch.int64, device=self.device)
         self.target_rank = 0
@@ -60,6 +61,36 @@ class DraftRunner(ModelRunner):
             self._draft_step_times = []
             print(f'[{_ts()}] DraftRunner set up, starting draft_loop', flush=True)
             self.draft_loop()
+
+    def run_model(self, input_ids, positions, is_prefill, last_only=True,
+                  tree_decode_step=-1, cache_hits=None, hidden_states=None):
+        """Override to broadcast context + args to draft TP followers before running."""
+        if self.draft_tp_size > 1:
+            import pickle
+            ctx = get_context()
+            ctx_dict = context_to_dict(ctx)
+            data = pickle.dumps(["run_model", ctx_dict, input_ids, positions,
+                                 is_prefill, last_only, tree_decode_step,
+                                 cache_hits, hidden_states])
+            n = len(data)
+            assert n + 4 <= self.shm.size, f"Draft SHM overflow: {n+4} > {self.shm.size}"
+            self.shm.buf[0:4] = n.to_bytes(4, "little")
+            self.shm.buf[4:n+4] = data
+            for event in self.event:
+                event.set()
+        return super().run_model(input_ids, positions, is_prefill, last_only,
+                                 tree_decode_step, cache_hits, hidden_states)
+
+    def _broadcast_exit_to_followers(self):
+        """Signal draft TP followers to exit their loop."""
+        if self.draft_tp_size > 1 and hasattr(self, 'shm'):
+            import pickle
+            data = pickle.dumps(["exit"])
+            n = len(data)
+            self.shm.buf[0:4] = n.to_bytes(4, "little")
+            self.shm.buf[4:n+4] = data
+            for event in self.event:
+                event.set()
 
     def draft_async_prefill(self):
         assert self.draft_async and self.is_draft
@@ -957,6 +988,7 @@ class DraftRunner(ModelRunner):
                 if self._draft_step_times:
                     avg_ms = sum(self._draft_step_times) * 1000 / len(self._draft_step_times)
                     print(f"[{_ts()}] [metrics] Avg draft step time (ms): {avg_ms:.2f}", flush=True)
+                self._broadcast_exit_to_followers()
                 self.exit()
                 break
 
