@@ -637,61 +637,122 @@ class DraftRunner(ModelRunner):
             rec_tok_ids = gd_view[:, 0]
             spec_tok_ids = gd_view[:, 1:]
 
-            # Variable per-seq lengths: n_ext[b] + K + 1
-            seqlens_q = (extend_counts + K + 1).to(torch.int32)
-            cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
-            cu_seqlens_q[1:] = torch.cumsum(seqlens_q, 0)
-            total_real = int(cu_seqlens_q[-1].item())
+            # Check if all extend counts are the same (common case) for vectorized fast path
+            n_ext_0 = int(extend_counts[0].item())
+            uniform_extends = (B == 1) or (extend_counts == n_ext_0).all().item()
 
-            # Build packed fused_ids and fused_hs (no padding, no for loops)
-            fused_ids = torch.empty(total_real, dtype=torch.int64, device=self.device)
-            fused_hs = torch.empty(total_real, hidden_size, dtype=self.hf_config.torch_dtype, device=self.device)
+            if uniform_extends:
+                # ── Fast path: regular layout (all seqs have same length) ──
+                # Layout per seq: [ext_0, ..., ext_{n-1}, rec, spec_0, ..., spec_{K-1}]
+                sl = n_ext_0 + K + 1   # uniform sequence length
+                total_real = B * sl
+                fused_ids = torch.empty(total_real, dtype=torch.int64, device=self.device)
+                fused_hs = torch.empty(total_real, hidden_size, dtype=self.hf_config.torch_dtype, device=self.device)
+                fid_v = fused_ids.view(B, sl)
+                fhs_v = fused_hs.view(B, sl, hidden_size)
 
-            # Per-token batch index and local offset
-            batch_idx = torch.repeat_interleave(torch.arange(B, device=self.device), seqlens_q)
-            local_off = torch.arange(total_real, device=self.device) - cu_seqlens_q[:-1].long().repeat_interleave(seqlens_q)
-            n_ext = extend_counts.long()  # [B]
-            n_ext_per_tok = n_ext[batch_idx]  # [total_real]
+                # Extend tokens: positions 0..n_ext-1 (need fc / target acts)
+                if n_ext_0 > 0 and extend_eagle_acts_batch is not None:
+                    fid_v[:, :n_ext_0] = extend_token_ids_batch[:, :n_ext_0]
+                    ext_fc_in = extend_eagle_acts_batch[:, :n_ext_0].reshape(B * n_ext_0, -1).to(fc_dtype)
+                else:
+                    ext_fc_in = None
 
-            # Classify each token: extend (local < n_ext), rec (local == n_ext), spec (local > n_ext)
-            is_extend = local_off < n_ext_per_tok
-            is_rec = local_off == n_ext_per_tok
-            is_spec = local_off > n_ext_per_tok
+                # Recovery token: position n_ext_0
+                fid_v[:, n_ext_0] = rec_tok_ids
+                rec_fc_in = target_acts.to(fc_dtype)
 
-            # Extend + rec tokens: batch fc into single call
-            is_target_conditioned = is_extend | is_rec
-            tc_b = batch_idx[is_target_conditioned]
-            tc_local = local_off[is_target_conditioned]
-            tc_n_ext = n_ext_per_tok[is_target_conditioned]
+                # Single batched fc call for all extend + rec tokens
+                fc_in = torch.cat([ext_fc_in, rec_fc_in], dim=0) if ext_fc_in is not None else rec_fc_in
+                if self.config.use_eagle:
+                    fc_out = self.model.fc(fc_in)
+                else:
+                    fc_out = fc_in  # Phoenix: no fc, use activations directly
+                if n_ext_0 > 0:
+                    fhs_v[:, :n_ext_0, :] = fc_out[:B * n_ext_0].view(B, n_ext_0, hidden_size)
+                    fhs_v[:, n_ext_0, :] = fc_out[B * n_ext_0:]
+                else:
+                    fhs_v[:, 0, :] = fc_out
 
-            # Gather target acts: extend uses extend_eagle_acts_batch[b,j], rec uses target_acts[b]
-            tc_is_ext = tc_local < tc_n_ext
-            tc_acts = torch.empty(tc_b.size(0), target_acts.size(1), dtype=fc_dtype, device=self.device)
-            if tc_is_ext.any() and extend_eagle_acts_batch is not None:
-                ext_b = tc_b[tc_is_ext]
-                ext_j = tc_local[tc_is_ext]
-                tc_acts[tc_is_ext] = extend_eagle_acts_batch[ext_b, ext_j].to(fc_dtype)
-                fused_ids[is_extend] = extend_token_ids_batch[ext_b, ext_j]
-            tc_acts[~tc_is_ext] = target_acts[tc_b[~tc_is_ext]].to(fc_dtype)
-            fused_ids[is_rec] = rec_tok_ids[batch_idx[is_rec]]
+                # Spec tokens: positions n_ext_0+1..sl-1 (no fc needed)
+                fid_v[:, n_ext_0 + 1:] = spec_tok_ids
+                fhs_v[:, n_ext_0 + 1:, :] = prev_acts
 
-            # Single batched fc call
-            if self.config.use_eagle:
-                fused_hs[is_target_conditioned] = self.model.fc(tc_acts)
-            elif self.config.use_phoenix:
-                fused_hs[is_target_conditioned] = tc_acts
+                # cu_seqlens_q: regular spacing
+                cu_seqlens_q = (torch.arange(B + 1, device=self.device, dtype=torch.int32) * sl)
+                seqlens_q = torch.full((B,), sl, device=self.device, dtype=torch.int32)
 
-            # Spec tokens: ids from spec_tok_ids, hs from prev_acts (self-conditioned, no fc)
-            spec_j = local_off[is_spec] - n_ext_per_tok[is_spec] - 1  # 0..K-1
-            fused_ids[is_spec] = spec_tok_ids[batch_idx[is_spec], spec_j]
-            fused_hs[is_spec] = prev_acts[batch_idx[is_spec], spec_j]
+                # Positions and slot mapping via arange arithmetic (no repeat_interleave)
+                tok_idx = torch.arange(total_real, device=self.device, dtype=torch.int64)
+                batch_idx_fast = tok_idx // sl
+                local_off_fast = tok_idx % sl
+                base_pos = (partial_tree_decode_args["num_tokens"] - 2 - n_ext_0).long()
+                positions = base_pos[batch_idx_fast] + local_off_fast
+                context_lens = (partial_tree_decode_args["num_tokens"] - 1 + K).to(torch.int32)
+                block_idx = (positions // self.block_size).clamp(0, dbt.shape[1] - 1).to(torch.int64)
+                block_off = (positions % self.block_size).to(torch.int32)
+                blk_ids = dbt[batch_idx_fast, block_idx]
+                slot_map = (blk_ids * self.block_size + block_off).to(torch.int32)
 
-            glue_decode_ctxt = self.prepare_glue_decode_ctxt_eagle(
-                num_tokens=partial_tree_decode_args["num_tokens"],
-                fused_ids=fused_ids, fused_hs=fused_hs,
-                extend_counts=extend_counts, seqlens_q=seqlens_q,
-                cu_seqlens_q=cu_seqlens_q, dbt=dbt, B=B,
-            )
+                glue_decode_ctxt = {
+                    "input_ids": fused_ids,
+                    "positions": positions,
+                    "slot_map": slot_map,
+                    "hidden_states": fused_hs,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "max_seqlen_q": sl,
+                    "context_lens": context_lens,
+                    "block_tables": dbt,
+                }
+            else:
+                # ── Fallback: variable-length layout (repeat_interleave + boolean masks) ──
+                seqlens_q = (extend_counts + K + 1).to(torch.int32)
+                cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+                cu_seqlens_q[1:] = torch.cumsum(seqlens_q, 0)
+                total_real = int(cu_seqlens_q[-1].item())
+
+                fused_ids = torch.empty(total_real, dtype=torch.int64, device=self.device)
+                fused_hs = torch.empty(total_real, hidden_size, dtype=self.hf_config.torch_dtype, device=self.device)
+
+                batch_idx = torch.repeat_interleave(torch.arange(B, device=self.device), seqlens_q)
+                local_off = torch.arange(total_real, device=self.device) - cu_seqlens_q[:-1].long().repeat_interleave(seqlens_q)
+                n_ext = extend_counts.long()
+                n_ext_per_tok = n_ext[batch_idx]
+
+                is_extend = local_off < n_ext_per_tok
+                is_rec = local_off == n_ext_per_tok
+                is_spec = local_off > n_ext_per_tok
+
+                is_target_conditioned = is_extend | is_rec
+                tc_b = batch_idx[is_target_conditioned]
+                tc_local = local_off[is_target_conditioned]
+                tc_n_ext = n_ext_per_tok[is_target_conditioned]
+
+                tc_is_ext = tc_local < tc_n_ext
+                tc_acts = torch.empty(tc_b.size(0), target_acts.size(1), dtype=fc_dtype, device=self.device)
+                if tc_is_ext.any() and extend_eagle_acts_batch is not None:
+                    ext_b = tc_b[tc_is_ext]
+                    ext_j = tc_local[tc_is_ext]
+                    tc_acts[tc_is_ext] = extend_eagle_acts_batch[ext_b, ext_j].to(fc_dtype)
+                    fused_ids[is_extend] = extend_token_ids_batch[ext_b, ext_j]
+                tc_acts[~tc_is_ext] = target_acts[tc_b[~tc_is_ext]].to(fc_dtype)
+                fused_ids[is_rec] = rec_tok_ids[batch_idx[is_rec]]
+
+                if self.config.use_eagle:
+                    fused_hs[is_target_conditioned] = self.model.fc(tc_acts)
+                elif self.config.use_phoenix:
+                    fused_hs[is_target_conditioned] = tc_acts
+
+                spec_j = local_off[is_spec] - n_ext_per_tok[is_spec] - 1
+                fused_ids[is_spec] = spec_tok_ids[batch_idx[is_spec], spec_j]
+                fused_hs[is_spec] = prev_acts[batch_idx[is_spec], spec_j]
+
+                glue_decode_ctxt = self.prepare_glue_decode_ctxt_eagle(
+                    num_tokens=partial_tree_decode_args["num_tokens"],
+                    fused_ids=fused_ids, fused_hs=fused_hs,
+                    extend_counts=extend_counts, seqlens_q=seqlens_q,
+                    cu_seqlens_q=cu_seqlens_q, dbt=dbt, B=B,
+                )
         else:
             # Non-EAGLE: K+1 per seq, uses verify CG path
             B = glue_decode_input_ids.shape[0] // (K + 1)
