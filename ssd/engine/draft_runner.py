@@ -19,8 +19,7 @@ NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 BRIEF_LOG = os.environ.get("SSD_BRIEF_LOG", "0") == "1"
 
 def _ts():
-    return f'{datetime.now().strftime('%H:%M:%S.%f')[:-3]}'
-
+    return f'{datetime.now().strftime("%H:%M:%S.%f")[:-3]}'
 
 ttl = 0
 ttl_hit = 0
@@ -423,6 +422,25 @@ class DraftRunner(ModelRunner):
                 print(f"[{_ts()}]   req[{i}]: speculations={spec_ids}", flush=True)
                 print(f"[{_ts()}]            decoded={spec_text}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
+
+        if _prof or PROFILE_DRAFT:
+            torch.cuda.synchronize()
+            _d3 = time.perf_counter()
+            print(f"[PROFILE draft._service_spec_request] receive={(_d1-_d0)*1000:.2f}ms, "
+                  f"hit_cache={(_d2-_d1)*1000:.2f}ms, "
+                  f"send={(_d3-_d2)*1000:.2f}ms, "
+                  f"total={(_d3-_d0)*1000:.2f}ms",
+                  flush=True,
+            )
+        if PROFILE_EVENTS:
+            _ev[3].record()
+            _ev[3].synchronize()
+            print(f"[PROFILE_EVENTS draft._service_spec_request] receive={_ev[0].elapsed_time(_ev[1]):.2f}ms, "
+                  f"hit_cache={_ev[1].elapsed_time(_ev[2]):.2f}ms, "
+                  f"send={_ev[2].elapsed_time(_ev[3]):.2f}ms, "
+                  f"total={_ev[0].elapsed_time(_ev[3]):.2f}ms",
+                  flush=True,
+            )
 
         partial_tree_decode_args = {
             "num_tokens": num_tokens,
