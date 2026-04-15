@@ -94,6 +94,8 @@ def main():
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--group", type=str, default=None)
     parser.add_argument("--name", type=str, default=None)
+    parser.add_argument("--acceptance-rate-log", type=str, default=None,
+                        help="Path to log acceptance rates (sets ACCEPTANCE_RATE_LOG env var for the server)")
     args = parser.parse_args()
     if args.qwen:
         args.llama = False
@@ -107,7 +109,12 @@ def main():
                    capture_output=True)
     time.sleep(2)
 
-    proc = subprocess.Popen(server_cmd, preexec_fn=os.setsid)
+    env = os.environ.copy()
+    if args.acceptance_rate_log:
+        env["ACCEPTANCE_RATE_LOG"] = args.acceptance_rate_log
+        print(f"ACCEPTANCE_RATE_LOG={args.acceptance_rate_log}")
+
+    proc = subprocess.Popen(server_cmd, preexec_fn=os.setsid, env=env)
     try:
         print("Waiting for server...")
         if not wait_for_server(args.port):

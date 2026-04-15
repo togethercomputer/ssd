@@ -90,9 +90,13 @@ class SpecDecodeStep(InferenceStep):
 
     def decode(self, seqs: list[Sequence]) -> int:
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
+        _prof_ev = os.environ.get("SSD_PROFILE_EVENTS", "0") == "1"
         if _prof:
             torch.cuda.synchronize()
             _t0 = perf_counter()
+        if _prof_ev:
+            _ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            _ev[0].record()
 
         # Save lightweight state instead of expensive clone_spec deep copy.
         # speculate() modifies: token_ids (append+extend), num_tokens, last_token, num_draft_cached_tokens
@@ -112,6 +116,8 @@ class SpecDecodeStep(InferenceStep):
         if _prof:
             torch.cuda.synchronize()
             _t1 = perf_counter()
+        if _prof_ev:
+            _ev[1].record()
 
         if __debug__:
             speculations = speculate_result.speculations
@@ -128,6 +134,8 @@ class SpecDecodeStep(InferenceStep):
         if _prof:
             torch.cuda.synchronize()
             _t2 = perf_counter()
+        if _prof_ev:
+            _ev[2].record()
 
         if __debug__:
             recovery_tokens = out_verify_result.recovery_tokens
@@ -159,5 +167,12 @@ class SpecDecodeStep(InferenceStep):
             hits_str = f"hits={cache_hits.sum().item()}/{len(cache_hits)}" if cache_hits is not None else ""
             toks = sum(len(s) for s in out_verify_result.new_suffixes)
             print(f"[PROFILE target] handshake={(_t1-_t0)*1000:.2f}ms verify={(_t2-_t1)*1000:.2f}ms postprocess={(_t3-_t2)*1000:.2f}ms total={(_t3-_t0)*1000:.2f}ms {hits_str} toks={toks}", flush=True)
+        if _prof_ev:
+            _ev[3].record()
+            _ev[3].synchronize()
+            cache_hits = speculate_result.cache_hits
+            hits_str = f"hits={cache_hits.sum().item()}/{len(cache_hits)}" if cache_hits is not None else ""
+            toks = sum(len(s) for s in out_verify_result.new_suffixes)
+            print(f"[PROFILE_EVENTS target] handshake={_ev[0].elapsed_time(_ev[1]):.2f}ms verify={_ev[1].elapsed_time(_ev[2]):.2f}ms postprocess={_ev[2].elapsed_time(_ev[3]):.2f}ms total={_ev[0].elapsed_time(_ev[3]):.2f}ms {hits_str} toks={toks}", flush=True)
 
         return sum(len(s) for s in out_verify_result.new_suffixes)
