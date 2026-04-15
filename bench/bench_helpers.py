@@ -172,10 +172,11 @@ def load_dataset_token_ids(
                 data = json.loads(line.strip())
                 text: str = data["text"]
                 if use_chat_template and hasattr(tokenizer, 'apply_chat_template'):
-                    tokens = tokenizer.apply_chat_template(
+                    result = tokenizer.apply_chat_template(
                         [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
                         add_generation_prompt=True,
                     )
+                    tokens = result.input_ids if hasattr(result, 'input_ids') else result
                 else:
                     tokens = tokenizer.encode(text, add_special_tokens=False)
 
