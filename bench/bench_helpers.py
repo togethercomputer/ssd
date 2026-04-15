@@ -186,11 +186,6 @@ def load_dataset_token_ids(
                         [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
                         add_generation_prompt=True,
                     )
-                    text_result = tokenizer.apply_chat_template(
-                        [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
-                        add_generation_prompt=True,
-                        tokenize=False,
-                    )
                     tokens = result.input_ids if hasattr(result, 'input_ids') else result
                 else:
                     tokens = tokenizer.encode(text, add_special_tokens=False)
