@@ -43,6 +43,8 @@ EAGLE3_QWEN_32B = os.environ.get(
     f"{HF_CACHE_DIR}/models--RedHatAI--Qwen3-32B-speculator.eagle3",
 )
 
+PHOENIX_70B = f"{HF_CACHE_DIR}/models--togethercomputer--phoenix-Llama-3p2-1B-Instruct-tgt-Llama-3p3-70b-instruct-UNTRAINED"
+
 MODELS = {
     "llama_70b": os.environ.get(
         "BENCH_LLAMA_70B",
