@@ -19,7 +19,7 @@ dependencies = [
     "numpy",
     "safetensors",
     "tqdm",
-    "sgl-kernel==0.3.21",
+    "sglang-kernel==0.4.1",  # Make sure this version is synchronized with TGL
     "nvidia-cutlass-dsl>=4.3.4",
     "wandb==0.22.0",
     "hf_transfer",
