@@ -43,8 +43,6 @@ EAGLE3_QWEN_32B = os.environ.get(
     f"{HF_CACHE_DIR}/models--RedHatAI--Qwen3-32B-speculator.eagle3",
 )
 
-PHOENIX_70B = f"{HF_CACHE_DIR}/models--togethercomputer--phoenix-Llama-3p2-1B-Instruct-tgt-Llama-3p3-70b-instruct-UNTRAINED"
-
 MODELS = {
     "llama_70b": os.environ.get(
         "BENCH_LLAMA_70B",
@@ -81,10 +79,6 @@ MODELS = {
     "eagle3_qwen_32b": os.environ.get(
         "BENCH_EAGLE3_QWEN_32B",
         "Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3",
-    ),
-    "phoenix2_qwen_8b": os.environ.get(
-        "BENCH_PHOENIX2_QWEN_8B",
-        "togethercomputer/phnx2-llama-decagon-4layer-v1.0",
     ),
 }
 

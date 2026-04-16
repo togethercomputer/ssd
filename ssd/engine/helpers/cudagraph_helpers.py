@@ -314,14 +314,14 @@ def capture_cudagraph(model_runner):
     is_jit = (model_runner.config.speculate and model_runner.config.draft_async and model_runner.is_draft)
 
     # Eagle models need special handling during CUDA graph capture
-    is_eagle_or_phoenix_draft = config.use_eagle_or_phoenix and model_runner.is_draft
-    is_eagle_or_phoenix_target = config.use_eagle_or_phoenix and not model_runner.is_draft
+    is_eagle_draft = config.use_eagle and model_runner.is_draft
+    is_eagle_target = config.use_eagle and not model_runner.is_draft
     hidden_states = None
-    if is_eagle_or_phoenix_draft:
+    if is_eagle_draft:
         # Note: For Eagle3, all callers project target acts via fc() BEFORE passing to CG
         hidden_states = torch.zeros(
             max_bs,
-            model_runner.hidden_states_dim,
+            model_runner.hf_config.hidden_size,
             dtype=hf_config.torch_dtype,
             device=input_ids.device,
         )
@@ -333,10 +333,10 @@ def capture_cudagraph(model_runner):
         graph = torch.cuda.CUDAGraph()
         set_context(
             False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], is_jit=is_jit)
-        if is_eagle_or_phoenix_draft:
+        if is_eagle_draft:
             outputs[:bs] = model_runner.model(
                 input_ids[:bs], positions[:bs], hidden_states[:bs])    # warmup
-        elif is_eagle_or_phoenix_target:
+        elif is_eagle_target:
             out, _ = model_runner.model(
                 input_ids[:bs], positions[:bs])    # warmup
             outputs[:bs] = out
@@ -344,10 +344,10 @@ def capture_cudagraph(model_runner):
             outputs[:bs] = model_runner.model(
                 input_ids[:bs], positions[:bs])    # warmup
         with torch.cuda.graph(graph, graph_pool):
-            if is_eagle_or_phoenix_draft:
+            if is_eagle_draft:
                 outputs[:bs] = model_runner.model(
                     input_ids[:bs], positions[:bs], hidden_states[:bs])    # capture
-            elif is_eagle_or_phoenix_target:
+            elif is_eagle_target:
                 out, _ = model_runner.model(
                     input_ids[:bs], positions[:bs])    # capture
                 outputs[:bs] = out
@@ -382,7 +382,7 @@ def capture_verify_cudagraph(model_runner):
     max_bs = min(model_runner.config.max_num_seqs, 512)
     k_plus_1 = model_runner.config.speculate_k + 1
 
-    is_eagle_or_phoenix_target = config.use_eagle_or_phoenix and not model_runner.is_draft
+    is_eagle_target = config.use_eagle and not model_runner.is_draft
 
     # For verify, we need to handle k+1 tokens per sequence, and use cu_seqlens_q and max_seqlen_q
     input_ids = torch.zeros(max_bs * k_plus_1, dtype=torch.int64)
@@ -394,9 +394,9 @@ def capture_verify_cudagraph(model_runner):
     outputs = torch.zeros(max_bs * k_plus_1, hf_config.hidden_size)
     cu_seqlens_q = torch.zeros(max_bs + 1, dtype=torch.int32)
 
-    # Eagle/Phoenix target: also capture activations from model forward
+    # Eagle target: also capture activations from model forward
     eagle_acts = None
-    if is_eagle_or_phoenix_target:
+    if is_eagle_target:
         eagle_acts = torch.zeros(
             max_bs * k_plus_1,
             model_runner.eagle_acts_dim,
@@ -548,10 +548,10 @@ def capture_glue_decode_cudagraph(model_runner):
     cu_seqlens_q = torch.zeros(max_bs + 1, dtype=torch.int32, device=model_runner.device)
 
     eagle_hidden_states = None
-    if config.use_eagle_or_phoenix and model_runner.is_draft:
+    if config.use_eagle and model_runner.is_draft:
         eagle_hidden_states = torch.zeros(
             max_flat,
-            model_runner.hidden_states_dim,
+            model_runner.hf_config.hidden_size,
             dtype=hf_config.torch_dtype,
             device=model_runner.device,
         )
@@ -650,10 +650,10 @@ def capture_fi_tree_decode_cudagraph(model_runner):
     graph_pool = None
 
     fi_hidden_states = None
-    if config.use_eagle_or_phoenix and model_runner.is_draft:
+    if config.use_eagle and model_runner.is_draft:
         fi_hidden_states = torch.zeros(
             max_flat_batch_size,
-            model_runner.hidden_states_dim,
+            model_runner.hf_config.hidden_size,
             dtype=hf_config.torch_dtype,
             device=model_runner.device,
         )
