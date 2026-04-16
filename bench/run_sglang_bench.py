@@ -4,12 +4,11 @@ Handles server lifecycle: launch, health-check, benchmark, cleanup.
 The benchmark client (sglang_eval_client.py) sends requests and logs metrics.
 
 Usage:
-    python -O run_sglang_bench.py --llama                     # SD, Llama 70B
-    python -O run_sglang_bench.py --qwen                      # SD, Qwen 32B
-    python -O run_sglang_bench.py --llama --mode AR           # autoregressive baseline
-    python -O run_sglang_bench.py --llama --wandb --name myrun # log to wandb
-    python -O run_sglang_bench.py --llama --mode EAGLE3 --size 8 --dataset humaneval --numseqs 1 --profile --tp 1
-    python -O run_sglang_bench.py --llama --mode EAGLE3 --size 8 --dataset humaneval --numseqs 1 --profile --tp 4
+    python -O /work/avner/git/ssd/bench/run_sglang_bench.py --llama                       # SD, Llama 70B
+    python -O /work/avner/git/ssd/bench/run_sglang_bench.py --qwen                        # SD, Qwen 32B
+    python -O /work/avner/git/ssd/bench/run_sglang_bench.py --llama --mode AR             # autoregressive baseline
+    python -O /work/avner/git/ssd/bench/run_sglang_bench.py --llama --wandb --name myrun  # log to wandb
+    python -O /work/avner/git/ssd/bench/run_sglang_bench.py --llama --mode EAGLE3 --size 8 --dataset humaneval --numseqs 1 --profile --tp 1
 
 Set model paths via env vars (BENCH_LLAMA_70B, etc.) or edit bench_paths.py.
 """
@@ -32,6 +31,8 @@ def main():
     parser.add_argument("--size", type=int, default=0)
     parser.add_argument("--mode", choices=["AR", "STANDALONE", "ASYNC_STANDALONE", "EAGLE3", "ASYNC_EAGLE3", "PHOENIX", "ASYNC_PHOENIX"], default="STANDALONE",
                         help="ar = autoregressive, sd = speculative decoding (default)")
+    parser.add_argument("--backup", choices=["fast", "jit", "force-jit"], default="jit",
+                        help="Backup strategy (fast, jit, force-jit)")
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--port", type=int, default=40010)
     parser.add_argument("--mem-frac", type=float, default=0.70)
@@ -50,8 +51,6 @@ def main():
     parser.add_argument("--fl", type=int, nargs='+', default=None, help="Fan out list (e.g., --fl 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flh", type=int, nargs='+', default=None, help="Fan out list (e.g., --flh 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flm", type=int, nargs='+', default=None, help="Fan out list miss (e.g., --flm 1 3 4 becomes [1, 3, 4])")
-    parser.add_argument("--jit", action="store_true")
-    parser.add_argument("--force-jit", action="store_true")
     parser.add_argument("--communicate-cache-hits", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--acceptance-rate-log", type=str, default=None,
@@ -168,7 +167,7 @@ def get_server_cmd(args):
             raise ValueError(f"Unsupported mode for qwen: {args.mode}")
 
     cmd = [
-        sys.executable, "-m", "sglang.launch_server",
+        "sglang", "serve",
         "--model-path", target,
         "--tp", str(args.tp),
         "--mem-fraction-static", str(args.mem_frac),
@@ -177,6 +176,7 @@ def get_server_cmd(args):
         "--log-level", "warning",
         "--port", str(args.port),
         "--context-length", str(args.context_length),
+        "--dtype", "bfloat16",
     ]
 
     if is_spec(args.mode):
@@ -205,11 +205,11 @@ def get_server_cmd(args):
                 cmd += [
                     "--speculative-async-fan-out-list-miss", ",".join(map(str, args.flm)),
                 ]
-            if args.jit or args.force_jit:
+            if args.backup in ["jit", "force-jit"]:
                 cmd += [
                     "--speculative-async-jit-speculate",
                 ]
-            if args.force_jit:
+            if args.backup == "force-jit":
                 cmd += [
                     "--speculative-async-force-jit-speculate",
                 ]
