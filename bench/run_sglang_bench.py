@@ -4,10 +4,12 @@ Handles server lifecycle: launch, health-check, benchmark, cleanup.
 The benchmark client (sglang_eval_client.py) sends requests and logs metrics.
 
 Usage:
-    python run_sglang_bench.py --llama                     # SD, Llama 70B
-    python run_sglang_bench.py --qwen                      # SD, Qwen 32B
-    python run_sglang_bench.py --llama --mode AR           # autoregressive baseline
-    python run_sglang_bench.py --llama --wandb --name myrun # log to wandb
+    python -O run_sglang_bench.py --llama                     # SD, Llama 70B
+    python -O run_sglang_bench.py --qwen                      # SD, Qwen 32B
+    python -O run_sglang_bench.py --llama --mode AR           # autoregressive baseline
+    python -O run_sglang_bench.py --llama --wandb --name myrun # log to wandb
+    python -O run_sglang_bench.py --llama --mode EAGLE3 --size 8 --dataset humaneval --numseqs 1 --profile --tp 1
+    python -O run_sglang_bench.py --llama --mode EAGLE3 --size 8 --dataset humaneval --numseqs 1 --profile --tp 4
 
 Set model paths via env vars (BENCH_LLAMA_70B, etc.) or edit bench_paths.py.
 """
@@ -27,6 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description="Launch SGLang server and benchmark it")
     parser.add_argument("--llama", action="store_true", default=True)
     parser.add_argument("--qwen", action="store_true")
+    parser.add_argument("--size", type=int, default=0)
     parser.add_argument("--mode", choices=["AR", "STANDALONE", "ASYNC_STANDALONE", "EAGLE3", "ASYNC_EAGLE3", "PHOENIX", "ASYNC_PHOENIX"], default="STANDALONE",
                         help="ar = autoregressive, sd = speculative decoding (default)")
     parser.add_argument("--tp", type=int, default=4)
@@ -53,10 +56,14 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--acceptance-rate-log", type=str, default=None,
                         help="Path to log acceptance rates (sets ACCEPTANCE_RATE_LOG env var for the server)")
+    parser.add_argument("--profile", action="store_true")
 
     args = parser.parse_args()
     if args.qwen:
         args.llama = False
+
+    if args.size == 0:
+        args.size = 70 if args.llama else 32
 
     server_cmd, target = get_server_cmd(args)
     print(f"Mode: {args.mode}, Target: {target}")
@@ -71,6 +78,11 @@ def main():
     if args.acceptance_rate_log:
         env["ACCEPTANCE_RATE_LOG"] = args.acceptance_rate_log
         print(f"ACCEPTANCE_RATE_LOG={args.acceptance_rate_log}")
+    if args.profile:
+        # env["SSD_PROFILE"] = "1"
+        # print("SSD_PROFILE=1")
+        env["SSD_PROFILE_EVENTS"] = "1"
+        print("SSD_PROFILE_EVENTS=1")
 
     proc = subprocess.Popen(server_cmd, preexec_fn=os.setsid, env=env)
     try:
@@ -83,7 +95,7 @@ def main():
         bench_dir = os.path.dirname(__file__)
         eval_cmd = [
             sys.executable, os.path.join(bench_dir, "sglang_eval_client.py"),
-            "--size", "70" if args.llama else "32",
+            "--size", str(args.size),
             "--numseqs", str(args.numseqs),
             "--output_len", str(args.output_len),
             "--temp", str(args.temp),
@@ -132,14 +144,17 @@ def is_phoenix(mode):
 
 def get_server_cmd(args):
     if args.llama:
-        target = resolve_snapshot(MODELS["llama_70b"])
-        if is_standalone(args.mode):
-            draft = resolve_snapshot(MODELS["llama_1b"])
-
-        elif is_eagle3(args.mode):
-            draft = resolve_snapshot(MODELS["eagle3_llama_70b"])
+        draft_name = "llama_1b"
+        if args.size == 70:
+            target = resolve_snapshot(MODELS["llama_70b"])
+            draft_name = "llama_1b" if is_standalone(args.mode) else "eagle3_llama_70b"
+        elif args.size == 8:
+            target = resolve_snapshot(MODELS["llama_8b"])
+            draft_name = "llama_1b" if is_standalone(args.mode) else "eagle3_llama_8b"
         else:
-            raise ValueError(f"Unsupported mode for llama: {args.mode}")
+            raise ValueError(f"Unsupported size for llama: {args.size}")
+
+        draft = resolve_snapshot(MODELS[draft_name])
     else:
         target = resolve_snapshot(MODELS["qwen_32b"])
         if is_standalone(args.mode):

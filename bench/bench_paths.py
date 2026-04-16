@@ -50,6 +50,10 @@ MODELS = {
         "BENCH_LLAMA_70B",
         f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.3-70B-Instruct",
     ),
+    "llama_8b": os.environ.get(
+        "BENCH_LLAMA_8B",
+        f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.1-8B-Instruct",
+    ),
     "llama_1b": os.environ.get(
         "BENCH_LLAMA_1B",
         f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.2-1B-Instruct",
@@ -69,6 +73,10 @@ MODELS = {
     "eagle3_llama_70b": os.environ.get(
         "BENCH_EAGLE3_LLAMA_70B",
         f"{HF_CACHE_DIR}/models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge",
+    ),
+    "eagle3_llama_8b": os.environ.get(
+        "BENCH_EAGLE3_LLAMA_8B",
+        f"{HF_CACHE_DIR}/models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B",
     ),
     "eagle3_qwen_32b": os.environ.get(
         "BENCH_EAGLE3_QWEN_32B",
