@@ -250,7 +250,9 @@ class SpeculationRequest:
     def maybe_update_buffers(self, batch_size: int, max_blocks: int = -1):
         if batch_size != self.batch_size:
             self.batch_size = batch_size
-            self._alloc_buffers(max_blocks=max_blocks)
+            if max_blocks > 0:
+                self.max_blocks = max_blocks
+            self._alloc_buffers()
 
     def send(self, async_pg: dist.ProcessGroup, draft_rank: int):
         send_tensor(self.cmd, async_pg, draft_rank, name="cmd", prefix="TARGET:SpeculationRequest.send")

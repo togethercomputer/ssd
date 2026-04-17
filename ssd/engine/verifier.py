@@ -129,6 +129,15 @@ class Verifier(VerifierBase):
         self.metrics["accepted_suffix_lens_with_recovery"].extend(
             [len(s) for s in new_suffixes])
 
+        # Full per-step accept trace for correctness tests (tier 1).
+        # Each entry is a list of (seq_id, accepted_suffix, new_recovery_token)
+        # covering every sequence in that verify step's batch.
+        if "per_step_accepts" in self.metrics:
+            self.metrics["per_step_accepts"].append([
+                (seq.seq_id, list(suffix), int(rec))
+                for seq, suffix, rec in zip(seqs, new_suffixes, recovery_tokens)
+            ])
+
         # For async mode, also track accepted suffix lengths only for cache hits
         if speculate_result.cache_hits is not None:
             _ch_cpu = speculate_result.cache_hits.cpu()
