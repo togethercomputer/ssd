@@ -48,6 +48,10 @@ MODELS = {
         "BENCH_LLAMA_70B",
         f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.3-70B-Instruct",
     ),
+    "llama_70b_3p1": os.environ.get(
+        "BENCH_LLAMA_70B_3P1",
+        f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.1-70B-Instruct",
+    ),
     "llama_8b": os.environ.get(
         "BENCH_LLAMA_8B",
         f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.1-8B-Instruct",
