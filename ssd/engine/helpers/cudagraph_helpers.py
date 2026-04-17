@@ -199,9 +199,7 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         context.tree_cu_seqlens_q = graph_vars["tree_cu_seqlens_q"][wrapper_bs]
         context.tree_mask_bias = graph_vars["tree_mask_bias"]
 
-    # in the case where we pad, we'll need cache_hits.shape[0] to match the padded batch size
-    if cache_hits.shape[0] < B:
-        cache_hits = torch.cat([cache_hits, torch.zeros(B - cache_hits.shape[0], device=cache_hits.device)])
+    K = model_runner.config.speculate_k
 
     if PROFILE:
         torch.cuda.synchronize()
@@ -209,18 +207,29 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         end_time = torch.cuda.Event(enable_timing=True)
         start_time.record()
 
-    # Build tree mask bias for this step and copy into pre-allocated buffer
-    from ssd.layers.tree_mask import build_tree_mask_bias
-    K = model_runner.config.speculate_k
-    mask_bias = build_tree_mask_bias(
-        context_lens, step=step, K=K, MQ_LEN=MQ_LEN,
-        fan_out_list=model_runner.config.fan_out_list,
-        fan_out_list_miss=model_runner.config.fan_out_list_miss,
-        cache_hits=cache_hits,
-        max_kv_stride=model_runner.config.max_model_len,
-        device=model_runner.device,
-    )
-    graph_vars["tree_mask_bias"][:len(mask_bias)] = mask_bias
+    # Build tree mask bias ONCE on step 0 at the MAX step (K-1), reuse for all K steps.
+    #
+    # Correctness: during the K-step tree-decode loop, step_context_lens[s] grows by
+    # MQ_LEN per step and ttl_added = (s+1)*MQ_LEN + (K+1) grows the same way, so
+    # prefix_len is constant across steps. The step=K-1 mask's prefix and glue
+    # regions are identical to any earlier step's, and its extra diagonal blocks
+    # (beyond step s's (s+1) blocks) sit at KV offsets >= step_context_lens[s],
+    # which FA4's seqused_k bounds out — those positions are never read.
+    if step == 0:
+        # Pad cache_hits to padded batch size (consumed by build_tree_mask_bias).
+        if cache_hits.shape[0] < B:
+            cache_hits = torch.cat([cache_hits, torch.zeros(B - cache_hits.shape[0], device=cache_hits.device)])
+        max_context_lens = context_lens + (K - 1) * MQ_LEN
+        from ssd.layers.tree_mask import build_tree_mask_bias
+        mask_bias = build_tree_mask_bias(
+            max_context_lens, step=K - 1, K=K, MQ_LEN=MQ_LEN,
+            fan_out_list=model_runner.config.fan_out_list,
+            fan_out_list_miss=model_runner.config.fan_out_list_miss,
+            cache_hits=cache_hits,
+            max_kv_stride=model_runner.config.max_model_len,
+            device=model_runner.device,
+        )
+        graph_vars["tree_mask_bias"][:len(mask_bias)] = mask_bias
 
     # Copy inputs/context into graph buffers
     graph_vars["input_ids"][:flat_batch_size] = input_ids
