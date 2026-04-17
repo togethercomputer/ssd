@@ -32,7 +32,11 @@ METRICS = {
     "decode_total_tokens": 0,
     "target_step_times": [],
     "target_verify_times": [],
+    # Per-step accept trace: enabled by tests when SSD_TRACE_ACCEPTS=1.
+    # See verifier.verify(); each step is a list of (seq_id, suffix, recovery).
 }
+if os.environ.get("SSD_TRACE_ACCEPTS", "0") == "1":
+    METRICS["per_step_accepts"] = []
 
 
 class LLMEngine:
@@ -125,7 +129,7 @@ class LLMEngine:
 
         if config.speculate and not config.draft_async:
             # keep it colocated on rank 0, process/dist agnostic in this case
-            self.draft_runner = DraftRunner(config)
+            self.draft_runner = DraftRunner(DraftRunner.create_draft_config(config))
             self.draft_cfg = self.draft_runner.draft_cfg
             print(f'Draft runner created on rank 0 (no async)', flush=True)
 
