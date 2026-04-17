@@ -46,6 +46,7 @@ def main():
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--group", type=str, default="ssd")
     parser.add_argument("--name", type=str, default=None)
+    parser.add_argument("--chat-template", action="store_true")
 
     parser.add_argument("--f", type=int, default=4, help="Async fan out value")
     parser.add_argument("--fl", type=int, nargs='+', default=None, help="Fan out list (e.g., --fl 1 3 4 becomes [1, 3, 4])")
@@ -102,6 +103,8 @@ def main():
             "--b", "1",
             "--port", str(args.port),
         ]
+        if args.chat_template:
+            eval_cmd.append("--chat-template")
         if args.llama:
             eval_cmd.append("--llama")
         else:
@@ -145,7 +148,10 @@ def get_server_cmd(args):
     if args.llama:
         draft_name = "llama_1b"
         if args.size == 70:
-            target = resolve_snapshot(MODELS["llama_70b"])
+            if is_eagle3(args.mode):
+                target = resolve_snapshot(MODELS["llama_70b_3p1"])
+            else:
+                target = resolve_snapshot(MODELS["llama_70b"])
             draft_name = "llama_1b" if is_standalone(args.mode) else "eagle3_llama_70b"
         elif args.size == 8:
             target = resolve_snapshot(MODELS["llama_8b"])
