@@ -62,6 +62,8 @@ def parse_arguments():
     parser.add_argument("--prompt_offset", type=int, default=0, help="Skip first N prompts per dataset (for variance testing)")
     parser.add_argument("--all", action="store_true", help="Use numseqs from each dataset (union dataset with numseqs*4 total)")
     parser.add_argument("--chat_template", action="store_true", help="Wrap dataset prompts in chat template before tokenizing")
+    parser.add_argument("--fused-tree-decode", action="store_true",
+                        help="Enable fused K-step tree-decode CUDA graph (argmax only). See docs/decode_tree_fused_graph.md.")
 
     # Debugging and logging
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
@@ -180,6 +182,7 @@ def create_llm_kwargs(args, draft_path):
         max_steps=args.max_steps,
         communicate_cache_hits=True,
         communicate_logits=False,
+        fused_tree_decode_graph=getattr(args, "fused_tree_decode", False),
     )
 
     if args.flh is not None:

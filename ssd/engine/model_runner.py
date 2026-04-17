@@ -32,6 +32,7 @@ from ssd.engine.helpers.cudagraph_helpers import (
     capture_cudagraph,
     capture_verify_cudagraph,
     capture_fi_tree_decode_cudagraph,
+    capture_fused_tree_decode_cudagraph,
     capture_glue_decode_cudagraph,
 )
 
@@ -274,6 +275,13 @@ class ModelRunner:
                 self.graph_pools["fi_tree_decode"] = fi_tree_decode_graph_pool
                 self.graphs["fi_tree_decode"] = fi_tree_decode_graphs
                 self.graph_bs_list["fi_tree_decode"] = fi_tree_decode_graph_bs_list
+            if (self.config.speculate and self.is_draft and self.config.draft_async
+                    and getattr(self.config, "fused_tree_decode_graph", False)):
+                ftd_gv, ftd_pool, ftd_graphs, ftd_bs_list = capture_fused_tree_decode_cudagraph(self)
+                self.graph_vars["fi_tree_decode_fused"] = ftd_gv
+                self.graph_pools["fi_tree_decode_fused"] = ftd_pool
+                self.graphs["fi_tree_decode_fused"] = ftd_graphs
+                self.graph_bs_list["fi_tree_decode_fused"] = ftd_bs_list
             if self.config.speculate and self.is_draft and self.config.draft_async and self.config.use_eagle:
                 glue_gv, glue_pool, glue_graphs, glue_bs_list = capture_glue_decode_cudagraph(self)
                 self.graph_vars["glue_decode"] = glue_gv

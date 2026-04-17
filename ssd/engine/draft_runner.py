@@ -958,14 +958,6 @@ class DraftRunner(ModelRunner):
         B, K, F, N = payload["metadata_ints"]
 
         V = self.hf_config.vocab_size  # Draft returns full target vocab size after d2t expansion
-        spec_tokens = torch.empty(
-            N, K, dtype=torch.int64, device=self.device)
-        spec_logits = torch.empty(
-            N, K, V, dtype=self.hf_config.torch_dtype, device=self.device)
-        spec_activations = torch.empty(
-            N, K, self.hf_config.hidden_size,
-            dtype=self.hf_config.torch_dtype, device=self.device
-        ) if self.config.use_eagle else None
 
         # Precompute all positions, context_lens, and slot_maps for all K steps
         # PERFORMANCE: no .clone() needed — these are not modified in-place
@@ -978,6 +970,24 @@ class DraftRunner(ModelRunner):
         _, step_rope_positions, step_context_lens, step_slot_maps = self._compute_step_positions_and_slot_maps(
             initial_positions, initial_rope_positions, dbt, B, K, F, N, self.config.MQ_LEN
         )
+
+        # ---- Fused CUDA graph fast path (argmax-only, single replay for all K steps) ----
+        # Requires capture-time flag AND a captured bucket >= B.  Falls back to per-step
+        # loop on any failure of those preconditions.
+        if self._fused_tree_decode_eligible(B):
+            return self._decode_tree_fused(
+                payload, B, K, N, dbt,
+                step_slot_maps, step_rope_positions, step_context_lens,
+            )
+
+        spec_tokens = torch.empty(
+            N, K, dtype=torch.int64, device=self.device)
+        spec_logits = torch.empty(
+            N, K, V, dtype=self.hf_config.torch_dtype, device=self.device)
+        spec_activations = torch.empty(
+            N, K, self.hf_config.hidden_size,
+            dtype=self.hf_config.torch_dtype, device=self.device
+        ) if self.config.use_eagle else None
 
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         payload["_all_greedy"] = bool((payload["temps"] == 0).all())
@@ -1009,6 +1019,93 @@ class DraftRunner(ModelRunner):
             _esteps = [f'{_tev[i].elapsed_time(_tev[i+1]):.2f}' for i in range(K)]
             _etotal = _tev[0].elapsed_time(_tev[K])
             print(f"[PROFILE_EVENTS draft] tree_decode: K={K} steps={' '.join(_esteps)} total={_etotal:.2f}ms", flush=True)
+
+        return spec_tokens, spec_logits, spec_activations
+
+    def _fused_tree_decode_eligible(self, B: int) -> bool:
+        """True iff the fused-graph fast path can handle this call.
+
+        Preconditions (all must hold):
+          - config.fused_tree_decode_graph is set at startup, so the graph was captured.
+          - A captured bucket >= B exists (smaller bench configs always satisfy this;
+            larger configs may have skipped buckets above the logits-buffer cap — see
+            capture_fused_tree_decode_cudagraph).
+        """
+        if not getattr(self.config, "fused_tree_decode_graph", False):
+            return False
+        bs_list = getattr(self, "graph_bs_list", {}).get("fi_tree_decode_fused")
+        if not bs_list:
+            return False
+        return any(bs >= B for bs in bs_list)
+
+    def _decode_tree_fused(
+        self, payload, B: int, K: int, N: int, dbt: torch.Tensor,
+        step_slot_maps: torch.Tensor, step_rope_positions: torch.Tensor,
+        step_context_lens: torch.Tensor,
+    ):
+        """Fused fast path: one graph.replay() for all K decode steps. Argmax only.
+
+        All state chaining (input_ids, hidden_states) happens inside the captured
+        graph.  Caller-visible outputs (spec_tokens, spec_logits, spec_activations)
+        match the per-step loop exactly in shape and semantics.
+        """
+        # Hard guard: sampler is not captured in the fused graph.  If the payload
+        # requests any temperature > 0 we must not take this path.
+        assert bool((payload["temps"] == 0).all()), (
+            "_decode_tree_fused only supports greedy (temps==0). "
+            "Non-zero draft temperatures require multinomial sampling, "
+            "which is not yet captured in the fused graph."
+        )
+
+        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
+        if PROFILE_EVENTS:
+            _tev = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+            _tev[0].record()
+
+        # Build the shared tree_mask_bias once, exactly as the per-step Opt1 does
+        # (step=K-1 at the widest context_lens).  This mask is reused across all
+        # K captured forwards inside the graph.
+        max_context_lens = step_context_lens[0] + (K - 1) * self.config.MQ_LEN
+        cache_hits = payload["cache_hits"]
+        if cache_hits.shape[0] < B:
+            cache_hits = torch.cat(
+                [cache_hits, torch.zeros(B - cache_hits.shape[0], device=cache_hits.device)]
+            )
+        from ssd.layers.tree_mask import build_tree_mask_bias
+        mask_bias = build_tree_mask_bias(
+            max_context_lens, step=K - 1, K=K, MQ_LEN=self.config.MQ_LEN,
+            fan_out_list=self.config.fan_out_list,
+            fan_out_list_miss=self.config.fan_out_list_miss,
+            cache_hits=cache_hits,
+            max_kv_stride=self.config.max_model_len,
+            device=self.device,
+        )
+
+        if PROFILE_EVENTS:
+            _tev[1].record()
+
+        from ssd.engine.helpers.cudagraph_helpers import run_fused_tree_decode_cudagraph
+        spec_tokens, spec_logits, spec_activations = run_fused_tree_decode_cudagraph(
+            self,
+            step_slot_maps=step_slot_maps,
+            step_rope_positions=step_rope_positions,
+            step_context_lens=step_context_lens,
+            dbt=dbt,
+            tree_mask_bias=mask_bias,
+            initial_input_ids=payload["input_ids"],
+            initial_hidden_states=payload.get("hidden_states"),
+        )
+
+        if PROFILE_EVENTS:
+            _tev[2].record()
+            _tev[2].synchronize()
+            print(
+                f"[PROFILE_EVENTS draft] tree_decode_fused: K={K} "
+                f"mask_build={_tev[0].elapsed_time(_tev[1]):.2f}ms "
+                f"replay+prep={_tev[1].elapsed_time(_tev[2]):.2f}ms "
+                f"total={_tev[0].elapsed_time(_tev[2]):.2f}ms",
+                flush=True,
+            )
 
         return spec_tokens, spec_logits, spec_activations
 

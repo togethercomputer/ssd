@@ -733,3 +733,289 @@ def capture_fi_tree_decode_cudagraph(model_runner):
         graph_vars["hidden_states"] = fi_hidden_states
 
     return graph_vars, graph_pool, graphs, graph_bs_list
+
+
+# ---------------------------------------------------------------------------
+# Fused K-step tree-decode CUDA graph (argmax-only).
+#
+# One graph per batch-size bucket captures ALL K model forwards + K
+# compute_logits + K argmax ops, chained via pre-allocated GPU buffers.
+# Replay is one graph.replay() call, eliminating per-step Python overhead.
+# Non-greedy sampling is NOT supported and the caller must assert temps==0.
+# See docs/decode_tree_fused_graph.md.
+# ---------------------------------------------------------------------------
+# Safety cap: per-bucket logits_buf size = K * bs * MQ_LEN * V * 2 bytes (bf16).
+# For a V=128k vocab at K=15, MQ_LEN=64, bs=8 that's ~2GB.  We skip buckets
+# whose logits_buf would exceed this cap, leaving only the smaller buckets in
+# the fused path (the caller falls back to the per-step graph there).
+_FUSED_LOGITS_BUF_BYTE_CAP = int(os.environ.get("SSD_FUSED_LOGITS_CAP_BYTES", 4 << 30))  # 4 GB
+
+
+@torch.inference_mode()
+def capture_fused_tree_decode_cudagraph(model_runner):
+    """Capture one fused CUDA graph per batch-size bucket.
+
+    Each graph runs K iterations of (model.forward, compute_logits, argmax,
+    input_ids/hidden_states chaining) sequentially with no Python in between.
+
+    Returns (graph_vars, graph_pool, graphs, graph_bs_list) matching the shape
+    of capture_fi_tree_decode_cudagraph.  Buckets whose logits buffer would
+    exceed the memory cap are skipped (omitted from graph_bs_list).
+    """
+    config = model_runner.config
+    hf_config = config.hf_config
+    K = config.speculate_k
+    MQ_LEN = sum(config.fan_out_list)
+    max_bs = min(config.max_num_seqs, 512)
+    max_flat = max_bs * MQ_LEN
+    V = hf_config.vocab_size
+    H = hf_config.hidden_size
+    dev = model_runner.device
+    dtype = hf_config.torch_dtype
+    is_eagle = config.use_eagle and model_runner.is_draft
+
+    max_num_blocks = (config.max_model_len + model_runner.block_size - 1) // model_runner.block_size
+
+    # Step-invariant shared buffers.
+    input_ids = torch.zeros(max_flat, dtype=torch.int64, device=dev)
+    block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
+    tree_mask_bias = torch.zeros(
+        max_flat * config.max_model_len, dtype=torch.float32, device=dev
+    )
+    current_hidden_states = torch.zeros(max_flat, H, dtype=dtype, device=dev) if is_eagle else None
+
+    # Per-step metadata buffers (pre-filled before each replay).
+    step_slot_maps = torch.zeros(K, max_flat, dtype=torch.int32, device=dev)
+    step_rope_positions = torch.zeros(K, max_flat, dtype=torch.int64, device=dev)
+    step_context_lens = torch.zeros(K, max_bs, dtype=torch.int32, device=dev)
+
+    # Per-step output buffers.  Size varies by bucket; we allocate ONCE at
+    # max_bs and bucket captures slice into the front.  spec_activations shares
+    # the prenorm "outputs" workspace pattern used by the per-step graph.
+    # NOTE: logits_buf can be large (K * max_flat * V * 2 bytes).  We'll check
+    # size per bucket below and skip buckets that blow the cap.
+    spec_tokens_buf = torch.zeros(K, max_flat, dtype=torch.int64, device=dev)
+    outputs_buf = torch.zeros(max_flat, H, dtype=dtype, device=dev)  # prenorm workspace
+    spec_activations_buf = (
+        torch.zeros(K, max_flat, H, dtype=dtype, device=dev) if is_eagle else None
+    )
+
+    # Bucket list mirrors the per-step graph's (both must cover the same B
+    # values so callers can fall back to per-step on skipped buckets).
+    if config.draft_async:
+        N_target = max_bs * (K + 1) * config.async_fan_out
+        graph_bs_list = []
+        bs = 1
+        while bs < max_bs:
+            graph_bs_list.append(bs)
+            bs *= 2
+        if max_bs not in graph_bs_list:
+            graph_bs_list.append(max_bs)
+    else:
+        graph_bs_list = [1]
+        for bs in [2, 4, 8] + list(range(16, max_bs + 1, 16)):
+            if bs <= max_bs:
+                graph_bs_list.append(bs)
+        if max_bs not in graph_bs_list:
+            graph_bs_list.append(max_bs)
+    graph_bs_list.sort()
+
+    # Per-bucket logits buffers (allocated lazily only for buckets we capture).
+    # logits_by_bs[bs] = tensor of shape [K, bs*MQ_LEN, V].
+    logits_by_bs = {}
+    tree_cu_seqlens_q_dict = {}
+    for bs in graph_bs_list:
+        tree_cu_seqlens_q_dict[bs] = torch.arange(
+            bs + 1, dtype=torch.int32, device=dev
+        ) * MQ_LEN
+
+    graphs = {}
+    graph_pool = None
+    captured_bs_list = []
+
+    print(
+        f"[capture_fused_tree_decode_cudagraph] Starting; K={K} MQ_LEN={MQ_LEN} "
+        f"buckets={graph_bs_list} V={V} H={H}",
+        flush=True,
+    )
+
+    for bs in reversed(graph_bs_list):
+        flat = bs * MQ_LEN
+        logits_bytes = K * flat * V * 2  # bf16
+        if logits_bytes > _FUSED_LOGITS_BUF_BYTE_CAP:
+            print(
+                f"[capture_fused_tree_decode_cudagraph] Skipping bs={bs}: "
+                f"logits_buf {logits_bytes/(1<<30):.2f} GB exceeds cap "
+                f"{_FUSED_LOGITS_BUF_BYTE_CAP/(1<<30):.2f} GB",
+                flush=True,
+            )
+            continue
+
+        logits_buf = torch.zeros(K, flat, V, dtype=dtype, device=dev)
+        logits_by_bs[bs] = logits_buf
+
+        graph = torch.cuda.CUDAGraph()
+
+        # Warmup run — one K-step pass outside the graph to populate autograd /
+        # kernel caches.  Must set_context identically to the graph body.
+        for depth in range(K):
+            set_context(
+                is_prefill=False,
+                slot_mapping=step_slot_maps[depth, :flat],
+                context_lens=step_context_lens[depth, :bs],
+                block_tables=block_tables[:bs],
+                tree_cu_seqlens_q=tree_cu_seqlens_q_dict[bs],
+                tree_mask_bias=tree_mask_bias,
+            )
+            if is_eagle:
+                outputs_buf[:flat] = model_runner.model(
+                    input_ids[:flat], step_rope_positions[depth, :flat], current_hidden_states[:flat]
+                )
+            else:
+                outputs_buf[:flat] = model_runner.model(
+                    input_ids[:flat], step_rope_positions[depth, :flat]
+                )
+            logits_buf[depth, :flat] = model_runner.model.compute_logits(
+                outputs_buf[:flat], last_only=False
+            )
+            spec_tokens_buf[depth, :flat] = logits_buf[depth, :flat].argmax(dim=-1)
+            if is_eagle:
+                spec_activations_buf[depth, :flat] = outputs_buf[:flat]
+                if depth < K - 1:
+                    current_hidden_states[:flat] = outputs_buf[:flat]
+            if depth < K - 1:
+                input_ids[:flat] = spec_tokens_buf[depth, :flat]
+            reset_context()
+
+        # Capture: identical body, inside torch.cuda.graph.
+        with torch.cuda.graph(graph, graph_pool):
+            for depth in range(K):
+                set_context(
+                    is_prefill=False,
+                    slot_mapping=step_slot_maps[depth, :flat],
+                    context_lens=step_context_lens[depth, :bs],
+                    block_tables=block_tables[:bs],
+                    tree_cu_seqlens_q=tree_cu_seqlens_q_dict[bs],
+                    tree_mask_bias=tree_mask_bias,
+                )
+                if is_eagle:
+                    outputs_buf[:flat] = model_runner.model(
+                        input_ids[:flat], step_rope_positions[depth, :flat], current_hidden_states[:flat]
+                    )
+                else:
+                    outputs_buf[:flat] = model_runner.model(
+                        input_ids[:flat], step_rope_positions[depth, :flat]
+                    )
+                logits_buf[depth, :flat] = model_runner.model.compute_logits(
+                    outputs_buf[:flat], last_only=False
+                )
+                spec_tokens_buf[depth, :flat] = logits_buf[depth, :flat].argmax(dim=-1)
+                if is_eagle:
+                    spec_activations_buf[depth, :flat] = outputs_buf[:flat]
+                    if depth < K - 1:
+                        current_hidden_states[:flat] = outputs_buf[:flat]
+                if depth < K - 1:
+                    input_ids[:flat] = spec_tokens_buf[depth, :flat]
+
+        if graph_pool is None:
+            graph_pool = graph.pool()
+        graphs[bs] = graph
+        captured_bs_list.append(bs)
+        torch.cuda.synchronize()
+        reset_context()
+
+    captured_bs_list.sort()
+    graph_vars = dict(
+        input_ids=input_ids,
+        block_tables=block_tables,
+        tree_mask_bias=tree_mask_bias,
+        step_slot_maps=step_slot_maps,
+        step_rope_positions=step_rope_positions,
+        step_context_lens=step_context_lens,
+        tree_cu_seqlens_q=tree_cu_seqlens_q_dict,
+        spec_tokens_buf=spec_tokens_buf,
+        logits_by_bs=logits_by_bs,
+        outputs_buf=outputs_buf,
+    )
+    if is_eagle:
+        graph_vars["current_hidden_states"] = current_hidden_states
+        graph_vars["spec_activations_buf"] = spec_activations_buf
+
+    print(
+        f"[capture_fused_tree_decode_cudagraph] Done; captured buckets={captured_bs_list}",
+        flush=True,
+    )
+    return graph_vars, graph_pool, graphs, captured_bs_list
+
+
+@torch.inference_mode()
+def run_fused_tree_decode_cudagraph(
+    model_runner,
+    step_slot_maps: torch.Tensor,       # [K, N] int32/int64
+    step_rope_positions: torch.Tensor,  # [K, N] int64
+    step_context_lens: torch.Tensor,    # [K, B] int32/int64
+    dbt: torch.Tensor,                  # [B, M] int32
+    tree_mask_bias: torch.Tensor,       # [B*MQ_LEN*max_kv_stride] float32
+    initial_input_ids: torch.Tensor,    # [N] int64 — step-0 forked rec tokens
+    initial_hidden_states: torch.Tensor | None,  # [N, H] bf16 (EAGLE only)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Fill buffers, call graph.replay(), return (spec_tokens, spec_logits, spec_activations).
+
+    Shapes follow the non-fused path:
+      spec_tokens      [N, K]       int64
+      spec_logits      [N, K, V]    bf16
+      spec_activations [N, K, H]    bf16 or None (non-EAGLE)
+    """
+    gv = model_runner.graph_vars["fi_tree_decode_fused"]
+    K = model_runner.config.speculate_k
+    MQ_LEN = sum(model_runner.config.fan_out_list)
+    N = step_slot_maps.shape[1]
+    B = step_context_lens.shape[1]
+    orig_flat = N
+    orig_B = B
+    assert orig_flat == orig_B * MQ_LEN, (
+        f"run_fused_tree_decode_cudagraph: expected N=B*MQ_LEN, got N={orig_flat} B={orig_B} MQ_LEN={MQ_LEN}"
+    )
+
+    # Pick smallest captured bucket >= orig_B.
+    bucket_bs = next(
+        (x for x in model_runner.graph_bs_list["fi_tree_decode_fused"] if x >= orig_B),
+        None,
+    )
+    if bucket_bs is None:
+        raise RuntimeError(
+            f"run_fused_tree_decode_cudagraph: no captured bucket covers B={orig_B}. "
+            f"Available buckets: {model_runner.graph_bs_list['fi_tree_decode_fused']}"
+        )
+    bucket_flat = bucket_bs * MQ_LEN
+
+    # --- Fill input buffers ---
+    # Per-step metadata: copy the first orig_flat entries per step; padded positions
+    # default to zeros which point at slot 0.  Attention outputs at padded positions
+    # are discarded; we only read [:orig_flat] after replay.
+    gv["step_slot_maps"][:K, :orig_flat] = step_slot_maps.to(torch.int32)
+    gv["step_rope_positions"][:K, :orig_flat] = step_rope_positions.to(torch.int64)
+    gv["step_context_lens"][:K, :orig_B] = step_context_lens.to(torch.int32)
+    if bucket_bs > orig_B:
+        # Ghost seqs: repeat last real seq's context_len + block_table to keep FA4 happy.
+        gv["step_context_lens"][:K, orig_B:bucket_bs] = step_context_lens[:, -1:].to(torch.int32)
+        gv["block_tables"][orig_B:bucket_bs, :dbt.shape[1]] = dbt[-1:].expand(bucket_bs - orig_B, -1)
+    gv["block_tables"][:orig_B, :dbt.shape[1]] = dbt
+
+    gv["tree_mask_bias"][:tree_mask_bias.shape[0]] = tree_mask_bias
+
+    gv["input_ids"][:orig_flat] = initial_input_ids
+    if initial_hidden_states is not None:
+        gv["current_hidden_states"][:orig_flat] = initial_hidden_states
+
+    # --- Replay ---
+    model_runner.graphs["fi_tree_decode_fused"][bucket_bs].replay()
+
+    # --- Slice outputs (caller wants [N, K, ...] layout) ---
+    spec_tokens = gv["spec_tokens_buf"][:K, :orig_flat].transpose(0, 1).contiguous()  # [N, K]
+    spec_logits = gv["logits_by_bs"][bucket_bs][:K, :orig_flat].transpose(0, 1).contiguous()  # [N, K, V]
+    spec_activations = None
+    if initial_hidden_states is not None:
+        spec_activations = gv["spec_activations_buf"][:K, :orig_flat].transpose(0, 1).contiguous()  # [N, K, H]
+
+    return spec_tokens, spec_logits, spec_activations

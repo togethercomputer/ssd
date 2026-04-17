@@ -38,6 +38,10 @@ class Config:
     async_nccl_host: str = "127.0.0.1"
     communicate_logits: bool = False
     communicate_cache_hits: bool = False
+    # When True, capture the K-step tree decode as a single CUDA graph (argmax/greedy only).
+    # Defaults to False while landing; flip once tier1 tests + A/B bench pass.
+    # See docs/decode_tree_fused_graph.md for design.
+    fused_tree_decode_graph: bool = False
 
     # eagle3
     use_eagle: bool = False
