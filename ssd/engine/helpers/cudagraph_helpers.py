@@ -993,12 +993,15 @@ def run_fused_tree_decode_cudagraph(
     # Per-step metadata: copy the first orig_flat entries per step; padded positions
     # default to zeros which point at slot 0.  Attention outputs at padded positions
     # are discarded; we only read [:orig_flat] after replay.
-    gv["step_slot_maps"][:K, :orig_flat] = step_slot_maps.to(torch.int32)
-    gv["step_rope_positions"][:K, :orig_flat] = step_rope_positions.to(torch.int64)
-    gv["step_context_lens"][:K, :orig_B] = step_context_lens.to(torch.int32)
+    #
+    # PERFORMANCE: No explicit .to(dtype) — slice-assign casts in a single kernel,
+    # whereas .to() allocates a temp and then copies (two kernels).
+    gv["step_slot_maps"][:K, :orig_flat] = step_slot_maps
+    gv["step_rope_positions"][:K, :orig_flat] = step_rope_positions
+    gv["step_context_lens"][:K, :orig_B] = step_context_lens
     if bucket_bs > orig_B:
         # Ghost seqs: repeat last real seq's context_len + block_table to keep FA4 happy.
-        gv["step_context_lens"][:K, orig_B:bucket_bs] = step_context_lens[:, -1:].to(torch.int32)
+        gv["step_context_lens"][:K, orig_B:bucket_bs] = step_context_lens[:, -1:]
         gv["block_tables"][orig_B:bucket_bs, :dbt.shape[1]] = dbt[-1:].expand(bucket_bs - orig_B, -1)
     gv["block_tables"][:orig_B, :dbt.shape[1]] = dbt
 
