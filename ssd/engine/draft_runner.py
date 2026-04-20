@@ -243,8 +243,31 @@ class DraftRunner(ModelRunner):
             # Vectorized membership: broadcast eq on [B,T,3], fuse hit+idx via max()
             eq = (request_keys.unsqueeze(1) == self.tree_cache_keys.unsqueeze(0))  # [B,T,3]
             match = torch.all(eq, dim=2)  # [B,T]
-            cache_hits, idx = match.max(dim=1)  # cache_hits: [B] bool, idx: [B] first-match index
+            cache_hits, idx = match.max(dim=1)  # cache_hits: [B] bool, idx: [B] first-match index.
 
+        there_was_a_cache_miss = not cache_hits.all()
+        if self.config.force_jit_speculate or (self.config.jit_speculate and there_was_a_cache_miss):
+            if self.config.verbose:
+                if self.config.force_jit_speculate:
+                    msg = "Force JIT speculate, running JIT speculate for all"
+                elif self.tree_cache_keys.numel() == 0:
+                    msg = "Cache empty, running JIT speculate for all"
+                else:
+                    assert there_was_a_cache_miss
+                    msg = "There was a cache miss, running JIT speculate for all"
+                print(f"[{_ts()}] [hit_cache] {msg}", flush=True)
+            jit_acts = self.jit_speculate(
+                request_keys,
+                num_tokens,
+                out_logits,
+                out_tokens,
+                temperatures,
+                draft_block_tables,
+                target_recovery_activations
+                )  # write into out_logits, out_tokens
+            if self.config.use_eagle:
+                out_activations = jit_acts
+        elif self.tree_cache_keys.numel() > 0:
             if self.config.verbose:
                 print(f"[{_ts()}] [hit_cache] Cache hits: {cache_hits.sum().item()}/{B}", flush=True)
                 print(f"[{_ts()}] [hit_cache] Cache: {self.tree_cache_keys.shape[0]} entries", flush=True)
@@ -262,43 +285,13 @@ class DraftRunner(ModelRunner):
                     hit_marker = "[HIT]" if i in hit_indices else ""
                     print(f"[{_ts()}]     [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
 
-            # Fill via direct indexing (miss slots get stale cache data, but that's ok since we can return any tokens/logits for cache misses, as long as they are consistent with one another).
-            if not self.config.force_jit_speculate and ((cache_hits.any() and not self.config.jit_speculate) or (cache_hits.all() and self.config.jit_speculate)):
-                out_tokens = self.tree_cache_tokens[idx]
-                if self.config.communicate_logits:
-                    out_logits = self.tree_cache_logits[idx]
-                if self.config.use_eagle:
-                    out_activations = self.tree_cache_activations[idx]
-            elif self.config.jit_speculate: 
-                # print(f'[hit_cache] found a cache miss, running jit speculate', flush=True)
-                if self.config.verbose:
-                    print(f"[{_ts()}] [hit_cache] Running JIT speculate for cache misses", flush=True)
-                jit_acts = self.jit_speculate(
-                    request_keys, 
-                    num_tokens, 
-                    out_logits, 
-                    out_tokens,
-                    temperatures,
-                    draft_block_tables,
-                    target_recovery_activations
-                    ) # write into out_logits, out_tokens
-                if self.config.use_eagle:
-                    out_activations = jit_acts
-        elif self.config.jit_speculate:
-            # Cache is empty (first iteration), must JIT all
-            if self.config.verbose:
-                print(f"[{_ts()}] [hit_cache] Cache empty, running JIT speculate for all", flush=True)
-            jit_acts = self.jit_speculate(
-                request_keys, 
-                num_tokens, 
-                out_logits, 
-                out_tokens,
-                temperatures,
-                draft_block_tables,
-                target_recovery_activations
-                )
+            # Fill via direct indexing (miss slots get stale cache data, but that's ok since we can
+            # return any tokens/logits for cache misses, as long as they are consistent with one another).
+            out_tokens = self.tree_cache_tokens[idx]
+            if self.config.communicate_logits:
+                out_logits = self.tree_cache_logits[idx]
             if self.config.use_eagle:
-                out_activations = jit_acts
+                out_activations = self.tree_cache_activations[idx]
 
         rec_toks = request_keys[:, 2]
 
