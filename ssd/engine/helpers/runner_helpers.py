@@ -21,7 +21,7 @@ def _dump_ts():
     if RUN_NAME:
         return RUN_NAME
     else:
-        return datetime.now().strftime('%H_%M_%S.%f')[:-4]
+        return datetime.now().strftime('%Y-%m-%d_%H-%M-%S.%f')  # [:-4]
 
 if DUMP_TENSORS_DIR:
     print(f"[{_ts()}] BANANA: Dumping tensors to {DUMP_TENSORS_DIR}")
@@ -167,16 +167,7 @@ class PrefillRequest:
             if eagle_acts is not None:
                 print(f"[{_ts()}] [PrefillRequest.receive] eagle_acts shape={eagle_acts.shape}, eagle_acts[:3, :3]={list_to_str(eagle_acts[:3, :3].tolist())}", flush=True)
 
-        if DUMP_TENSORS:
-            torch.save({
-                'metadata': metadata.cpu(),
-                'input_ids': input_ids.cpu(),
-                'num_tokens': num_tokens.cpu(),
-                'draft_block_table': draft_block_table.cpu(),
-                'eagle_acts': eagle_acts.cpu() if eagle_acts is not None else None,
-            }, f"{DUMP_TENSORS_DIR}/prefill_request_{_dump_ts()}.pt")
-
-        return cls(
+        received_request = cls(
             cmd=None,
             metadata=metadata,
             input_ids=input_ids,
@@ -184,6 +175,19 @@ class PrefillRequest:
             draft_block_table=draft_block_table,
             eagle_acts=eagle_acts,
         )
+        if DUMP_TENSORS:
+            received_request.dump()
+        return received_request
+
+    def dump(self):
+        assert DUMP_TENSORS_DIR is not None, "DUMP_TENSORS_DIR is not set"
+        torch.save({
+            'metadata': self.metadata.cpu(),
+            'input_ids': self.input_ids.cpu(),
+            'num_tokens': self.num_tokens.cpu(),
+            'draft_block_table': self.draft_block_table.cpu(),
+            'eagle_acts': self.eagle_acts.cpu() if self.eagle_acts is not None else None,
+        }, f"{DUMP_TENSORS_DIR}/prefill_request_{_dump_ts()}.pt")
 
 
 @dataclass
@@ -405,19 +409,23 @@ class SpeculationRequest:
                     print(f"[{_ts()}]      req[{i}]: extend_token_ids shape={extend_token_ids.shape}, values={extend_token_ids[i].tolist()}, decoded[:, :{num_extend}]='{decoded_extend_token_ids}'", flush=True)
 
         if DUMP_TENSORS:
-            torch.save({
-                'metadata': speculation_request.metadata.cpu(),
-                'cache_keys': speculation_request.cache_keys.cpu(),
-                'num_tokens': speculation_request.num_tokens.cpu(),
-                'block_tables': speculation_request.block_tables.cpu() if speculation_request.block_tables is not None else None,
-                'temps': speculation_request.temps.cpu(),
-                'recovery_activations': speculation_request.recovery_activations.cpu() if speculation_request.recovery_activations is not None else None,
-                'extend_counts': speculation_request.extend_counts.cpu() if speculation_request.extend_counts is not None else None,
-                'extend_activations': speculation_request.extend_activations.cpu() if speculation_request.extend_activations is not None else None,
-                'extend_token_ids': speculation_request.extend_token_ids.cpu() if speculation_request.extend_token_ids is not None else None,
-            }, f"{DUMP_TENSORS_DIR}/speculation_request_{_dump_ts()}.pt")
+            speculation_request.dump()
 
         return speculation_request
+
+    def dump(self):
+        assert DUMP_TENSORS_DIR is not None, "DUMP_TENSORS_DIR is not set"
+        torch.save({
+            'metadata': self.metadata.cpu(),
+            'cache_keys': self.cache_keys.cpu(),
+            'num_tokens': self.num_tokens.cpu(),
+            'block_tables': self.block_tables.cpu() if self.block_tables is not None else None,
+            'temps': self.temps.cpu(),
+            'recovery_activations': self.recovery_activations.cpu() if self.recovery_activations is not None else None,
+            'extend_activations': self.extend_activations.cpu() if self.extend_activations is not None else None,
+            'extend_counts': self.extend_counts.cpu() if self.extend_counts is not None else None,
+            'extend_token_ids': self.extend_token_ids.cpu() if self.extend_token_ids is not None else None,
+        }, f"{DUMP_TENSORS_DIR}/speculation_request_{_dump_ts()}.pt")
 
 
 @dataclass
@@ -474,17 +482,23 @@ class SpeculationResponse:
             print(f"[{_ts()}] [SpeculationResponse.send] SPECULATION: '{decoded_speculations}'", flush=True)
             print(f"[{_ts()}] {'='*80}\n", flush=True)
 
-        if DUMP_TENSORS:
-            torch.save({
-                'speculations': self.speculations.cpu(),
-            }, f"{DUMP_TENSORS_DIR}/speculation_response_{_dump_ts()}.pt")
-
         if self.logits_q is not None:
             assert getattr(self, 'communicate_logits', True), "logits_q is not None but communicate_logits is False"
             send_tensor(self.logits_q, async_pg, target_rank, name="logits", prefix="DRAFT:SpeculationResponse.send")
         if self.cache_hits is not None:
             assert getattr(self, 'communicate_cache_hits', True), "cache_hits is not None but communicate_cache_hits is False"
             send_tensor(self.cache_hits, async_pg, target_rank, name="cache hits", prefix="DRAFT:SpeculationResponse.send")
+
+        if DUMP_TENSORS:
+            self.dump()
+
+    def dump(self):
+        assert DUMP_TENSORS_DIR is not None, "DUMP_TENSORS_DIR is not set"
+        torch.save({
+            'speculations': self.speculations.cpu(),
+            'logits': self.logits_q.cpu() if self.logits_q is not None else None,
+            'cache_hits': self.cache_hits.cpu() if self.cache_hits is not None else None,
+        }, f"{DUMP_TENSORS_DIR}/speculation_response_{_dump_ts()}.pt")
 
     @classmethod
     def receive(
