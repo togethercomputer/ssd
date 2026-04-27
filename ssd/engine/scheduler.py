@@ -304,6 +304,7 @@ class Scheduler:
             if eagle_acts is not None:
                 accepted_len = len(new_suffix)
                 idx = min(accepted_len - 1, eagle_acts.shape[1] - 1)
+                # TODO: Get rid of last_target_hidden_state field, just use extend_eagle_acts instead.
                 seq.last_target_hidden_state = eagle_acts[i, idx]
 
                 # Store extend data for next glue decode
