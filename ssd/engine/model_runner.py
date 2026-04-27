@@ -309,20 +309,22 @@ class ModelRunner:
             self.send_draft_exit_signal()
         except Exception:
             pass
-        # 2) Best-effort local cleanup (no collectives; avoid group destroys in hard mode)
+        # 2) Best-effort local cleanup (no collectives; avoid group destroys in hard mode).
+        # Drop GPU tensors so main-process ranks (target rank 0) actually release
+        # model weights and KV cache — otherwise a subsequent engine or subprocess
+        # on the same GPU will OOM.
         try:
-            if not self.enforce_eager and hasattr(self, "graphs"):
-                del self.graphs
-                if hasattr(self, "graph_pool"):
-                    del self.graph_pool
-            if hasattr(self, "verify_graphs"):
-                del self.verify_graphs
-            if hasattr(self, "verify_graph_pool"):
-                del self.verify_graph_pool
-            if hasattr(self, "glue_graphs"):
-                del self.glue_graphs
-            if hasattr(self, "glue_graph_pool"):
-                del self.glue_graph_pool
+            for attr in (
+                "graphs", "graph_pools", "graph_vars", "graph_bs_list",
+                "verify_graphs", "verify_graph_pool",
+                "glue_graphs", "glue_graph_pool",
+                "model", "kv_cache", "sampler",
+            ):
+                if hasattr(self, attr):
+                    setattr(self, attr, None)
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
         except Exception:
             pass
         # Close SHM on all ranks that have it

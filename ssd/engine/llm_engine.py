@@ -14,6 +14,7 @@ from ssd.engine.step import InferenceStep, AutoRegressiveStep, SpecDecodeStep
 from ssd.engine.verifier import Verifier
 
 import atexit
+import weakref
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -141,7 +142,15 @@ class LLMEngine:
         print(f"[LLMEngine] finished llm_engine init", flush=True)
 
         self._exiting = False
-        atexit.register(lambda: self.exit(hard=True))
+        # Use a weakref so `del llm` can actually release the engine (and its
+        # GPU tensors on target rank 0) before process exit. A direct closure
+        # over `self` keeps the engine alive for the whole process lifetime.
+        _weak_self = weakref.ref(self)
+        def _atexit_cleanup():
+            obj = _weak_self()
+            if obj is not None:
+                obj.exit(hard=True)
+        atexit.register(_atexit_cleanup)
 
     def exit(self, hard: bool = True):
         print(f"[LLMEngine] Exiting (hard={hard})", flush=True)
