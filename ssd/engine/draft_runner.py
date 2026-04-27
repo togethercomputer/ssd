@@ -18,6 +18,9 @@ PROFILE_EVENTS = os.environ.get("SSD_PROFILE_EVENTS", "0") == "1"  # CUDA event 
 def _ts():
     return f'{datetime.now().strftime("%H:%M:%S.%f")[:-3]}'
 
+def _dump_ts():
+    return datetime.now().strftime('%Y-%m-%d_%H-%M-%S.%f')
+
 ttl = 0
 ttl_hit = 0
 
@@ -88,6 +91,16 @@ class DraftRunner(ModelRunner):
             dist.recv(eagle_acts, src=0, group=self.async_pg)
 
         prefill_ctxt = self.prepare_prefill_ctxt(num_tokens, draft_block_table)
+
+        dump_dir = os.environ.get("SSD_DUMP_TENSORS_DIR", "")
+        if dump_dir:
+            torch.save({
+                'metadata': metadata.cpu(),
+                'input_ids': input_ids.cpu(),
+                'num_tokens': num_tokens.cpu(),
+                'draft_block_table': draft_block_table.cpu(),
+                'eagle_acts': eagle_acts.cpu() if eagle_acts is not None else None,
+            }, f"{dump_dir}/prefill_request_{_dump_ts()}.pt")
 
         # 5) set up context exactly like prepare_prefill() does:
         set_context(
@@ -360,6 +373,20 @@ class DraftRunner(ModelRunner):
                     print(f"  Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}'), n_ext={n_ext}", flush=True)
                 print(f"{'='*80}\n", flush=True)
 
+        dump_dir = os.environ.get("SSD_DUMP_TENSORS_DIR", "")
+        if dump_dir:
+            torch.save({
+                'metadata': meta.cpu(),
+                'cache_keys': cache_keys.cpu(),
+                'num_tokens': num_tokens.cpu(),
+                'block_tables': draft_block_tables.cpu() if draft_block_tables is not None else None,
+                'temps': temperatures.cpu(),
+                'recovery_activations': target_recovery_activations.cpu() if target_recovery_activations is not None else None,
+                'extend_activations': extend_eagle_acts.cpu() if extend_eagle_acts is not None else None,
+                'extend_counts': extend_counts.cpu() if extend_counts is not None else None,
+                'extend_token_ids': extend_token_ids.cpu() if extend_token_ids is not None else None,
+            }, f"{dump_dir}/speculation_request_{_dump_ts()}.pt")
+
         if _prof or PROFILE_DRAFT:
             torch.cuda.synchronize()
             _d1 = time.perf_counter()
@@ -401,6 +428,14 @@ class DraftRunner(ModelRunner):
         fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
         dist.send(fused_response, dst=0, group=self.async_pg)
         dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
+
+        dump_dir = os.environ.get("SSD_DUMP_TENSORS_DIR", "")
+        if dump_dir:
+            torch.save({
+                'speculations': out_tokens.to(torch.int64).cpu(),
+                'logits': out_logits[:, :K, :].contiguous().cpu(),
+                'cache_hits': cache_hits.to(torch.int64).cpu(),
+            }, f"{dump_dir}/speculation_response_{_dump_ts()}.pt")
 
         if _prof or PROFILE_DRAFT:
             torch.cuda.synchronize()
