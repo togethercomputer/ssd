@@ -260,9 +260,9 @@ class DraftRunner(ModelRunner):
                     rec_text = self.tokenizer.decode([rec_token])
                     hit_marker = "[HIT]" if i in hit_indices else ""
                     print(f"    [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
-            
+
             # Fill hits
-            if (cache_hits.any() and not self.config.jit_speculate) or (cache_hits.all() and self.config.jit_speculate):
+            if not self.config.force_jit_speculate and ((cache_hits.any() and not self.config.jit_speculate) or (cache_hits.all() and self.config.jit_speculate)):
                 # print(f'[hit_cache_and_respond] got all cache hits, using cached logits and tokens', flush=True)
                 # [B], arbitrary if no match but masked out
                 idx = match.float().argmax(dim=1).to(torch.int64)

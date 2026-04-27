@@ -32,6 +32,9 @@ class Config:
     fan_out_list_miss: list[int] | None = None
     sampler_x: float | None = None 
     jit_speculate: bool = False 
+    force_jit_speculate: bool = False
+    communicate_logits: bool = True
+    communicate_cache_hits: bool = True
 
     # eagle3
     use_eagle: bool = False 

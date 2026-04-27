@@ -18,6 +18,7 @@ from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
@@ -135,10 +136,11 @@ class LLMEngine:
                 self.model_runner.send_draft_exit_signal()
         except Exception:
             pass
-        # 2) Tell all target ranks (including rank 0 self) to exit (non-blocking cleanup, no os._exit inside)
+        # 2) Tell all target ranks (including rank 0 self) to exit (non-blocking cleanup, no os._exit inside).
+        # Forward `hard` so soft exits actually destroy process groups; otherwise the next test
+        # in the same process gets "trying to initialize the default process group twice".
         try:
-            self.model_runner.call("exit",
-                                   True if not self.config.draft_async else True)
+            self.model_runner.call("exit", hard)
         except Exception:
             pass
         # 3) Wait briefly for TP workers; terminate if still around
