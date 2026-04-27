@@ -43,7 +43,7 @@ class VocabParallelEmbedding(nn.Module):
         shard_size = param_data.size(0)
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
-        assert param_data.size() == loaded_weight.size()
+        assert param_data.size() == loaded_weight.size(), f"param_data.size()={param_data.size()}, loaded_weight.size()={loaded_weight.size()}"
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):

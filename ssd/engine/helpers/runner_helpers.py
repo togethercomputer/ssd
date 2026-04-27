@@ -11,7 +11,6 @@ from ssd.utils.misc import compress_neg_ones_and_zeros
 
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 BRIEF_LOG = os.environ.get("SSD_BRIEF_LOG", "0") == "1"
-DUMP_TENSORS_DIR = os.environ.get("SSD_DUMP_TENSORS_DIR", "")
 RUN_NAME = os.environ.get("SSD_RUN_NAME", "")
 
 def _ts():
@@ -22,13 +21,6 @@ def _dump_ts():
         return RUN_NAME
     else:
         return datetime.now().strftime('%Y-%m-%d_%H-%M-%S.%f')  # [:-4]
-
-if DUMP_TENSORS_DIR:
-    print(f"[{_ts()}] BANANA: Dumping tensors to {DUMP_TENSORS_DIR}")
-    os.makedirs(DUMP_TENSORS_DIR, exist_ok=True)
-    DUMP_TENSORS = True
-else:
-    DUMP_TENSORS = False
 
 def list_to_str(lst: list[float] | list[list[float]], num_decimals: int = 4) -> str:
     assert len(lst) > 0
@@ -175,19 +167,19 @@ class PrefillRequest:
             draft_block_table=draft_block_table,
             eagle_acts=eagle_acts,
         )
-        if DUMP_TENSORS:
-            received_request.dump()
+        received_request.dump()
         return received_request
 
     def dump(self):
-        assert DUMP_TENSORS_DIR is not None, "DUMP_TENSORS_DIR is not set"
-        torch.save({
-            'metadata': self.metadata.cpu(),
-            'input_ids': self.input_ids.cpu(),
-            'num_tokens': self.num_tokens.cpu(),
-            'draft_block_table': self.draft_block_table.cpu(),
-            'eagle_acts': self.eagle_acts.cpu() if self.eagle_acts is not None else None,
-        }, f"{DUMP_TENSORS_DIR}/prefill_request_{_dump_ts()}.pt")
+        dump_dir = os.environ.get("SSD_DUMP_TENSORS_DIR", "")
+        if dump_dir:
+            torch.save({
+                'metadata': self.metadata.cpu(),
+                'input_ids': self.input_ids.cpu(),
+                'num_tokens': self.num_tokens.cpu(),
+                'draft_block_table': self.draft_block_table.cpu(),
+                'eagle_acts': self.eagle_acts.cpu() if self.eagle_acts is not None else None,
+            }, f"{dump_dir}/prefill_request_{_dump_ts()}.pt")
 
 
 @dataclass
@@ -408,24 +400,23 @@ class SpeculationRequest:
                     decoded_extend_token_ids = _decode_ids(extend_token_ids[i, :num_extend], tokenizer)
                     print(f"[{_ts()}]      req[{i}]: extend_token_ids shape={extend_token_ids.shape}, values={extend_token_ids[i].tolist()}, decoded[:, :{num_extend}]='{decoded_extend_token_ids}'", flush=True)
 
-        if DUMP_TENSORS:
-            speculation_request.dump()
-
+        speculation_request.dump()
         return speculation_request
 
     def dump(self):
-        assert DUMP_TENSORS_DIR is not None, "DUMP_TENSORS_DIR is not set"
-        torch.save({
-            'metadata': self.metadata.cpu(),
-            'cache_keys': self.cache_keys.cpu(),
-            'num_tokens': self.num_tokens.cpu(),
-            'block_tables': self.block_tables.cpu() if self.block_tables is not None else None,
-            'temps': self.temps.cpu(),
-            'recovery_activations': self.recovery_activations.cpu() if self.recovery_activations is not None else None,
-            'extend_activations': self.extend_activations.cpu() if self.extend_activations is not None else None,
-            'extend_counts': self.extend_counts.cpu() if self.extend_counts is not None else None,
-            'extend_token_ids': self.extend_token_ids.cpu() if self.extend_token_ids is not None else None,
-        }, f"{DUMP_TENSORS_DIR}/speculation_request_{_dump_ts()}.pt")
+        dump_dir = os.environ.get("SSD_DUMP_TENSORS_DIR", "")
+        if dump_dir:
+            torch.save({
+                'metadata': self.metadata.cpu(),
+                'cache_keys': self.cache_keys.cpu(),
+                'num_tokens': self.num_tokens.cpu(),
+                'block_tables': self.block_tables.cpu() if self.block_tables is not None else None,
+                'temps': self.temps.cpu(),
+                'recovery_activations': self.recovery_activations.cpu() if self.recovery_activations is not None else None,
+                'extend_activations': self.extend_activations.cpu() if self.extend_activations is not None else None,
+                'extend_counts': self.extend_counts.cpu() if self.extend_counts is not None else None,
+                'extend_token_ids': self.extend_token_ids.cpu() if self.extend_token_ids is not None else None,
+            }, f"{dump_dir}/speculation_request_{_dump_ts()}.pt")
 
 
 @dataclass
@@ -459,6 +450,8 @@ class SpeculationResponse:
         response.communicate_logits = communicate_logits
         response.communicate_cache_hits = communicate_cache_hits
         response.tokenizer = tokenizer
+        if response.communicate_logits:
+            assert response.vocab_size > 0, "vocab_size must be set when communicate_logits is True"
         response._alloc_buffers()
         return response
 
@@ -489,16 +482,16 @@ class SpeculationResponse:
             assert getattr(self, 'communicate_cache_hits', True), "cache_hits is not None but communicate_cache_hits is False"
             send_tensor(self.cache_hits, async_pg, target_rank, name="cache hits", prefix="DRAFT:SpeculationResponse.send")
 
-        if DUMP_TENSORS:
-            self.dump()
+        self.dump()
 
     def dump(self):
-        assert DUMP_TENSORS_DIR is not None, "DUMP_TENSORS_DIR is not set"
-        torch.save({
-            'speculations': self.speculations.cpu(),
-            'logits': self.logits_q.cpu() if self.logits_q is not None else None,
-            'cache_hits': self.cache_hits.cpu() if self.cache_hits is not None else None,
-        }, f"{DUMP_TENSORS_DIR}/speculation_response_{_dump_ts()}.pt")
+        dump_dir = os.environ.get("SSD_DUMP_TENSORS_DIR", "")
+        if dump_dir:
+            torch.save({
+                'speculations': self.speculations.cpu(),
+                'logits': self.logits_q.cpu() if self.logits_q is not None else None,
+                'cache_hits': self.cache_hits.cpu() if self.cache_hits is not None else None,
+            }, f"{dump_dir}/speculation_response_{_dump_ts()}.pt")
 
     @classmethod
     def receive(
