@@ -316,6 +316,7 @@ class ModelRunner:
         try:
             for attr in (
                 "graphs", "graph_pools", "graph_vars", "graph_bs_list",
+                "prefill_wrappers", "only_prefill_wrapper", "workspace_buffer",
                 "verify_graphs", "verify_graph_pool",
                 "glue_graphs", "glue_graph_pool",
                 "model", "kv_cache", "sampler",
