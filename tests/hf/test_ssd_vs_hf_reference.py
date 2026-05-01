@@ -25,8 +25,8 @@ CROSS_NODE = [True, False]
 # @pytest.mark.parametrize("speculator_type", ["standalone"])
 # @pytest.mark.parametrize("cross_node", [False])
 # @pytest.mark.parametrize("backup", ["force-jit"])
-@pytest.mark.parametrize("backup", ["force-jit"])  # [None])
-@pytest.mark.parametrize("speculator_type", ["eagle", "standalone"])
+@pytest.mark.parametrize("backup", ["jit"])  # [None])
+@pytest.mark.parametrize("speculator_type", ["standalone"])
 @pytest.mark.parametrize("cross_node", [False])
 @pytest.mark.parametrize("engine", ["tgl"])
 @pytest.mark.parametrize("max_new_tokens", [128])
@@ -295,8 +295,8 @@ def full_ssd_simulation(
     full_target_activations: torch.Tensor = None, # Note: These should already be projected into the draft space.
     duplicate_first_token: bool = True,
     tokenizer: AutoTokenizer = None,
+    fan_out: int = 5,
 ):
-    assert backup == "force-jit", "SSD simulation only supports force-jit backup for now"
     all_tokens = prompt_tokens + completion_tokens
     all_tokens_tensor = torch.tensor([all_tokens], device=draft_model.device, dtype=torch.long)
     draft_device = draft_model.device
@@ -318,45 +318,69 @@ def full_ssd_simulation(
 
     target_preds = full_target_logits.argmax(dim=-1)
     
-    generated = 0
     acceptance_lengths = []
+    cache_hits = []
     probability_gaps = []
-    # current_activation_index = len(prompt_tokens)
-    done_generating = False
-    while not done_generating:
+
+    cache_hit = False
+    generated = 1  # bonus token from prefill is already generated
+    while True:
+        ## SPECULATE ##
+        tokens_remaining = all_tokens_tensor.shape[1] - (len(prompt_tokens) + generated)
+        if tokens_remaining < lookahead:
+            break
+
         if eagle:
-            tokens_remaining = all_tokens_tensor.shape[1] - (len(prompt_tokens) + generated)
-            effective_lookahead = min(lookahead, tokens_remaining)
-            if effective_lookahead <= 0:
-                done_generating = True
-                break
-            current_activations = full_target_activations[:len(prompt_tokens) + generated + 1]
-            for i in range(effective_lookahead):
-                curr_len = len(prompt_tokens) + generated + i + 1
-                current_prefix = all_tokens_tensor[0, :curr_len]
-                print(f"[SIMULATION] current_activations.shape: {current_activations.shape}")
-                if i > 0:
-                    print(f"[SIMULATION] draft_activations.shape: {draft_activations.shape}")
-                    current_activations = torch.cat([current_activations, draft_activations[-1:]])
-                draft_activations = draft_model.forward_with_cond(current_prefix, torch.arange(curr_len, device=draft_device), current_activations)
-            speculation_activations = draft_model.norm(draft_activations[-effective_lookahead:])
-            speculation_logits = draft_model.lm_head(speculation_activations)
-            speculation_logits = convert_to_full_vocab_logits(draft_model, speculation_logits)
-            speculation_preds = speculation_logits.argmax(dim=-1)
+            if backup == "force-jit" or (not cache_hit and backup == "jit") or cache_hit:
+                if cache_hit and backup != "force-jit":
+                    num_generated_last_round = acceptance_lengths[-1] + 1
+                    base_len = len(prompt_tokens) + generated - num_generated_last_round
+                    # We do one extra draft pass (+1) to get the logits after the last speculated token,
+                    # which are needed to check for cache hits when all tokens are accepted.
+                    num_draft_passes = num_generated_last_round + lookahead + 1
+                else:
+                    base_len = len(prompt_tokens) + generated
+                    # We do one extra draft pass (+1) to get the logits after the last speculated token,
+                    # which are needed to check for cache hits when all tokens are accepted.
+                    num_draft_passes = lookahead + 1
+                current_activations = full_target_activations[:base_len]
+                for i in range(num_draft_passes):
+                    curr_len = base_len + i
+                    current_prefix = all_tokens_tensor[0, :curr_len]
+                    print(f"[SIMULATION] current_activations.shape: {current_activations.shape}")
+                    if i > 0:
+                        print(f"[SIMULATION] draft_activations.shape: {draft_activations.shape}")
+                        current_activations = torch.cat([current_activations, draft_activations[-1:]])
+                    draft_activations = draft_model.forward_with_cond(current_prefix, torch.arange(curr_len, device=draft_device), current_activations)
+                speculation_activations = draft_model.norm(draft_activations[-(lookahead + 1):])
+                speculation_logits = draft_model.lm_head(speculation_activations)
+                speculation_logits = convert_to_full_vocab_logits(draft_model, speculation_logits)
+                speculation_preds = speculation_logits.argmax(dim=-1)
+            else:
+                # fast speculation
+                speculation_logits = torch.full((lookahead + 1, draft_model.config.vocab_size), float("-inf"), device=draft_device, dtype=dtype)
+                speculation_logits[:, 0] = 0.0
+                speculation_preds = torch.zeros(lookahead + 1, device=draft_device, dtype=torch.long)
         else:
             curr_len = len(prompt_tokens) + generated + lookahead
             current_prefix = all_tokens_tensor[:, :curr_len]
-            speculation_logits = draft_model.forward(current_prefix).logits[0]
-            speculation_logits = speculation_logits[-lookahead:]
-            speculation_preds = speculation_logits.argmax(dim=-1)
+            if backup == "fast" and not cache_hit:
+                # fast speculation
+                speculation_logits = torch.full((lookahead + 1, draft_model.config.vocab_size), float("-inf"), device=draft_device, dtype=dtype)
+                speculation_logits[:, 0] = 0.0
+                speculation_preds = torch.zeros(lookahead + 1, device=draft_device, dtype=torch.long)
+            else:
+                speculation_logits = draft_model.forward(current_prefix).logits[0]
+                speculation_logits = speculation_logits[-(lookahead + 1):]
+                # Note: speculation preds has an extra token at the end.
+                speculation_preds = speculation_logits.argmax(dim=-1)
+        ### END SPECULATE ###
 
-        num_accepted = lookahead        
+        ### CHECK HOW MANY TOKENS ARE ACCEPTED ###
+        num_accepted = lookahead
         for i in range(lookahead):
             curr_idx = len(prompt_tokens) + generated + i
-            if curr_idx + 1 > len(all_tokens) - 1:
-                done_generating = True
-                break
-            next_token = all_tokens[curr_idx + 1]
+            next_token = all_tokens[curr_idx]
             if target_preds[curr_idx].item() != next_token:
                 if tokenizer is not None:
                     target_pred_str = tokenizer.decode(target_preds[curr_idx])
@@ -364,36 +388,46 @@ def full_ssd_simulation(
                     print(f"[SIMULATION] Target prediction `{target_pred_str}` != next token `{next_token_str}` at index {curr_idx}")
                 else:
                     print(f"[SIMULATION] Target prediction {target_preds[curr_idx].item()} != next token {next_token} at index {curr_idx}")
-            if speculation_preds[i].item() != next_token:
+
+            speculated_token = speculation_preds[i].item()
+            if speculated_token != next_token:
                 num_accepted = i
                 break
 
-        if not done_generating:
-            acceptance_lengths.append(num_accepted)
-            curr_probability_gaps = []
-            for i in range(lookahead):
-                curr_idx = len(prompt_tokens) + generated + i
-                if curr_idx > len(all_tokens) - 1:
-                    done_generating = True
-                    break
-                draft_logits = speculation_logits[i]
-                target_logits = full_target_logits[curr_idx]
-                draft_probs = torch.softmax(draft_logits, dim=-1)
-                target_probs = torch.softmax(target_logits, dim=-1)
-                gap = torch.linalg.norm(draft_probs - target_probs, ord=1).item()
-                if gap > 0.5:
-                    prefix = all_tokens_tensor[0, :curr_idx + 1]
-                    decoded_prefix = tokenizer.decode(prefix)
-                    print(f"[SIMULATION][{curr_idx}] Prefix: {decoded_prefix}")
-                    draft_pred = draft_logits.argmax(dim=-1)
-                    target_pred = target_logits.argmax(dim=-1)
-                    draft_pred_str = tokenizer.decode(draft_pred)
-                    target_pred_str = tokenizer.decode(target_pred)
-                    print(f"[SIMULATION][{curr_idx}] |draft_probs - target_probs| = {gap:.4f}, Draft prediction `{draft_pred_str}`. Target prediction `{target_pred_str}`.")
-                curr_probability_gaps.append(gap)
+        acceptance_lengths.append(num_accepted)
+        ### END CHECK HOW MANY TOKENS ARE ACCEPTED ###
 
-            if not done_generating:
-                probability_gaps.append(curr_probability_gaps)
+        ### DETERMINE IF THERE IS A CACHE HIT IN THE NEXT ROUND ###
+        speculated_token = speculation_preds[num_accepted].item()
+        draft_logits = speculation_logits[num_accepted].clone()
+        if num_accepted != lookahead:
+            draft_logits[speculated_token] = float("-inf")
+        cache_hit = int(next_token in draft_logits.topk(k=fan_out).indices)
+        cache_hits.append(cache_hit)
+        ### END DETERMINE IF THERE IS A CACHE HIT IN THE NEXT ROUND ###
+
+        ### MEASURE PROBABILITY DISTRIBUTION GAPS (DRAFT VS TARGET) ###
+        curr_probability_gaps = []
+        for i in range(lookahead):
+            curr_idx = len(prompt_tokens) + generated + i
+            draft_logits = speculation_logits[i]
+            target_logits = full_target_logits[curr_idx]
+            draft_probs = torch.softmax(draft_logits, dim=-1)
+            target_probs = torch.softmax(target_logits, dim=-1)
+            gap = torch.linalg.norm(draft_probs - target_probs, ord=1).item()
+            if gap > 0.5:
+                prefix = all_tokens_tensor[0, :curr_idx + 1]
+                decoded_prefix = tokenizer.decode(prefix)
+                print(f"[SIMULATION][{curr_idx}] Prefix: {decoded_prefix}")
+                draft_pred = draft_logits.argmax(dim=-1)
+                target_pred = target_logits.argmax(dim=-1)
+                draft_pred_str = tokenizer.decode(draft_pred)
+                target_pred_str = tokenizer.decode(target_pred)
+                print(f"[SIMULATION][{curr_idx}] |draft_probs - target_probs| = {gap:.4f}, Draft prediction `{draft_pred_str}`. Target prediction `{target_pred_str}`.")
+            curr_probability_gaps.append(gap)
+
+        probability_gaps.append(curr_probability_gaps)
+        ### END MEASURE PROBABILITY DISTRIBUTION GAPS (DRAFT VS TARGET) ###
 
         generated += num_accepted + 1
 
@@ -402,14 +436,15 @@ def full_ssd_simulation(
     print(f"[SIMULATION] Average acceptance length: {acc_lengths_array.mean():.4f}")
     print(f"[SIMULATION] Probability gaps: {probability_gaps}")
     print(f"[SIMULATION] Average probability gap: {np.array(probability_gaps).mean():.4f}")
-
-
+    if backup != "force-jit":
+        print(f"[SIMULATION] Cache hits: {cache_hits}")
+        print(f"[SIMULATION] Average cache hit: {np.array(cache_hits).mean():.4f}")
     return acceptance_lengths, probability_gaps
 
 
 def convert_to_full_vocab_logits(draft_model: Eagle3Model, draft_logits: torch.Tensor) -> torch.Tensor:
     full_vocab_indices = torch.arange(draft_model.d2t.shape[0], device=draft_logits.device) + draft_model.d2t
-    full_vocab_logits = draft_logits.new_full((draft_logits.shape[0], draft_model.cfg.vocab_size), float("-inf"))
+    full_vocab_logits = draft_logits.new_full((draft_logits.shape[0], draft_model.config.vocab_size), float("-inf"))
     full_vocab_logits.index_copy_(-1, full_vocab_indices, draft_logits)
     return full_vocab_logits
 

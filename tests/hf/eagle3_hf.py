@@ -99,7 +99,7 @@ class Eagle3DecoderLayer(nn.Module):
 class Eagle3Model(nn.Module):
     def __init__(self, cfg, d_model_target, device: str = "cuda"):
         super().__init__()
-        self.cfg = cfg
+        self.config = cfg
         self.device = device
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.fc = nn.Linear(3 * d_model_target, cfg.hidden_size, bias=False)
