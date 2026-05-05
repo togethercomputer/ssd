@@ -20,6 +20,7 @@ class Verifier(VerifierBase):
         jit_speculate: bool = False,
         tokenizer: AutoTokenizer = None,
         metrics: dict = None,
+        verbose: bool = False,
     ):
         super().__init__(lookahead, device)
         self.target_model_runner = target_model_runner
@@ -28,6 +29,7 @@ class Verifier(VerifierBase):
         self.jit_speculate = jit_speculate
         self.tokenizer = tokenizer
         self.metrics = metrics
+        self.verbose = verbose
 
     def prefill(self, seqs: list[Sequence], eagle: bool = False) -> VerifyResult:
         result = self.target_model_runner.call("run", seqs, True)
@@ -114,7 +116,7 @@ class Verifier(VerifierBase):
 
 
         # # Debug: print recovery tokens detokenized
-        if __debug__ and recovery_tokens is not None and len(recovery_tokens) > 0:
+        if self.verbose and recovery_tokens is not None and len(recovery_tokens) > 0:
             recovery_texts = []
             for token in recovery_tokens:
                 try:
@@ -138,7 +140,7 @@ class Verifier(VerifierBase):
                     self.metrics["accepted_suffix_lens_on_miss"].append(suffix_len)
 
         # Print mean length of new suffixes for monitoring
-        if __debug__ and new_suffixes:
+        if self.verbose and new_suffixes:
             mean_suffix_len = sum([len(suffix) for suffix in new_suffixes]) / len(new_suffixes)
             print(f"[verify] mean new suffix length: {mean_suffix_len:.2f}", flush=True)
 

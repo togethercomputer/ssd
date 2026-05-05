@@ -18,39 +18,40 @@ class InferenceStep(ABC):
         self.scheduler = scheduler
 
     @abstractmethod
-    def decode(self, seqs: list[Sequence]) -> int:
+    def prefill(self, seqs: list[Sequence], step_num: int = 0) -> int:
         pass
 
     @abstractmethod
-    def prefill(self, seqs: list[Sequence]) -> int:
+    def decode(self, seqs: list[Sequence], step_num: int = 0) -> int:
         pass
 
 
 class AutoRegressiveStep(InferenceStep):
 
-    def __init__(self, scheduler: Scheduler, model_runner: ModelRunner, tokenizer: AutoTokenizer):
+    def __init__(self, scheduler: Scheduler, model_runner: ModelRunner, tokenizer: AutoTokenizer, verbose: bool = False):
         super().__init__(scheduler)
         self.model_runner = model_runner
         self.tokenizer = tokenizer
+        self.verbose = verbose
 
-    def step(self, seqs: list[Sequence], is_prefill: bool) -> int:
-        if __debug__:
+    def step(self, seqs: list[Sequence], is_prefill: bool, step_num: int = 0) -> int:
+        if self.verbose:
             print(f'[auto_regressive_step] is_prefill={is_prefill}', flush=True)
 
         token_ids = self.model_runner.call("run", seqs, is_prefill)
 
-        if __debug__:
+        if self.verbose:
             decoded_tokens = decode_tokens(token_ids, self.tokenizer)
             print(f"[auto_regressive_step] generated tokens: {decoded_tokens}", flush=True)
 
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         return len(seqs) if not is_prefill else sum(len(seq) for seq in seqs)
 
-    def prefill(self, seqs: list[Sequence]) -> int:
-        return self.step(seqs, is_prefill=True)
+    def prefill(self, seqs: list[Sequence], step_num: int = 0) -> int:
+        return self.step(seqs, is_prefill=True, step_num=step_num)
 
-    def decode(self, seqs: list[Sequence]) -> int:
-        return self.step(seqs, is_prefill=False)
+    def decode(self, seqs: list[Sequence], step_num: int = 0) -> int:
+        return self.step(seqs, is_prefill=False, step_num=step_num)
 
 
 class SpecDecodeStep(InferenceStep):
@@ -63,6 +64,7 @@ class SpecDecodeStep(InferenceStep):
         eagle: bool,
         tokenizer: AutoTokenizer,
         async_spec: bool,
+        verbose: bool = False,
     ):
         super().__init__(scheduler)
         self.speculator = speculator
@@ -70,16 +72,26 @@ class SpecDecodeStep(InferenceStep):
         self.eagle = eagle
         self.tokenizer = tokenizer
         self.async_spec = async_spec
+        self.verbose = verbose
 
-    def prefill(self, seqs: list[Sequence]) -> int:
+    def prefill(self, seqs: list[Sequence], step_num: int = 0) -> int:
         # When doing async speculation and not Eagle, we can do draft and target prefills in parallel.
-        if not self.eagle and self.async_spec:
-            empty_verify_result = VerifyResult([], [], None)
-            self.speculator.prefill(seqs, empty_verify_result)
-            verify_result = self.verifier.prefill(seqs, eagle=False)
-        else:
-            verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
-            self.speculator.prefill(seqs, verify_result)
+        # TEMPORARY: Disable prefill optimization of running draft and target prefills in parallel.
+        # if not self.eagle and self.async_spec:
+        #     empty_verify_result = VerifyResult([], [], None)
+        #     self.speculator.prefill(seqs, empty_verify_result)
+        #     verify_result = self.verifier.prefill(seqs, eagle=False)
+        # else:
+        if self.verbose:
+            print(f"[SpecDecodeStep] Verifier prefill {step_num}", flush=True)
+        verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
+
+        if self.verbose:
+            print(f"[SpecDecodeStep] Speculator prefill {step_num}", flush=True)
+        self.speculator.prefill(seqs, verify_result)
+
+        if self.verbose:
+            print(f"[SpecDecodeStep] Prefill {step_num} complete", flush=True)
 
         for seq in seqs:
             assert seq.recovery_token_id is not None
@@ -88,11 +100,15 @@ class SpecDecodeStep(InferenceStep):
 
         return sum(len(seq) for seq in seqs)
 
-    def decode(self, seqs: list[Sequence]) -> int:
+    def decode(self, seqs: list[Sequence], step_num: int = 0) -> int:
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
+        _prof_ev = os.environ.get("SSD_PROFILE_EVENTS", "0") == "1"
         if _prof:
             torch.cuda.synchronize()
             _t0 = perf_counter()
+        if _prof_ev:
+            _ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            _ev[0].record()
 
         # Save lightweight state instead of expensive clone_spec deep copy.
         # speculate() modifies: token_ids (append+extend), num_tokens, last_token, num_draft_cached_tokens
@@ -112,15 +128,17 @@ class SpecDecodeStep(InferenceStep):
         if _prof:
             torch.cuda.synchronize()
             _t1 = perf_counter()
+        if _prof_ev:
+            _ev[1].record()
 
-        if __debug__:
+        if self.verbose:
             speculations = speculate_result.speculations
-            print(f"[SpecDecodeStep] speculations: {speculations}", flush=True)
+            print(f"[SpecDecodeStep] speculations {step_num}: {speculations}", flush=True)
             speculations_list = speculations.tolist()
 
             for i, speculation in enumerate(speculations_list):
                 decoded_tokens = decode_tokens(speculation, self.tokenizer)
-                print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
+                print(f"[SpecDecodeStep] speculation {step_num},{i}: {decoded_tokens}", flush=True)
 
         #### STEP 2: VERIFY ####
         out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
@@ -128,13 +146,15 @@ class SpecDecodeStep(InferenceStep):
         if _prof:
             torch.cuda.synchronize()
             _t2 = perf_counter()
+        if _prof_ev:
+            _ev[2].record()
 
-        if __debug__:
+        if self.verbose:
             recovery_tokens = out_verify_result.recovery_tokens
             new_suffixes = out_verify_result.new_suffixes
             for i, new_suffix in enumerate(new_suffixes):
                 decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
-                print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
+                print(f"[SpecDecodeStep] verification {step_num},{i}: {decoded_tokens}", flush=True)
 
         # Restore original seq state before postprocess (undo speculate + verify modifications)
         for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):
@@ -159,5 +179,12 @@ class SpecDecodeStep(InferenceStep):
             hits_str = f"hits={cache_hits.sum().item()}/{len(cache_hits)}" if cache_hits is not None else ""
             toks = sum(len(s) for s in out_verify_result.new_suffixes)
             print(f"[PROFILE target] handshake={(_t1-_t0)*1000:.2f}ms verify={(_t2-_t1)*1000:.2f}ms postprocess={(_t3-_t2)*1000:.2f}ms total={(_t3-_t0)*1000:.2f}ms {hits_str} toks={toks}", flush=True)
+        if _prof_ev:
+            _ev[3].record()
+            _ev[3].synchronize()
+            cache_hits = speculate_result.cache_hits
+            hits_str = f"hits={cache_hits.sum().item()}/{len(cache_hits)}" if cache_hits is not None else ""
+            toks = sum(len(s) for s in out_verify_result.new_suffixes)
+            print(f"[PROFILE_EVENTS target] handshake={_ev[0].elapsed_time(_ev[1]):.2f}ms verify={_ev[1].elapsed_time(_ev[2]):.2f}ms postprocess={_ev[2].elapsed_time(_ev[3]):.2f}ms total={_ev[0].elapsed_time(_ev[3]):.2f}ms {hits_str} toks={toks}", flush=True)
 
         return sum(len(s) for s in out_verify_result.new_suffixes)

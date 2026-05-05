@@ -1,6 +1,7 @@
 
 import pickle
 import time
+from datetime import datetime, timedelta
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -17,9 +18,12 @@ from ssd.layers.sampler import Sampler
 from ssd.utils.context import set_context, reset_context, get_context
 from ssd.utils.loader import load_model
 from ssd.engine.helpers.runner_helpers import (
+    COMMAND,
     prepare_decode_tensors_from_seqs, 
     prepare_block_tables_from_seqs, 
-    prepare_prefill_tensors_from_seqs
+    prepare_prefill_tensors_from_seqs,
+    receive_tensor,
+    send_tensor,
 )
 from ssd.engine.helpers.cudagraph_helpers import (
     run_verify_cudagraph,
@@ -30,9 +34,14 @@ from ssd.engine.helpers.cudagraph_helpers import (
     capture_verify_cudagraph,
     capture_fi_tree_decode_cudagraph,
     capture_glue_decode_cudagraph,
-    get_custom_mask,
 )
-    
+from ssd.engine.helpers.mask_helpers import get_custom_mask
+
+NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
+
+def _ts():
+    return f'[[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}]]'
+
 
 class ModelRunner:
 
@@ -48,7 +57,7 @@ class ModelRunner:
                     print(f"Warning: Draft dtype {config.draft_hf_config.torch_dtype} differs from target {config.hf_config.torch_dtype}. Casting draft to {config.hf_config.torch_dtype}.")
                 config.draft_hf_config.torch_dtype = config.hf_config.torch_dtype
             assert (config.draft_hf_config.vocab_size == config.hf_config.vocab_size) or config.use_eagle, "ERROR in ModelRunner: draft_hf_config.vocab_size != hf_config.vocab_size"
-        
+
         self.hf_config = config.hf_config if not is_draft else config.draft_hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
@@ -59,7 +68,7 @@ class ModelRunner:
         
         # TODO: Get rid of this.
         if self.is_draft:
-            should_use_dist = self.config.draft_async
+            should_use_dist = self.config.draft_async and self.config.async_nccl_port is None
         else:
             should_use_dist = self.config.num_gpus > 1
 
@@ -86,7 +95,9 @@ class ModelRunner:
         self._exiting = False 
         
         torch.cuda.set_device(self.rank)
-        self.device = torch.device(f'cuda:{self.rank}') 
+        self.device = torch.device(f'cuda:{self.rank}')
+        self._cmd = torch.empty(1, dtype=torch.int64, device=self.device)
+
         
         # cudagraph logic for FlashInfer kernels, need diff wrapper for each batch size we make a graph for 
         if is_draft and config.draft_async:
@@ -159,7 +170,7 @@ class ModelRunner:
     def _init_flashinfer_wrappers(self):
         """Initialize FlashInfer wrappers for draft async mode."""
         self.workspace_buffer = torch.zeros(
-            512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}") 
+            768 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}")
         
         if self.config.enforce_eager: 
             self.only_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
@@ -256,7 +267,37 @@ class ModelRunner:
         load_model(self.model, config.model, target_path=target_path, target_hidden_size=target_hidden_size)
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
-            self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
+            if config.async_nccl_port is not None:
+                _nccl_timeout = timedelta(minutes=20)
+                _banner = "=" * 80
+                print(
+                    f'\n{_banner}\n'
+                    f'>>> DRAFT: WAITING for target server at '
+                    f'{config.async_nccl_host}:{config.async_nccl_port} '
+                    f'to form NCCL process group (timeout={_nccl_timeout}) ...\n'
+                    f'{_banner}\n',
+                    flush=True,
+                )
+                from torch.distributed import TCPStore
+                from ssd.utils.dist_utils import init_custom_process_group
+                store = TCPStore(config.async_nccl_host, port=config.async_nccl_port,
+                                 world_size=2, is_master=False,
+                                 timeout=_nccl_timeout)
+                with torch.cuda.device(self.device):
+                    self.async_pg = init_custom_process_group(
+                        backend="nccl", store=store, world_size=2, rank=1,
+                        group_name="async_spec", timeout=_nccl_timeout)
+                print(f'\n{_banner}\n>>> DRAFT: NCCL process group formed! Now receiving kv_cache_size...\n{_banner}\n', flush=True)
+                # Cross-node: receive kv_cache_size from target so draft
+                # allocates the same number of KV cache blocks.
+                kv_buf = torch.empty(1, dtype=torch.int64, device=self.device)
+                kv_buf = receive_tensor(kv_buf, self.async_pg, 0, name="target kv_cache_size")
+                target_kv_cache_size = kv_buf.item()
+                print(f'[model_runner] Received target kv_cache_size={target_kv_cache_size} via NCCL', flush=True)
+                if target_kv_cache_size > 0:
+                    config.num_kvcache_blocks = target_kv_cache_size
+            else:
+                self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
         if self.verbose:
             print(f'-----{model_type}MODEL LOADED----', flush=True)
         if config.sampler_x is not None:
@@ -270,10 +311,6 @@ class ModelRunner:
         if self.verbose:
             print(f'-----ALLOCATING {model_type}KV CACHE----', flush=True)
         self.allocate_kv_cache()
-        if init_q is not None:
-            # super().__init__() runs warmup and calculates num_kvcache_blocks, pass that up
-            init_q.put(self.config.num_kvcache_blocks)
-            init_q.close()
 
         if not self.enforce_eager:
             # if not self.is_draft or (self.is_draft and self.config.draft_async and self.config.speculate): 
@@ -300,6 +337,19 @@ class ModelRunner:
                 self.graph_pools["glue_decode"] = glue_pool
                 self.graphs["glue_decode"] = glue_graphs
                 self.graph_bs_list["glue_decode"] = glue_bs_list
+
+        if init_q is not None:
+            # Signal the scheduler that we're fully initialized (model loaded,
+            # KV cache allocated, CUDA graphs captured).  Must happen after
+            # CUDA graph capture so the scheduler doesn't send NCCL requests
+            # before the draft runner enters its recv loop.
+            init_q.put(self.config.num_kvcache_blocks)
+            init_q.close()
+        elif self.is_draft and self.draft_async and hasattr(self, 'async_pg'):
+            # Cross-node mode: no mp.Queue available, signal readiness via NCCL.
+            ready_buf = torch.tensor([self.config.num_kvcache_blocks], dtype=torch.int64, device=self.device)
+            send_tensor(ready_buf, self.async_pg, 0, name="num_kvcache_blocks")
+            print(f'[model_runner] Cross-node init: sent num_kvcache_blocks={self.config.num_kvcache_blocks} via NCCL', flush=True)
 
         return model_type
 
@@ -356,7 +406,7 @@ class ModelRunner:
                 pass
             try:
                 # Default group
-                if self.world_size > 1 or (self.draft_async and self.is_draft):
+                if (self.world_size > 1 or (self.draft_async and self.is_draft)) and self.config.async_nccl_port is None:
                     dist.destroy_process_group()
             except Exception:
                 pass
@@ -378,16 +428,6 @@ class ModelRunner:
             self.call(method_name, *args)
             if method_name == "exit":
                 break
-
-    def recv_cmd(self):
-        t = torch.empty(1, dtype=torch.int64, device=self.device)
-        dist.recv(t, src=0, group=self.async_pg)
-        return int(t.item())
-
-    def recv_tensor(self, shape, dtype=torch.int64):
-        t = torch.empty(shape, dtype=dtype, device=self.device)
-        dist.recv(t, src=0, group=self.async_pg)
-        return t
     
     def send_draft_exit_signal(self):
         """
@@ -398,9 +438,30 @@ class ModelRunner:
             return
         try:
             cmd = torch.tensor([2], dtype=torch.int64, device=self.device)
-            dist.send(cmd, dst=self.draft_rank, group=self.async_pg)
+            send_tensor(cmd, self.async_pg, self.draft_rank, name="draft exit signal")
         except Exception:
+            if NCCL_LOG:
+                print(f"[{_ts()}] [NCCL_LOG SEND_DRAFT_EXIT_SIGNAL] ERROR SENDING DRAFT EXIT SIGNAL", flush=True)
             pass
+
+    def _wait_for_cmd(self, handle_entry=None):
+        """Waits for a command, using the provided handle if available."""
+        if handle_entry:
+            if NCCL_LOG:
+                print(f"[{_ts()}] [NCCL_LOG WAIT_FOR_CMD] WAITING FOR CMD", flush=True)
+
+            work_handle, cmd_tensor = handle_entry
+            # block until the irecv completes and the buffer is filled
+            work_handle.wait()
+        else:
+            # no pending irecv, fall back to the normal recv path
+            cmd_tensor = receive_tensor(self._cmd, self.async_pg, 0, name="cmd", prefix="DRAFT:wait_for_cmd")
+
+        command = COMMAND(cmd_tensor.item())
+        if NCCL_LOG:
+            print(f"[{_ts()}] [NCCL_LOG WAIT_FOR_CMD] CMD RECEIVED: {command}", flush=True)
+        return command, None
+
     def read_shm(self):
         assert self.world_size > 1 and self.rank
         self.event.wait()
@@ -472,7 +533,10 @@ class ModelRunner:
             usable_bytes = max(usable_bytes - reserved_bytes, 0)
             assert usable_bytes > 0, "ERROR: Not enough memory for draft KV cache after accounting for tree_cache for logits storage"
 
-        config.num_kvcache_blocks = int(usable_bytes) // block_bytes
+        if config.num_kvcache_blocks is not None and config.num_kvcache_blocks > 0:
+            config.num_kvcache_blocks = min(config.num_kvcache_blocks, int(usable_bytes) // block_bytes)
+        else:
+            config.num_kvcache_blocks = int(usable_bytes) // block_bytes
         if self.verbose:
             print(f'KV CACHE ALLOCATION for {"TARGET" if not self.is_draft else "DRAFT"} model', flush=True)
             print(f' free={free/1e9:.2f}GB, util={config.gpu_memory_utilization:.2f}', flush=True)
@@ -489,7 +553,7 @@ class ModelRunner:
             num_kv_heads,
             hf_config.head_dim, 
         )
-        
+
         print(f"allocate_kv_cache(): kv_cache shape = {self.kv_cache.shape}", flush=True)
         layer_id = 0
         for module in self.model.modules():

@@ -242,7 +242,7 @@ class Eagle3DraftForCausalLM(nn.Module):
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.use_eagle = use_eagle
-        self.eagle_layers = eagle_layers if eagle_layers is not None else []
+        self.eagle_layers = eagle_layers
         self.d_model_target = d_model_target
         self.d2t = {}  # loaded by loader.py, converted to tensor after load_model
         self.t2d = {}  # loaded by loader.py, converted to tensor after load_model
