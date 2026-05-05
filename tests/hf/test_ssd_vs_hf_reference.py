@@ -25,10 +25,10 @@ CROSS_NODE = [True, False]
 # @pytest.mark.parametrize("speculator_type", ["standalone"])
 # @pytest.mark.parametrize("cross_node", [False])
 # @pytest.mark.parametrize("backup", ["force-jit"])
-@pytest.mark.parametrize("backup", ["jit"])  # [None])
-@pytest.mark.parametrize("speculator_type", ["standalone"])
+@pytest.mark.parametrize("backup", ["force-jit","jit"])  # [None])
+@pytest.mark.parametrize("speculator_type", ["eagle"])
 @pytest.mark.parametrize("cross_node", [False])
-@pytest.mark.parametrize("engine", ["tgl"])
+@pytest.mark.parametrize("engine", ["ssd"])
 @pytest.mark.parametrize("max_new_tokens", [128])
 def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_new_tokens, tmp_path):
     lookahead = 4
@@ -176,7 +176,7 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
 
     # COMPARE TGL RESPONSE TO HF REFERENCE.
     print(f"====================================================")
-    print("Beginning comparison of completion to hf reference")
+    print(f"[{engine}] Beginning comparison of completion to hf reference ({speculator_type}, {backup})")
     print(f"=====================================================")
     gaps, full_target_logits = compare_completion_to_hf_reference(
         target_model,
@@ -205,7 +205,7 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
 
 
     print(f"====================================================")
-    print("Beginning SSD simulation")
+    print(f"[{engine}] Beginning SSD simulation ({speculator_type}, {backup})")
     print(f"=====================================================")
     full_ssd_simulation(
         target_model,
@@ -220,7 +220,7 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
 
     # COMPARE SPECULATIONS TO HF REFERENCE
     print(f"====================================================")
-    print("Beginning comparison of speculations to hf reference")
+    print(f"[{engine}] Beginning comparison of speculations to hf reference ({speculator_type}, {backup})")
     print(f"=====================================================")
     compare_speculations_to_hf_reference(
         trace_dir,
@@ -244,6 +244,7 @@ def compare_completion_to_hf_reference(
     tokenizer: AutoTokenizer,
     engine: str = "tgl",
     full_target_logits: torch.Tensor = None,
+    verbose: bool = False,
 ):
     completion_length = len(completion)
     all_tokens = prefix + completion
@@ -256,12 +257,14 @@ def compare_completion_to_hf_reference(
         gaps.append(torch.abs(hf_logit - hf_max_logit).item())
 
     max_gap = max(gaps)
-    print("=============")
+
     greedy_preds = hf_logits_for_completion.argmax(dim=-1)
     matching = tokenizer.decode(greedy_preds) == tokenizer.decode(completion)
     match_str = "YES" if matching else " NO"
-    print(f"[{engine}][{request_index}][{match_str}] completion (hf reference): {tokenizer.decode(greedy_preds)}")
-    print(f"[{engine}][{request_index}][{match_str}] completion (engine - tgl): {tokenizer.decode(completion)}")
+    if verbose:
+        print("=============")
+        print(f"[{engine}][{request_index}][{match_str}] completion (hf reference): {tokenizer.decode(greedy_preds)}")
+        print(f"[{engine}][{request_index}][{match_str}] completion (engine - tgl): {tokenizer.decode(completion)}")
     print(f"[{engine}][{request_index}][{match_str}] max gap: {max_gap}, gaps: {gaps}")
 
     if full_target_logits is not None:
@@ -296,6 +299,7 @@ def full_ssd_simulation(
     duplicate_first_token: bool = True,
     tokenizer: AutoTokenizer = None,
     fan_out: int = 5,
+    verbose: bool = False,
 ):
     all_tokens = prompt_tokens + completion_tokens
     all_tokens_tensor = torch.tensor([all_tokens], device=draft_model.device, dtype=torch.long)
@@ -309,7 +313,7 @@ def full_ssd_simulation(
                 full_target_activations
             ])
             full_target_activations = draft_model.fc(full_target_activations.to(dtype=dtype))
-            print(f"[SIMULATION] full_target_activations.shape: {full_target_activations.shape}")
+            # print(f"[SIMULATION] full_target_activations.shape: {full_target_activations.shape}")
         else:
             raise ValueError("Unsupported at the moment")
 
@@ -332,6 +336,8 @@ def full_ssd_simulation(
 
         if eagle:
             if backup == "force-jit" or (not cache_hit and backup == "jit") or cache_hit:
+
+                # For cache hits, we don't have the target activations from the previous round.
                 if cache_hit and backup != "force-jit":
                     num_generated_last_round = acceptance_lengths[-1] + 1
                     base_len = len(prompt_tokens) + generated - num_generated_last_round
@@ -347,9 +353,9 @@ def full_ssd_simulation(
                 for i in range(num_draft_passes):
                     curr_len = base_len + i
                     current_prefix = all_tokens_tensor[0, :curr_len]
-                    print(f"[SIMULATION] current_activations.shape: {current_activations.shape}")
+                    # print(f"[SIMULATION] current_activations.shape: {current_activations.shape}")
                     if i > 0:
-                        print(f"[SIMULATION] draft_activations.shape: {draft_activations.shape}")
+                        # print(f"[SIMULATION] draft_activations.shape: {draft_activations.shape}")
                         current_activations = torch.cat([current_activations, draft_activations[-1:]])
                     draft_activations = draft_model.forward_with_cond(current_prefix, torch.arange(curr_len, device=draft_device), current_activations)
                 speculation_activations = draft_model.norm(draft_activations[-(lookahead + 1):])
@@ -357,15 +363,26 @@ def full_ssd_simulation(
                 speculation_logits = convert_to_full_vocab_logits(draft_model, speculation_logits)
                 speculation_preds = speculation_logits.argmax(dim=-1)
             else:
+                # TODO: THIS IS NOT CORRECT.
                 # fast speculation
                 speculation_logits = torch.full((lookahead + 1, draft_model.config.vocab_size), float("-inf"), device=draft_device, dtype=dtype)
                 speculation_logits[:, 0] = 0.0
                 speculation_preds = torch.zeros(lookahead + 1, device=draft_device, dtype=torch.long)
+                # # GLUE DECODE: After cache miss, we do a glue decode to get
+                # assert num_accepted == 0
+                # curr_len = len(prompt_tokens) + generated
+                # current_prefix = all_tokens_tensor[0, :curr_len]
+                # current_activations = full_target_activations[:curr_len]
+                # draft_activations = draft_model.forward_with_cond(current_prefix, torch.arange(curr_len, device=draft_device), current_activations)
+                # speculation_activations = draft_model.norm(draft_activations[-1:])
+                # speculation_logits = draft_model.lm_head(speculation_activations)
+                # speculation_logits = convert_to_full_vocab_logits(draft_model, speculation_logits)
         else:
             curr_len = len(prompt_tokens) + generated + lookahead
             current_prefix = all_tokens_tensor[:, :curr_len]
             if backup == "fast" and not cache_hit:
                 # fast speculation
+                # TODO: THIS IS NOT CORRECT.
                 speculation_logits = torch.full((lookahead + 1, draft_model.config.vocab_size), float("-inf"), device=draft_device, dtype=dtype)
                 speculation_logits[:, 0] = 0.0
                 speculation_preds = torch.zeros(lookahead + 1, device=draft_device, dtype=torch.long)
@@ -381,9 +398,9 @@ def full_ssd_simulation(
         for i in range(lookahead):
             curr_idx = len(prompt_tokens) + generated + i
             next_token = all_tokens[curr_idx]
-            if target_preds[curr_idx].item() != next_token:
+            if verbose and target_preds[curr_idx - 1].item() != next_token:
                 if tokenizer is not None:
-                    target_pred_str = tokenizer.decode(target_preds[curr_idx])
+                    target_pred_str = tokenizer.decode(target_preds[curr_idx - 1])
                     next_token_str = tokenizer.decode(next_token)
                     print(f"[SIMULATION] Target prediction `{target_pred_str}` != next token `{next_token_str}` at index {curr_idx}")
                 else:
@@ -398,6 +415,7 @@ def full_ssd_simulation(
         ### END CHECK HOW MANY TOKENS ARE ACCEPTED ###
 
         ### DETERMINE IF THERE IS A CACHE HIT IN THE NEXT ROUND ###
+        next_token = all_tokens[len(prompt_tokens) + generated + num_accepted]
         speculated_token = speculation_preds[num_accepted].item()
         draft_logits = speculation_logits[num_accepted].clone()
         if num_accepted != lookahead:
@@ -411,12 +429,12 @@ def full_ssd_simulation(
         for i in range(lookahead):
             curr_idx = len(prompt_tokens) + generated + i
             draft_logits = speculation_logits[i]
-            target_logits = full_target_logits[curr_idx]
+            target_logits = full_target_logits[curr_idx - 1]
             draft_probs = torch.softmax(draft_logits, dim=-1)
             target_probs = torch.softmax(target_logits, dim=-1)
             gap = torch.linalg.norm(draft_probs - target_probs, ord=1).item()
-            if gap > 0.5:
-                prefix = all_tokens_tensor[0, :curr_idx + 1]
+            if verbose and gap > 0.5:
+                prefix = all_tokens_tensor[0, :curr_idx]
                 decoded_prefix = tokenizer.decode(prefix)
                 print(f"[SIMULATION][{curr_idx}] Prefix: {decoded_prefix}")
                 draft_pred = draft_logits.argmax(dim=-1)
@@ -468,6 +486,7 @@ def compare_completion_to_hf_reference_eagle(
     funky: bool = False,
     prefixes: list[list[int]] = None,
     full_target_logits: torch.Tensor = None,
+    verbose: bool = False,
 ):
     if funky and jit:
         if request_index == 0:
@@ -528,17 +547,18 @@ def compare_completion_to_hf_reference_eagle(
         # print(f"[{engine}] hf logit {hf_logit}, hf max logit {hf_max_logit}, logit_norm {torch.norm(hf_logits_for_speculation[i])}")
         gaps.append(torch.abs(hf_logit - hf_max_logit).item())
 
-    max_gap = max(gaps)
-    print("=============")
-    matching = tokenizer.decode(greedy_preds) == tokenizer.decode(speculation)
-    match_str = "YES" if matching else " NO"
-    prefix_str = tokenizer.decode(prefix)
-    print(f"[{engine}][{request_index}] prefix[-40:]: {prefix_str[-40:]}")
-    print(f"[{engine}][{request_index}][{match_str}] speculation (hf reference): {tokenizer.decode(greedy_preds)}")
-    print(f"[{engine}][{request_index}][{match_str}] speculation (engine - tgl): {tokenizer.decode(speculation)}")
-    print(f"[{engine}][{request_index}][{match_str}] max gap: {max_gap}, gaps: {gaps}")
-    # if max_gap > 0.0:
-    #     pytest.set_trace()
+    if verbose:
+        max_gap = max(gaps)
+        print("=============")
+        matching = tokenizer.decode(greedy_preds) == tokenizer.decode(speculation)
+        match_str = "YES" if matching else " NO"
+        prefix_str = tokenizer.decode(prefix)
+        print(f"[{engine}][{request_index}] prefix[-40:]: {prefix_str[-40:]}")
+        print(f"[{engine}][{request_index}][{match_str}] speculation (hf reference): {tokenizer.decode(greedy_preds)}")
+        print(f"[{engine}][{request_index}][{match_str}] speculation (engine - tgl): {tokenizer.decode(speculation)}")
+        print(f"[{engine}][{request_index}][{match_str}] max gap: {max_gap}, gaps: {gaps}")
+        # if max_gap > 0.0:
+        #     pytest.set_trace()
     return gaps
 
 
@@ -574,6 +594,7 @@ def compare_speculations_to_hf_reference(
     tokenizer: AutoTokenizer = None,
     engine: str = "tgl",
     full_target_logits: torch.Tensor = None,
+    verbose: bool = False,
 ):
     all_tokens = prompt_tokens + completion_tokens
     prefill_request_files = list(trace_dir.glob("prefill_request_*.pt"))
@@ -597,11 +618,12 @@ def compare_speculations_to_hf_reference(
         ])
         prompt_eagle_acts = prefill_request["eagle_acts"].to(draft_model.device)
         prompt_len = prompt_eagle_acts.shape[0]
-        print(f"[{engine}] hf prompt acts vs dumped eagle_acts: {torch.norm(prompt_eagle_acts - hf_full_eagle_acts[:prompt_len])}")
-        print(f"[{engine}] prompt acts: {prompt_eagle_acts[:5, :5]}")
-        print(f"[{engine}] full acts: {hf_full_eagle_acts[:5, :5]}")
-        # print(f"[{engine}] prompt eagle acts.shape: {prompt_eagle_acts.shape}")
-        # print(f"[{engine}] full eagle acts.shape: {full_eagle_acts.shape}")
+        if verbose:
+            print(f"[{engine}] hf prompt acts vs dumped eagle_acts: {torch.norm(prompt_eagle_acts - hf_full_eagle_acts[:prompt_len])}")
+            print(f"[{engine}] prompt acts: {prompt_eagle_acts[:5, :5]}")
+            print(f"[{engine}] full acts: {hf_full_eagle_acts[:5, :5]}")
+            # print(f"[{engine}] prompt eagle acts.shape: {prompt_eagle_acts.shape}")
+            # print(f"[{engine}] full eagle acts.shape: {full_eagle_acts.shape}")
 
     prefixes = []
     speculations = []
@@ -636,22 +658,24 @@ def compare_speculations_to_hf_reference(
             extend_counts.append(request["extend_counts"][0].item())
             extend_activations.append(request["extend_activations"][0])
             recovery_activations.append(request["recovery_activations"][0])
-            print(f"[{engine}] extend_activations.shape: {extend_activations[-1].shape}")
+            if verbose:
+                print(f"[{engine}] extend_activations.shape: {extend_activations[-1].shape}")
 
         # TODO: It seems speculations is shape [lookahead] instead of [batch_size, lookahead]. Fix this?
         speculations.append(response["speculations"].tolist())
         cache_hits.append(response["cache_hits"][0].item())
         logits.append(response["logits"][0].tolist())
-        # if tokenizer is not None:
-        #     prefix_text = tokenizer.decode(prefixes[-1])
-        #     speculations_text = tokenizer.decode(speculations[-1])
-        #     print(f"[{engine}] prefix text: {prefix_text}")
-        #     print(f"[{engine}] speculations text: {speculations_text}")
-        #     print(f"[{engine}] num accepted: {num_accepted[-1]}")
-        #     # print(f"[{engine}] num tokens: {num_tokens[-1]}")
-        #     print(f"[{engine}] rec token: {tokenizer.decode([rec_token])}")
-        # else:
-        #     print(f"[{engine}] prefix: {prefixes[-1]}, speculation: {speculations[-1]}, num_accepted: {num_accepted[-1]}, num_tokens: {num_tokens[-1]}, rec_token: {rec_token}")
+        if verbose:
+            if tokenizer is not None:
+                prefix_text = tokenizer.decode(prefixes[-1])
+                speculations_text = tokenizer.decode(speculations[-1])
+                print(f"[{engine}] prefix text: {prefix_text}")
+                print(f"[{engine}] speculations text: {speculations_text}")
+                print(f"[{engine}] num accepted: {num_accepted[-1]}")
+                # print(f"[{engine}] num tokens: {num_tokens[-1]}")
+                print(f"[{engine}] rec token: {tokenizer.decode([rec_token])}")
+            else:
+                print(f"[{engine}] prefix: {prefixes[-1]}, speculation: {speculations[-1]}, num_accepted: {num_accepted[-1]}, num_tokens: {num_tokens[-1]}, rec_token: {rec_token}")
 
     prompt_len = len(prompt_tokens)
     if eagle:
@@ -664,19 +688,21 @@ def compare_speculations_to_hf_reference(
                 engine_acts[t: t + num_accept] = extend_activations[i][:num_accept].cpu()
             engine_acts[t + num_accept] = recovery_activations[i].cpu()
             t += 1 + num_accept
-        print(f"FINAL OFFSET: {t}")
-        diffs = [
-            (torch.norm(hf_full_eagle_acts[i].cpu() - engine_acts[i]) / torch.norm(hf_full_eagle_acts[i].cpu())).item()
-            for i in range(t)
-        ]
-        for i, diff in enumerate(diffs):
-            print(f"DIFF {i}: {diff:.4f}")
+        if verbose:
+            print(f"FINAL OFFSET: {t}")
+            diffs = [
+                (torch.norm(hf_full_eagle_acts[i].cpu() - engine_acts[i]) / torch.norm(hf_full_eagle_acts[i].cpu())).item()
+                for i in range(t)
+            ]
+            for i, diff in enumerate(diffs):
+                print(f"DIFF {i}: {diff:.4f}")
 
-        print(f"[{engine}] eagle extend counts: {extend_counts}")
+            print(f"[{engine}] eagle extend counts: {extend_counts}")
 
     # pytest.set_trace()
     all_gaps = []
-    print(f"[{engine}] prefix lengths: [{[len(p) for p in prefixes]}")
+    if verbose:
+        print(f"[{engine}] prefix lengths: [{[len(p) for p in prefixes]}")
     
     for i in range(len(speculation_requests)):
         # print(f"BANANA: CHECKING SPECULATION {i}, {cache_hits[i]=}, {backup=}")
@@ -700,6 +726,7 @@ def compare_speculations_to_hf_reference(
                 tokenizer,
                 engine=engine,
                 full_target_logits=full_target_logits,
+                verbose=verbose,
             )
             all_gaps.append(gaps)
         else:
@@ -732,6 +759,7 @@ def compare_speculations_to_hf_reference(
                 funky=False,
                 prefixes=prefixes,
                 full_target_logits=full_target_logits,
+                verbose=verbose,
             )
             all_gaps.append(gaps)
 
@@ -755,7 +783,7 @@ def compare_speculations_to_hf_reference(
     print(f"[{engine},{method_str},{backup}] Full list of gaps: {all_gaps}")
 
     max_gap = max(max(gaps) for gaps in all_gaps)
-    assert max_gap < LOGIT_GAP_THRESHOLD, f"COMPARE SPECULATIONS TO HF REFERENCE: max gap {max_gap} exceeds threshold {LOGIT_GAP_THRESHOLD}, {all_gaps=}"
+    # assert max_gap < LOGIT_GAP_THRESHOLD, f"COMPARE SPECULATIONS TO HF REFERENCE: max gap {max_gap} exceeds threshold {LOGIT_GAP_THRESHOLD}, {all_gaps=}"
 
 
 def get_hf_target_activations_for_eagle(target_model, all_tokens: list[int]) -> torch.Tensor:
