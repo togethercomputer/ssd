@@ -190,13 +190,17 @@ class SpeculatorAsync(SpeculatorBase):
         return self._speculation_request
 
     def _prepare_eagle_payload(self, seqs: list[Sequence]):
+        # Layout: extend_activations[i, :n] / extend_token_ids[i, :n] hold the n extend entries;
+        # extend_activations[i, n] / extend_token_ids[i, n] hold the recovery activation/token,
+        # where n = extend_count.
         for i, seq in enumerate(seqs):
-            self._speculation_request.recovery_activations[i, :] = seq.last_target_hidden_state
-            self._speculation_request.extend_counts[i] = seq.extend_count
-            if seq.extend_count > 0 and seq.extend_eagle_acts is not None:
-                n = seq.extend_count
+            n = seq.extend_count
+            self._speculation_request.extend_counts[i] = n
+            if n > 0 and seq.extend_eagle_acts is not None:
                 self._speculation_request.extend_activations[i, :n] = seq.extend_eagle_acts[:n].to(self.draft_dtype)
                 self._speculation_request.extend_token_ids[i, :n] = seq.extend_token_ids[:n]
+            self._speculation_request.extend_activations[i, n] = seq.last_target_hidden_state.to(self.draft_dtype)
+            self._speculation_request.extend_token_ids[i, n] = seq.recovery_token_id
 
     def _make_speculation_request(self, seqs: list[Sequence], eagle: bool):
         speculation_request = self._prepare_speculation_request(seqs, eagle)

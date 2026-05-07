@@ -25,10 +25,10 @@ CROSS_NODE = [True, False]
 # @pytest.mark.parametrize("speculator_type", ["standalone"])
 # @pytest.mark.parametrize("cross_node", [False])
 # @pytest.mark.parametrize("backup", ["force-jit"])
-@pytest.mark.parametrize("backup", ["force-jit","jit"])  # [None])
+@pytest.mark.parametrize("backup", ["jit", "force-jit"])  # [None])
 @pytest.mark.parametrize("speculator_type", ["eagle"])
 @pytest.mark.parametrize("cross_node", [False])
-@pytest.mark.parametrize("engine", ["ssd"])
+@pytest.mark.parametrize("engine", ["ssd", "tgl"])
 @pytest.mark.parametrize("max_new_tokens", [128])
 def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_new_tokens, tmp_path):
     lookahead = 4
@@ -477,7 +477,6 @@ def compare_completion_to_hf_reference_eagle(
     extend_token_ids: list[torch.Tensor],
     extend_counts: list[int],
     extend_activations: list[torch.Tensor],
-    recovery_activations: list[torch.Tensor],
     prompt_eagle_acts: torch.Tensor,
     jit: bool,
     engine_acts: torch.Tensor,
@@ -577,7 +576,6 @@ def validate_request_and_response(request, response, request_num, eagle: bool = 
         assert request["extend_token_ids"].shape[0] == 1
         assert request["extend_counts"].shape[0] == 1
         assert request["extend_activations"].shape[0] == 1
-        assert request["recovery_activations"].shape[0] == 1
 
     assert response["cache_hits"].shape[0] == 1
     assert response["logits"].shape[0] == 1
@@ -636,7 +634,6 @@ def compare_speculations_to_hf_reference(
         extend_counts = []
         extend_activations = []
         extend_activations_accepted = []
-        recovery_activations = []
     # TODO: Do this per request, by having a dictionary indexed by sequence ID.
     for i in range(len(speculation_requests)):
         request = speculation_requests[i]
@@ -657,7 +654,6 @@ def compare_speculations_to_hf_reference(
             extend_token_ids.append(request["extend_token_ids"][0])
             extend_counts.append(request["extend_counts"][0].item())
             extend_activations.append(request["extend_activations"][0])
-            recovery_activations.append(request["recovery_activations"][0])
             if verbose:
                 print(f"[{engine}] extend_activations.shape: {extend_activations[-1].shape}")
 
@@ -685,8 +681,7 @@ def compare_speculations_to_hf_reference(
         for i in range(len(speculation_requests)):
             num_accept = extend_counts[i]
             if num_accept > 0:
-                engine_acts[t: t + num_accept] = extend_activations[i][:num_accept].cpu()
-            engine_acts[t + num_accept] = recovery_activations[i].cpu()
+                engine_acts[t: t + num_accept + 1] = extend_activations[i][:num_accept + 1].cpu()
             t += 1 + num_accept
         if verbose:
             print(f"FINAL OFFSET: {t}")
@@ -750,7 +745,6 @@ def compare_speculations_to_hf_reference(
                 extend_token_ids,
                 extend_counts,
                 extend_activations,
-                recovery_activations,
                 prompt_eagle_acts,
                 jit,
                 engine_acts,

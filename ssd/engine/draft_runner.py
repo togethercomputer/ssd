@@ -156,7 +156,9 @@ class DraftRunner(ModelRunner):
         out_tokens: torch.Tensor,
         temperatures: torch.Tensor,
         draft_block_tables: torch.Tensor,
-        target_recovery_activations: torch.Tensor = None,
+        extend_activations: torch.Tensor = None,
+        extend_counts: torch.Tensor = None,
+        extend_token_ids: torch.Tensor = None,
     ):
         input_ids = request_keys[:, -1]
         positions = num_tokens - 1
@@ -171,11 +173,25 @@ class DraftRunner(ModelRunner):
         spec_activations = None
 
         if self.config.use_eagle_or_phoenix:
-            assert target_recovery_activations is not None
+            assert extend_activations is not None and extend_counts is not None and extend_token_ids is not None
+
+            # Phase 1: warm up the draft KV cache with target-activation-based KV for the
+            # extend tokens (previously accepted specs from the prior round). Without this,
+            # the recovery iter's attention reads stale draft prenorms left at those slots
+            # by the previous round's glue decode.
+            if int(extend_counts.max().item()) > 0:
+                self._jit_extend_warmup(
+                    extend_activations, extend_counts, extend_token_ids,
+                    num_tokens, draft_block_tables,
+                )
+
+            # Recovery activation (target hidden at last accepted token) lives at
+            # extend_activations[i, extend_counts[i]] in the new combined layout.
+            rec_act = extend_activations[batch_indices, extend_counts.long()]
             if self.config.use_eagle:
-                hidden_states = self.model.fc(target_recovery_activations.to(self.model.fc.weight.dtype))
+                hidden_states = self.model.fc(rec_act.to(self.model.fc.weight.dtype))
             else:
-                hidden_states = target_recovery_activations
+                hidden_states = rec_act
             spec_activations = torch.empty(
                 input_ids.shape[0], self.config.speculate_k,
                 self.hidden_states_dim,
@@ -217,7 +233,62 @@ class DraftRunner(ModelRunner):
 
         return spec_activations
 
-    def hit_cache(self, request_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations=None):
+    def _jit_extend_warmup(
+        self,
+        extend_activations: torch.Tensor,
+        extend_counts: torch.Tensor,
+        extend_token_ids: torch.Tensor,
+        num_tokens: torch.Tensor,
+        draft_block_tables: torch.Tensor,
+    ):
+        """Run a varlen forward pass over the extend tokens to overwrite stale draft KV
+        with target-activation-based KV. Convention 1 (slot = token's sequence position):
+        extend tokens occupy draft slots [num_tokens-1-n_ext, num_tokens-2] per request.
+        Outputs are discarded — KV writes are the side effect.
+        """
+        B = num_tokens.shape[0]
+        K = self.config.speculate_k
+        fc_dtype = self.model.fc.weight.dtype if self.config.use_eagle else self.hf_config.torch_dtype
+
+        n_ext = extend_counts.long()  # [B]
+        cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens_q[1:] = torch.cumsum(n_ext.to(torch.int32), 0)
+        total = int(cu_seqlens_q[-1].item())
+
+        # Per-token batch index and local offset within each seq's extend run.
+        batch_idx = torch.repeat_interleave(torch.arange(B, device=self.device, dtype=torch.int64), n_ext)
+        local_off = torch.arange(total, device=self.device, dtype=torch.int64) - cu_seqlens_q[:-1].long().repeat_interleave(n_ext)
+
+        base_pos = (num_tokens - 1 - n_ext).long()  # [B]
+        positions = base_pos[batch_idx] + local_off  # [total]
+
+        block_idx = (positions // self.block_size).clamp(0, draft_block_tables.shape[1] - 1).to(torch.int64)
+        block_off = (positions % self.block_size).to(torch.int32)
+        blk_ids = draft_block_tables[batch_idx, block_idx]
+        slot_map = (blk_ids * self.block_size + block_off).to(torch.int32)
+
+        flat_token_ids = extend_token_ids[batch_idx, local_off]
+        flat_act = extend_activations[batch_idx, local_off].to(fc_dtype)
+        flat_hidden = self.model.fc(flat_act) if self.config.use_eagle else flat_act
+
+        # After writing, the last extend slot per request sits at sequence pos num_tokens - 2,
+        # so context_lens (= valid KV count) is num_tokens - 1.
+        context_lens = (num_tokens - 1).to(torch.int32)
+
+        n_ext_max = int(n_ext.max().item())
+        set_context(
+            is_prefill=False,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=n_ext_max,
+            slot_mapping=slot_map,
+            context_lens=context_lens,
+            block_tables=draft_block_tables,
+        )
+        self.run_model(flat_token_ids, positions, is_prefill=False, last_only=False, hidden_states=flat_hidden)
+        reset_context()
+
+    def hit_cache(self, request_keys, B, K, num_tokens, temperatures, draft_block_tables,
+                  extend_activations=None, extend_counts=None, extend_token_ids=None):
         """Hits the cache (tensor-backed) and returns tensors to respond to the spec request."""
         global ttl
         # Draft model now returns full target vocab size logits (after d2t expansion)
@@ -273,7 +344,9 @@ class DraftRunner(ModelRunner):
                 out_tokens,
                 temperatures,
                 draft_block_tables,
-                target_recovery_activations
+                extend_activations=extend_activations,
+                extend_counts=extend_counts,
+                extend_token_ids=extend_token_ids,
                 )  # write into out_logits, out_tokens
             if self.config.use_eagle_or_phoenix:
                 out_activations = jit_acts
@@ -339,13 +412,17 @@ class DraftRunner(ModelRunner):
         )
 
         B, K, _, _, _ = speculation_request.metadata.tolist()
-        cache_keys, num_tokens, draft_block_tables, temperatures, target_recovery_activations = (
+        cache_keys, num_tokens, draft_block_tables, temperatures = (
             speculation_request.cache_keys,
             speculation_request.num_tokens,
             speculation_request.block_tables,
             speculation_request.temps,
-            speculation_request.recovery_activations,
         )
+        # extend_activations is the concatenation [extend, recovery] per request:
+        # the recovery activation lives at extend_activations[i, extend_counts[i]].
+        extend_activations = speculation_request.extend_activations
+        extend_counts = speculation_request.extend_counts
+        extend_token_ids = speculation_request.extend_token_ids
 
         if _prof or PROFILE_DRAFT:
             torch.cuda.synchronize()
@@ -354,7 +431,11 @@ class DraftRunner(ModelRunner):
             _ev[1].record()
 
         out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache(
-            cache_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations)
+            cache_keys, B, K, num_tokens, temperatures, draft_block_tables,
+            extend_activations=extend_activations,
+            extend_counts=extend_counts,
+            extend_token_ids=extend_token_ids,
+        )
 
         if _prof or PROFILE_DRAFT:
             torch.cuda.synchronize()
@@ -442,11 +523,11 @@ class DraftRunner(ModelRunner):
             "dbt": draft_block_tables,
             "cache_hits": cache_hits,
             "returned_tokens": out_tokens,
-            "target_recovery_activations": target_recovery_activations,
             "previous_activations": out_activations,
-            "extend_counts": speculation_request.extend_counts,
-            "extend_eagle_acts": speculation_request.extend_activations,
-            "extend_token_ids": speculation_request.extend_token_ids,
+            "extend_counts": extend_counts,
+            # extend_eagle_acts has shape (B, K+1, dim); slot extend_counts[i] holds the recovery activation.
+            "extend_eagle_acts": extend_activations,
+            "extend_token_ids": extend_token_ids,
         }
         return glue_decode_input_ids, partial_tree_decode_args
 
@@ -534,13 +615,13 @@ class DraftRunner(ModelRunner):
         batch_idx = torch.repeat_interleave(torch.arange(B, device=self.device), seqlens_q)  # [total_real]
         local_off = torch.arange(total_real, device=self.device) - cu_seqlens_q[:-1].long().repeat_interleave(seqlens_q)
 
-        # Positions: extend starts at num_tokens-2-n_ext, then rec, then spec
-        # base_pos[b] = num_tokens[b] - 2 - extend_counts[b] (position of first extend token)
-        base_pos = (num_tokens - 2 - extend_counts).long()  # [B]
+        # Positions: extend starts at num_tokens - 1 - n_ext, then rec, then spec
+        # base_pos[b] = num_tokens[b] - 1 - extend_counts[b] (position of first extend token)
+        base_pos = (num_tokens - 1 - extend_counts).long()  # [B]
         positions = (base_pos[batch_idx] + local_off).to(torch.int64)
 
-        # Context lens: last token (spec K-1) at pos num_tokens-2+K, cache has 0..num_tokens-2+K
-        context_lens = (num_tokens - 1 + K).to(torch.int32)
+        # Context lens: last token (spec K-1) at pos num_tokens+K-1, cache has 0..num_tokens+K-1
+        context_lens = (num_tokens + K).to(torch.int32)
 
         # Slot mapping
         block_idx = (positions // self.block_size).clamp(0, dbt.shape[1] - 1).to(torch.int64)
@@ -619,15 +700,15 @@ class DraftRunner(ModelRunner):
             extend_counts = partial_tree_decode_args.get("extend_counts")
             if extend_counts is None:
                 extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
+            # extend_eagle_acts_batch has shape (B, K+1, dim): the recovery activation lives
+            # at extend_eagle_acts_batch[i, extend_counts[i]] (one past the original extends).
             extend_eagle_acts_batch = partial_tree_decode_args.get("extend_eagle_acts")
             extend_token_ids_batch = partial_tree_decode_args.get("extend_token_ids")
-            target_acts = partial_tree_decode_args["target_recovery_activations"]
             prev_acts = partial_tree_decode_args["previous_activations"]
             hidden_size = self.hidden_states_dim
             fc_dtype = self.model.fc.weight.dtype if self.config.use_eagle else self.hf_config.torch_dtype
 
             gd_view = glue_decode_input_ids.view(B, K + 1)
-            rec_tok_ids = gd_view[:, 0]
             spec_tok_ids = gd_view[:, 1:]
 
             # Check if all extend counts are the same (common case) for vectorized fast path
@@ -644,28 +725,16 @@ class DraftRunner(ModelRunner):
                 fid_v = fused_ids.view(B, sl)
                 fhs_v = fused_hs.view(B, sl, hidden_size)
 
-                # Extend tokens: positions 0..n_ext-1 (need fc / target acts)
-                if n_ext_0 > 0 and extend_eagle_acts_batch is not None:
-                    fid_v[:, :n_ext_0] = extend_token_ids_batch[:, :n_ext_0]
-                    ext_fc_in = extend_eagle_acts_batch[:, :n_ext_0].reshape(B * n_ext_0, -1).to(fc_dtype)
-                else:
-                    ext_fc_in = None
-
-                # Recovery token: position n_ext_0
-                fid_v[:, n_ext_0] = rec_tok_ids
-                rec_fc_in = target_acts.to(fc_dtype)
-
-                # Single batched fc call for all extend + rec tokens
-                fc_in = torch.cat([ext_fc_in, rec_fc_in], dim=0) if ext_fc_in is not None else rec_fc_in
+                # Extend + recovery tokens: positions 0..n_ext_0 (need fc / target acts).
+                # extend_eagle_acts_batch[:, :n_ext_0+1] and extend_token_ids_batch[:, :n_ext_0+1]
+                # both hold [extend_0..extend_{n-1}, recovery].
+                fid_v[:, :n_ext_0 + 1] = extend_token_ids_batch[:, :n_ext_0 + 1]
+                fc_in = extend_eagle_acts_batch[:, :n_ext_0 + 1].reshape(B * (n_ext_0 + 1), -1).to(fc_dtype)
                 if self.config.use_eagle:
                     fc_out = self.model.fc(fc_in)
                 else:
                     fc_out = fc_in  # Phoenix: no fc, use activations directly
-                if n_ext_0 > 0:
-                    fhs_v[:, :n_ext_0, :] = fc_out[:B * n_ext_0].view(B, n_ext_0, hidden_size)
-                    fhs_v[:, n_ext_0, :] = fc_out[B * n_ext_0:]
-                else:
-                    fhs_v[:, 0, :] = fc_out
+                fhs_v[:, :n_ext_0 + 1, :] = fc_out.view(B, n_ext_0 + 1, hidden_size)
 
                 # Spec tokens: positions n_ext_0+1..sl-1 (no fc needed)
                 fid_v[:, n_ext_0 + 1:] = spec_tok_ids
@@ -679,9 +748,9 @@ class DraftRunner(ModelRunner):
                 tok_idx = torch.arange(total_real, device=self.device, dtype=torch.int64)
                 batch_idx_fast = tok_idx // sl
                 local_off_fast = tok_idx % sl
-                base_pos = (partial_tree_decode_args["num_tokens"] - 2 - n_ext_0).long()
+                base_pos = (partial_tree_decode_args["num_tokens"] - 1 - n_ext_0).long()
                 positions = base_pos[batch_idx_fast] + local_off_fast
-                context_lens = (partial_tree_decode_args["num_tokens"] - 1 + K).to(torch.int32)
+                context_lens = (partial_tree_decode_args["num_tokens"] + K).to(torch.int32)
                 block_idx = (positions // self.block_size).clamp(0, dbt.shape[1] - 1).to(torch.int64)
                 block_off = (positions % self.block_size).to(torch.int32)
                 blk_ids = dbt[batch_idx_fast, block_idx]
@@ -712,29 +781,20 @@ class DraftRunner(ModelRunner):
                 n_ext = extend_counts.long()
                 n_ext_per_tok = n_ext[batch_idx]
 
-                is_extend = local_off < n_ext_per_tok
-                is_rec = local_off == n_ext_per_tok
-                is_spec = local_off > n_ext_per_tok
+                # is_extend now covers both the original extend slots AND the recovery slot
+                # (recovery sits at local_off == n_ext_per_tok within the new combined buffers).
+                is_extend = local_off <= n_ext_per_tok
+                is_spec = ~is_extend
 
-                is_target_conditioned = is_extend | is_rec
-                tc_b = batch_idx[is_target_conditioned]
-                tc_local = local_off[is_target_conditioned]
-                tc_n_ext = n_ext_per_tok[is_target_conditioned]
-
-                tc_is_ext = tc_local < tc_n_ext
-                tc_acts = torch.empty(tc_b.size(0), target_acts.size(1), dtype=fc_dtype, device=self.device)
-                if tc_is_ext.any() and extend_eagle_acts_batch is not None:
-                    ext_b = tc_b[tc_is_ext]
-                    ext_j = tc_local[tc_is_ext]
-                    tc_acts[tc_is_ext] = extend_eagle_acts_batch[ext_b, ext_j].to(fc_dtype)
-                    fused_ids[is_extend] = extend_token_ids_batch[ext_b, ext_j]
-                tc_acts[~tc_is_ext] = target_acts[tc_b[~tc_is_ext]].to(fc_dtype)
-                fused_ids[is_rec] = rec_tok_ids[batch_idx[is_rec]]
+                ext_b = batch_idx[is_extend]
+                ext_local = local_off[is_extend]
+                tc_acts = extend_eagle_acts_batch[ext_b, ext_local].to(fc_dtype)
+                fused_ids[is_extend] = extend_token_ids_batch[ext_b, ext_local]
 
                 if self.config.use_eagle:
-                    fused_hs[is_target_conditioned] = self.model.fc(tc_acts)
+                    fused_hs[is_extend] = self.model.fc(tc_acts)
                 elif self.config.use_phoenix:
-                    fused_hs[is_target_conditioned] = tc_acts
+                    fused_hs[is_extend] = tc_acts
 
                 spec_j = local_off[is_spec] - n_ext_per_tok[is_spec] - 1
                 fused_ids[is_spec] = spec_tok_ids[batch_idx[is_spec], spec_j]
@@ -856,8 +916,10 @@ class DraftRunner(ModelRunner):
                 tree_hidden_states = torch.repeat_interleave(prenorms_flat, reps_flat, dim=0)
             else:
                 assert self.config.use_phoenix
-                # Phoenix conditions on target activations, not prenorms
-                target_acts_expanded = target_acts.unsqueeze(1).expand(B, K + 1, -1)  # [B, K+1, target_dim]
+                # Phoenix conditions on target activations (recovery slot), not prenorms.
+                # The recovery activation per request is at extend_eagle_acts_batch[i, extend_counts[i]].
+                rec_acts = extend_eagle_acts_batch[torch.arange(B, device=self.device), extend_counts.long()]  # [B, target_dim]
+                target_acts_expanded = rec_acts.unsqueeze(1).expand(B, K + 1, -1)  # [B, K+1, target_dim]
                 acts_flat = target_acts_expanded.reshape(B * (K + 1), -1)  # [B*(K+1), target_dim]
                 tree_hidden_states = torch.repeat_interleave(acts_flat, reps_flat, dim=0)
 
@@ -904,6 +966,16 @@ class DraftRunner(ModelRunner):
                 f"get_forked_recovery_tokens={_bev[5].elapsed_time(_bev[6]):.2f}ms, total={_bev[0].elapsed_time(_bev[6]):.2f}ms",
                 flush=True,
             )
+        # Phoenix tree decode reuses the recovery activation per request.
+        # In the new layout it lives at extend_eagle_acts_batch[i, extend_counts[i]].
+        if self.config.use_phoenix:
+            ext_acts_p = partial_tree_decode_args["extend_eagle_acts"]
+            ext_counts_p = partial_tree_decode_args["extend_counts"]
+            target_recovery_activations = ext_acts_p[
+                torch.arange(ext_acts_p.shape[0], device=self.device), ext_counts_p.long()
+            ]
+        else:
+            target_recovery_activations = None
         tree_decode_args = {
             "metadata_ints": _pre_metadata_ints,
             "input_ids": forked_rec_tokens,
@@ -915,7 +987,7 @@ class DraftRunner(ModelRunner):
             "seq_ids_expanded": _pre_seq_ids_expanded,
             "cache_hits": cache_hits,
             "cache_hits_list": cache_hits_list,
-            "target_recovery_activations": partial_tree_decode_args["target_recovery_activations"],
+            "target_recovery_activations": target_recovery_activations,
         }
         tree_decode_args["hidden_states"] = tree_hidden_states
         return tree_decode_args

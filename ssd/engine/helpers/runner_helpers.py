@@ -190,7 +190,10 @@ class SpeculationRequest:
     num_tokens: torch.Tensor
     block_tables: torch.Tensor
     temps: torch.Tensor  # .view(torch.int32).to(torch.int64)
-    recovery_activations: torch.Tensor | None
+    # extend_activations holds the concatenation of the per-request extend activations
+    # followed by the recovery activation (the target activation for the last accepted
+    # token, just before the recovery token). For request i, the recovery activation
+    # lives at extend_activations[i, extend_counts[i]] (extend_counts excludes recovery).
     extend_activations: torch.Tensor | None
     extend_counts: torch.Tensor | None
     extend_token_ids: torch.Tensor | None
@@ -208,7 +211,7 @@ class SpeculationRequest:
         eagle_act_dim: int = 0,
         tokenizer: AutoTokenizer = None,
     ):
-        speculation_request = cls(*([None] * 10))
+        speculation_request = cls(*([None] * 9))
         speculation_request.batch_size = batch_size
         speculation_request.lookahead = lookahead
         speculation_request.max_blocks = max_blocks
@@ -233,12 +236,11 @@ class SpeculationRequest:
         else:
             self.block_tables = None
         if self.eagle:
-            self.recovery_activations = torch.empty(B, self.eagle_act_dim, dtype=self.draft_dtype, device=self.device)
-            self.extend_activations = torch.empty(B, K, self.eagle_act_dim, dtype=self.draft_dtype, device=self.device)
+            # K extend slots + 1 recovery slot (recovery sits at index extend_counts[i]).
+            self.extend_activations = torch.empty(B, K + 1, self.eagle_act_dim, dtype=self.draft_dtype, device=self.device)
             self.extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
-            self.extend_token_ids = torch.empty(B, K, dtype=torch.int64, device=self.device)
+            self.extend_token_ids = torch.empty(B, K + 1, dtype=torch.int64, device=self.device)
         else:
-            self.recovery_activations = None
             self.extend_activations = None
             self.extend_counts = None
             self.extend_token_ids = None
@@ -262,7 +264,6 @@ class SpeculationRequest:
         ]
         if self.eagle:
             int64_parts.extend([
-                self.recovery_activations.contiguous().reshape(-1).view(torch.int64),
                 self.extend_counts.reshape(-1),
                 self.extend_activations.contiguous().reshape(-1).view(torch.int64),
                 self.extend_token_ids.reshape(-1),
@@ -303,10 +304,9 @@ class SpeculationRequest:
         _dsz = torch.finfo(draft_dtype).bits // 8 if eagle else 0  # draft dtype element size
         fused_total = (3 * B) + B + (B * max_blocks) + B  # cache_keys + num_tokens + block_tables + temps
         if eagle:
-            fused_total += B * eagle_act_dim * _dsz // 8  # recovery_activations as int64
-            fused_total += B                                # extend_counts
-            fused_total += B * K * eagle_act_dim * _dsz // 8  # extend_activations as int64
-            fused_total += B * K                            # extend_token_ids
+            fused_total += B                                          # extend_counts
+            fused_total += B * (K + 1) * eagle_act_dim * _dsz // 8    # extend_activations (K extends + recovery)
+            fused_total += B * (K + 1)                                # extend_token_ids (K extends + recovery)
         fused_req = torch.empty(fused_total, dtype=torch.int64, device=device)
         fused_req = receive_tensor(fused_req, async_pg, target_rank, name="fused payload", prefix="DRAFT:SpeculationRequest.receive")
         off = 0
@@ -320,16 +320,13 @@ class SpeculationRequest:
         off += B
         speculation_request.temps = temps_as_int64.to(torch.int32).view(torch.float32)
         if eagle:
-            n_rec = B * eagle_act_dim * _dsz // 8
-            speculation_request.recovery_activations = fused_req[off:off + n_rec].view(draft_dtype).view(B, eagle_act_dim)
-            off += n_rec
             speculation_request.extend_counts = fused_req[off:off + B]
             off += B
-            n_ext = B * K * eagle_act_dim * _dsz // 8
-            speculation_request.extend_activations = fused_req[off:off + n_ext].view(draft_dtype).view(B, K, eagle_act_dim)
+            n_ext = B * (K + 1) * eagle_act_dim * _dsz // 8
+            speculation_request.extend_activations = fused_req[off:off + n_ext].view(draft_dtype).view(B, K + 1, eagle_act_dim)
             off += n_ext
-            speculation_request.extend_token_ids = fused_req[off:off + B * K].view(B, K)
-            off += B * K
+            speculation_request.extend_token_ids = fused_req[off:off + B * (K + 1)].view(B, K + 1)
+            off += B * (K + 1)
         assert off == fused_total
 
         cache_keys, draft_block_tables, temperatures, num_tokens = (
@@ -354,13 +351,11 @@ class SpeculationRequest:
             print(f"[{_ts()}] {sep}\n", flush=True)
 
         if eagle and verbose:
-            target_recovery_activations = speculation_request.recovery_activations
             extend_counts = speculation_request.extend_counts
             extend_eagle_acts = speculation_request.extend_activations
             extend_token_ids = speculation_request.extend_token_ids
-            print(f"[{_ts()}] [CACHE REQUEST] target_recovery_activations.shape={target_recovery_activations.shape}", flush=True)
             print(f"[{_ts()}] [CACHE REQUEST] extend_counts.shape={extend_counts.shape}, {extend_counts.tolist()}", flush=True)
-            print(f"[{_ts()}] [CACHE REQUEST] extend_eagle_acts.shape={extend_eagle_acts.shape}", flush=True)
+            print(f"[{_ts()}] [CACHE REQUEST] extend_eagle_acts.shape={extend_eagle_acts.shape} (last slot per request is recovery activation)", flush=True)
             print(f"[{_ts()}] [CACHE REQUEST] extend_token_ids.shape={extend_token_ids.shape}, {extend_token_ids.tolist()}", flush=True)
             recovery_tokens_target = cache_keys[:, 2].clone()
             print(f"[{_ts()}] \n{'='*80}", flush=True)
@@ -382,7 +377,6 @@ class SpeculationRequest:
             num_tokens = speculation_request.num_tokens
             # block_tables = speculation_request.block_tables
             # temps = speculation_request.temps
-            recovery_activations = speculation_request.recovery_activations
             extend_activations = speculation_request.extend_activations
             extend_counts = speculation_request.extend_counts
             extend_token_ids = speculation_request.extend_token_ids
@@ -393,7 +387,6 @@ class SpeculationRequest:
                 # print(f"[{_ts()}]      req[{i}]: seq_id={seq_id}, accept_len={accept_len}, verified_id={int(verified_id)} ({verified_text})", flush=True)
                 print(f"[{_ts()}]      req[{i}]: ACCEPT_LENGTH={accept_len}, VERIFIED_TEXT={verified_text}", flush=True)
                 if eagle:
-                    print(f"[{_ts()}]      req[{i}]: recovery_activations shape={recovery_activations.shape}, values[i, :3]={list_to_str(recovery_activations[i, :3].tolist())}", flush=True)
                     print(f"[{_ts()}]      req[{i}]: extend_activations shape={extend_activations.shape}, values[i, :, :3]={list_to_str(extend_activations[i, :, :3].tolist())}", flush=True)
                     num_extend = extend_counts[i].item()
                     print(f"[{_ts()}]      req[{i}]: extend_counts shape={extend_counts.shape}, values[i]={num_extend}", flush=True)
@@ -412,7 +405,6 @@ class SpeculationRequest:
                 'num_tokens': self.num_tokens.cpu(),
                 'block_tables': self.block_tables.cpu() if self.block_tables is not None else None,
                 'temps': self.temps.cpu(),
-                'recovery_activations': self.recovery_activations.cpu() if self.recovery_activations is not None else None,
                 'extend_activations': self.extend_activations.cpu() if self.extend_activations is not None else None,
                 'extend_counts': self.extend_counts.cpu() if self.extend_counts is not None else None,
                 'extend_token_ids': self.extend_token_ids.cpu() if self.extend_token_ids is not None else None,
