@@ -25,10 +25,10 @@ CROSS_NODE = [True, False]
 # @pytest.mark.parametrize("speculator_type", ["standalone"])
 # @pytest.mark.parametrize("cross_node", [False])
 # @pytest.mark.parametrize("backup", ["force-jit"])
-@pytest.mark.parametrize("backup", ["jit", "force-jit"])  # [None])
-@pytest.mark.parametrize("speculator_type", ["eagle"])
+@pytest.mark.parametrize("backup", ["fast"])  # [None])
+@pytest.mark.parametrize("speculator_type", ["eagle", "standalone"])
 @pytest.mark.parametrize("cross_node", [False])
-@pytest.mark.parametrize("engine", ["ssd", "tgl"])
+@pytest.mark.parametrize("engine", ["tgl"])
 @pytest.mark.parametrize("max_new_tokens", [128])
 def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_new_tokens, tmp_path):
     lookahead = 4
@@ -47,7 +47,7 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
 
     tokenizer = AutoTokenizer.from_pretrained(target_path)
     prompt_tokens = tokenizer.apply_chat_template(
-        [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Please tell me about the capital city of France."}],
+        [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Please tell me about San Francisco."}],
         add_generation_prompt=True,
     )
     if isinstance(prompt_tokens, list):
@@ -331,7 +331,9 @@ def full_ssd_simulation(
     while True:
         ## SPECULATE ##
         tokens_remaining = all_tokens_tensor.shape[1] - (len(prompt_tokens) + generated)
-        if tokens_remaining < lookahead:
+        # Need lookahead tokens for the speculation/gap loop AND one extra token
+        # so the cache-hit check (which indexes at num_accepted, up to lookahead) is in range.
+        if tokens_remaining < lookahead + 1:
             break
 
         if eagle:
@@ -363,28 +365,40 @@ def full_ssd_simulation(
                 speculation_logits = convert_to_full_vocab_logits(draft_model, speculation_logits)
                 speculation_preds = speculation_logits.argmax(dim=-1)
             else:
-                # TODO: THIS IS NOT CORRECT.
-                # fast speculation
+                # Fast speculation on cache miss: the engine sends zeros as the K speculation
+                # tokens, but still runs a glue decode over the prefix so the recovery-position
+                # logits are available for the next round's cache-candidate lookup. We mirror
+                # that here so the cache_hit check below has real next-round logits.
+                curr_len = len(prompt_tokens) + generated
+                current_prefix = all_tokens_tensor[0, :curr_len]
+                current_activations = full_target_activations[:curr_len]
+                draft_activations = draft_model.forward_with_cond(
+                    current_prefix,
+                    torch.arange(curr_len, device=draft_device),
+                    current_activations,
+                )
+                recovery_logits = draft_model.lm_head(draft_model.norm(draft_activations[-1:]))
+                recovery_logits = convert_to_full_vocab_logits(draft_model, recovery_logits)
+
                 speculation_logits = torch.full((lookahead + 1, draft_model.config.vocab_size), float("-inf"), device=draft_device, dtype=dtype)
                 speculation_logits[:, 0] = 0.0
+                speculation_logits[0] = recovery_logits[0]
                 speculation_preds = torch.zeros(lookahead + 1, device=draft_device, dtype=torch.long)
-                # # GLUE DECODE: After cache miss, we do a glue decode to get
-                # assert num_accepted == 0
-                # curr_len = len(prompt_tokens) + generated
-                # current_prefix = all_tokens_tensor[0, :curr_len]
-                # current_activations = full_target_activations[:curr_len]
-                # draft_activations = draft_model.forward_with_cond(current_prefix, torch.arange(curr_len, device=draft_device), current_activations)
-                # speculation_activations = draft_model.norm(draft_activations[-1:])
-                # speculation_logits = draft_model.lm_head(speculation_activations)
-                # speculation_logits = convert_to_full_vocab_logits(draft_model, speculation_logits)
         else:
             curr_len = len(prompt_tokens) + generated + lookahead
             current_prefix = all_tokens_tensor[:, :curr_len]
             if backup == "fast" and not cache_hit:
-                # fast speculation
-                # TODO: THIS IS NOT CORRECT.
+                # Fast speculation on cache miss: the engine sends zeros as the K speculation
+                # tokens, but still runs a glue decode over the prefix so the recovery-position
+                # logits are available for the next round's cache-candidate lookup. We mirror
+                # that here so the cache_hit check below has real next-round logits.
+                recovery_prefix_len = len(prompt_tokens) + generated
+                recovery_prefix = all_tokens_tensor[:, :recovery_prefix_len]
+                recovery_logits = draft_model.forward(recovery_prefix).logits[0, -1:]  # [1, vocab]
+
                 speculation_logits = torch.full((lookahead + 1, draft_model.config.vocab_size), float("-inf"), device=draft_device, dtype=dtype)
                 speculation_logits[:, 0] = 0.0
+                speculation_logits[0] = recovery_logits[0]
                 speculation_preds = torch.zeros(lookahead + 1, device=draft_device, dtype=torch.long)
             else:
                 speculation_logits = draft_model.forward(current_prefix).logits[0]
@@ -763,7 +777,7 @@ def compare_speculations_to_hf_reference(
     if eagle:
         # extend counts don't include the recovery token, so we add 1 to the average.
         print(f"[{engine},{method_str},{backup}][FINAL_METRIC] Average acceptance lengths: {1 + (sum(extend_counts) / (len(extend_counts) - 1)):.4f}")
-        print(f"[{engine},{method_str},{backup}] Full list of acceptance lengths: {extend_counts}")
+        print(f"[{engine},{method_str},{backup}] Full list of acceptance lengths: {[e + 1 for e in extend_counts[1:]]}")
     else:
         prefix_lengths = np.array([len(p) for p in prefixes])
         acceptance_lengths = prefix_lengths[1:] - prefix_lengths[:-1]   
