@@ -395,6 +395,7 @@ class DraftRunner(ModelRunner):
     def _service_spec_request(self):
         """Receives a speculation request, serves it from cache, and sends results back in a single response."""
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
+        DEBUG = os.environ.get("SSD_DEBUG", "0") == "1"
         if _prof or PROFILE_DRAFT:
             torch.cuda.synchronize()
             _d0 = time.perf_counter()
@@ -423,6 +424,44 @@ class DraftRunner(ModelRunner):
         extend_activations = speculation_request.extend_activations
         extend_counts = speculation_request.extend_counts
         extend_token_ids = speculation_request.extend_token_ids
+
+        if DEBUG:
+            # Sanity-check the received payload: a corrupted/torn NCCL receive will surface
+            # downstream as a `torch.empty(<huge negative>)` failure inside `_build_tree_batch`.
+            # Catch it here, while we still know the bad tensor is fresh off the wire.
+            vocab_size = int(speculation_request.metadata[4].item())
+            assert num_tokens.dtype == torch.int64, f"num_tokens dtype={num_tokens.dtype}, expected int64"
+            assert num_tokens.shape == (B,), f"num_tokens shape={tuple(num_tokens.shape)}, expected ({B},)"
+            nt_min = int(num_tokens.min().item())
+            nt_max = int(num_tokens.max().item())
+            assert nt_min > 0, f"num_tokens has non-positive value: min={nt_min}, num_tokens={num_tokens.tolist()}"
+            assert nt_max < (1 << 31), f"num_tokens implausibly large: max={nt_max}, num_tokens={num_tokens.tolist()}"
+            if extend_counts is not None:
+                assert extend_counts.dtype == torch.int64, f"extend_counts dtype={extend_counts.dtype}, expected int64"
+                assert extend_counts.shape == (B,), f"extend_counts shape={tuple(extend_counts.shape)}, expected ({B},)"
+                ec_min = int(extend_counts.min().item())
+                ec_max = int(extend_counts.max().item())
+                assert ec_min >= 0 and ec_max <= K, (
+                    f"extend_counts out of range [0,{K}]: min={ec_min}, max={ec_max}, "
+                    f"extend_counts={extend_counts.tolist()}"
+                )
+            if extend_token_ids is not None:
+                assert extend_token_ids.dtype == torch.int64, f"extend_token_ids dtype={extend_token_ids.dtype}, expected int64"
+                assert extend_token_ids.shape == (B, K + 1), (
+                    f"extend_token_ids shape={tuple(extend_token_ids.shape)}, expected ({B},{K+1})"
+                )
+                # Only the valid prefix [0 .. extend_counts[i]] per row carries meaningful token ids;
+                # the rest is uninitialized scratch. Check just the valid prefix.
+                if extend_counts is not None and ec_max >= 0:
+                    col_idx = torch.arange(K + 1, device=extend_token_ids.device)
+                    valid_mask = col_idx[None, :] <= extend_counts[:, None]
+                    valid_ids = extend_token_ids[valid_mask]
+                    if valid_ids.numel() > 0:
+                        tid_min = int(valid_ids.min().item())
+                        tid_max = int(valid_ids.max().item())
+                        assert 0 <= tid_min and tid_max < vocab_size, (
+                            f"extend_token_ids out of [0,{vocab_size}): min={tid_min}, max={tid_max}"
+                        )
 
         if _prof or PROFILE_DRAFT:
             torch.cuda.synchronize()

@@ -25,7 +25,7 @@ CROSS_NODE = [True, False]
 # @pytest.mark.parametrize("speculator_type", ["standalone"])
 # @pytest.mark.parametrize("cross_node", [False])
 # @pytest.mark.parametrize("backup", ["force-jit"])
-@pytest.mark.parametrize("backup", ["fast"])  # [None])
+@pytest.mark.parametrize("backup", ["fast", "jit", "force-jit"])
 @pytest.mark.parametrize("speculator_type", ["eagle", "standalone"])
 @pytest.mark.parametrize("cross_node", [False])
 @pytest.mark.parametrize("engine", ["tgl"])
