@@ -24,8 +24,7 @@ dependencies = [
     "wandb==0.22.0",
     "hf_transfer",
     "tiktoken",
-    # Install from source for now, for latest support on Hopper
-    "flash-attn-4 @ git+https://github.com/Dao-AILab/flash-attention.git@5301a359f59ef8fa10f211618d9f7a69716a8898#subdirectory=flash_attn/cute",
+    "flash-attn-4>=4.0.0b9",
 ]
 
 [project.urls]
