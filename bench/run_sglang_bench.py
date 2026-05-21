@@ -79,10 +79,8 @@ def main():
         env["ACCEPTANCE_RATE_LOG"] = args.acceptance_rate_log
         print(f"ACCEPTANCE_RATE_LOG={args.acceptance_rate_log}")
     if args.profile:
-        # env["SSD_PROFILE"] = "1"
-        # print("SSD_PROFILE=1")
-        env["SSD_PROFILE_EVENTS"] = "1"
-        print("SSD_PROFILE_EVENTS=1")
+        env["SSD_PROFILE"] = "1"
+        print("SSD_PROFILE=1")
 
     proc = subprocess.Popen(server_cmd, preexec_fn=os.setsid, env=env)
     try:

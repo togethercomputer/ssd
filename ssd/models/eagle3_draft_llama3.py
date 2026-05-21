@@ -9,6 +9,7 @@ from ssd.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, Row
 from ssd.layers.rotary_embedding import get_rope
 from ssd.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from ssd.models.llama3 import LlamaAttention, LlamaMLP
+from ssd.utils import profile
 
 
 class Eagle3Attention(nn.Module):
@@ -250,6 +251,8 @@ class Eagle3DraftForCausalLM(nn.Module):
         self.t2d = {}  # loaded by loader.py, converted to tensor after load_model
         self.d2t_tensor = None  # will be set after load_model
         self.t2d_tensor = None  # will be set after load_model
+        self.draft_vocab_size = config.draft_vocab_size if hasattr(config, 'draft_vocab_size') else config.vocab_size
+        self.vocab_trim = self.draft_vocab_size != self.config.vocab_size
         self.debug_mode = debug_mode
         self._debug_saved = False  # Track if we've already saved debug data
         assert not (tp_group is None and self.tp_size > 1), "ERROR in LlamaForCausalLM: tp_group is None and tp_size > 1"
@@ -259,7 +262,7 @@ class Eagle3DraftForCausalLM(nn.Module):
         self.final_norm = RMSDNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.model = Eagle3DraftModel(config, draft, speculate, spec_k, async_fan_out, draft_async, use_eagle=use_eagle, eagle_layers=eagle_layers, tp_group=tp_group, tp_size=self.tp_size)
         self.lm_head = ParallelLMHead(
-            config.draft_vocab_size,  # LM head size (subset of tokens draft can propose)
+            self.draft_vocab_size,  # LM head size (subset of tokens draft can propose)
             config.hidden_size,
             draft_async=draft_async,
             tp_group=tp_group,
@@ -275,19 +278,39 @@ class Eagle3DraftForCausalLM(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # Events fire only on eager paths (prefill / enforce_eager). On CG paths
+        # this body is captured into the graph — replay timing is collected at
+        # the cudagraph_helpers level instead.
+        ev = profile.new_events(3)
+        if ev: ev[0].record()
+
         # Only project if this is target hidden states (3 * d_model_target dimension)
         if hidden_states.shape[-1] == 3 * self.d_model_target:
             # This is the first prefill with target activations
             if self.debug_mode and not self._debug_saved and input_ids.shape[0] != 2048:
                 self._save_debug_inputs(input_ids, positions, hidden_states)
                 self._debug_saved = True
-            
+
             hidden_states_projected = self.fc(hidden_states.to(self.fc.weight.dtype))  # [num_tokens, d_model_draft]
+            had_fc = True
         else:
-            hidden_states_projected = hidden_states # draft self-conditioning output, already d_model_draft from prenorm 
-        
+            hidden_states_projected = hidden_states # draft self-conditioning output, already d_model_draft from prenorm
+            had_fc = False
+
+        if ev: ev[1].record()
+
         # Forward through draft model with conditioning
         prenorm = self.model(input_ids, hidden_states_projected, positions)
+
+        if ev: ev[2].record()
+
+        profile.emit(
+            "Eagle3DraftForCausalLM.forward",
+            ["fc", "decoder_layer"],
+            ev,
+            n_tokens=input_ids.shape[0],
+            had_fc=had_fc,
+        )
         return prenorm
     
     def _save_debug_inputs(self, input_ids: torch.Tensor, positions: torch.Tensor, target_hidden_states: torch.Tensor):
@@ -316,39 +339,43 @@ class Eagle3DraftForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        last_only: bool = True, 
+        last_only: bool = True,
     ) -> torch.Tensor:
+        # compute_logits is always called outside the CUDA graph (after replay
+        # in cudagraph_helpers), so timing always works.
+        n_in = hidden_states.shape[0]
+        ev = profile.new_events(4 if self.vocab_trim else 3)
+        if ev: ev[0].record()
+
         hidden_states = self.final_norm(hidden_states)
+        if ev: ev[1].record()
+
         logits = self.lm_head(hidden_states, last_only=last_only)  # [B, draft_vocab_size]
 
         if logits.dim() == 3:
             logits = logits.view(-1, logits.shape[-1])
-        
-        # Expand draft vocab logits to full target vocab using d2t mapping
-        # Draft LM head has draft_vocab_size rows, map them to target vocab positions
-        assert self.d2t_tensor is not None, "d2t_tensor must be loaded before inference"
-        assert hasattr(self.config, 'vocab_size'), "config must have vocab_size (target vocab)"
-        assert hasattr(self.config, 'draft_vocab_size'), "config must have draft_vocab_size"
-        
+
+        if ev: ev[2].record()
+
         B = logits.shape[0]
-        vocab_size = self.config.vocab_size  # Target vocab size from config
-        
-        # Map draft indices to target vocab positions: target_idx = draft_idx + d2t_tensor[draft_idx]
-        base = torch.arange(self.config.draft_vocab_size, device=logits.device)
-        target_indices = base + self.d2t_tensor  # [draft_vocab_size]
-        # target_indices = self.d2t_tensor  # [draft_vocab_size]
-        # Debug logging once per run
-        if not hasattr(self, '_vocab_debug_printed'):
-            print(
-                f'[compute_logits DEBUG] draft_vocab_size={self.config.draft_vocab_size}, target_vocab_size={vocab_size}', flush=True)
-            print(
-                f'[compute_logits DEBUG] d2t_tensor[:10]={target_indices[:10].tolist()}', flush=True)
-            print(
-                f'[compute_logits DEBUG] d2t_tensor[-10:]={target_indices[-10:].tolist()}', flush=True)
-            self._vocab_debug_printed = True
-        
-        # Scatter draft logits into full vocab space, -inf elsewhere
-        logits_full = logits.new_full((B, vocab_size), float('-inf'))
-        logits_full[:, target_indices] = logits
-        
-        return logits_full
+        if self.vocab_trim:
+            # Expand draft vocab logits to full target vocab using d2t mapping.
+            # Map draft indices to target vocab positions: target_idx = draft_idx + d2t_tensor[draft_idx]
+            assert self.d2t_tensor is not None, "d2t_tensor must be loaded before inference"
+            assert self.t2d_tensor is not None, "t2d_tensor must be loaded before inference"
+            base = torch.arange(self.draft_vocab_size, device=logits.device)
+            target_indices = base + self.d2t_tensor  # [draft_vocab_size]
+            logits_full = logits.new_full((B, self.config.vocab_size), float('-inf'))
+            logits_full[:, target_indices] = logits
+            logits = logits_full
+
+            if ev: ev[3].record()
+
+        profile.emit(
+            "Eagle3DraftForCausalLM.compute_logits",
+            ["final_norm", "lm_head"] + (["d2t_scatter"] if self.vocab_trim else []),
+            ev,
+            n_tokens=n_in,
+            last_only=last_only,
+        )
+        return logits

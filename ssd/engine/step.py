@@ -1,14 +1,13 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-import os
 import torch
-from time import perf_counter
 from transformers import AutoTokenizer
 
 from ssd.engine.model_runner import ModelRunner
 from ssd.engine.sequence import Sequence
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.helpers.speculate_types import SpeculatorBase, VerifierBase, VerifyResult
+from ssd.utils import profile
 from ssd.utils.misc import decode_tokens
 
 
@@ -101,14 +100,8 @@ class SpecDecodeStep(InferenceStep):
         return sum(len(seq) for seq in seqs)
 
     def decode(self, seqs: list[Sequence], step_num: int = 0) -> int:
-        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
-        _prof_ev = os.environ.get("SSD_PROFILE_EVENTS", "0") == "1"
-        if _prof:
-            torch.cuda.synchronize()
-            _t0 = perf_counter()
-        if _prof_ev:
-            _ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
-            _ev[0].record()
+        ev = profile.new_events(4)
+        if ev: ev[0].record()
 
         # Save lightweight state instead of expensive clone_spec deep copy.
         # speculate() modifies: token_ids (append+extend), num_tokens, last_token, num_draft_cached_tokens
@@ -124,12 +117,7 @@ class SpecDecodeStep(InferenceStep):
         )
         #### STEP 1: SPECULATE ####
         speculate_result = self.speculator.speculate(seqs, in_verify_result)
-
-        if _prof:
-            torch.cuda.synchronize()
-            _t1 = perf_counter()
-        if _prof_ev:
-            _ev[1].record()
+        if ev: ev[1].record()
 
         if self.verbose:
             speculations = speculate_result.speculations
@@ -142,12 +130,7 @@ class SpecDecodeStep(InferenceStep):
 
         #### STEP 2: VERIFY ####
         out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
-
-        if _prof:
-            torch.cuda.synchronize()
-            _t2 = perf_counter()
-        if _prof_ev:
-            _ev[2].record()
+        if ev: ev[2].record()
 
         if self.verbose:
             recovery_tokens = out_verify_result.recovery_tokens
@@ -172,19 +155,20 @@ class SpecDecodeStep(InferenceStep):
             eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
         )
 
-        if _prof:
-            torch.cuda.synchronize()
-            _t3 = perf_counter()
-            cache_hits = speculate_result.cache_hits
-            hits_str = f"hits={cache_hits.sum().item()}/{len(cache_hits)}" if cache_hits is not None else ""
-            toks = sum(len(s) for s in out_verify_result.new_suffixes)
-            print(f"[PROFILE target] handshake={(_t1-_t0)*1000:.2f}ms verify={(_t2-_t1)*1000:.2f}ms postprocess={(_t3-_t2)*1000:.2f}ms total={(_t3-_t0)*1000:.2f}ms {hits_str} toks={toks}", flush=True)
-        if _prof_ev:
-            _ev[3].record()
-            _ev[3].synchronize()
-            cache_hits = speculate_result.cache_hits
-            hits_str = f"hits={cache_hits.sum().item()}/{len(cache_hits)}" if cache_hits is not None else ""
-            toks = sum(len(s) for s in out_verify_result.new_suffixes)
-            print(f"[PROFILE_EVENTS target] handshake={_ev[0].elapsed_time(_ev[1]):.2f}ms verify={_ev[1].elapsed_time(_ev[2]):.2f}ms postprocess={_ev[2].elapsed_time(_ev[3]):.2f}ms total={_ev[0].elapsed_time(_ev[3]):.2f}ms {hits_str} toks={toks}", flush=True)
+        if ev: ev[3].record()
+        cache_hits = speculate_result.cache_hits
+        n_hits = int(cache_hits.sum().item()) if cache_hits is not None else 0
+        toks = sum(len(s) for s in out_verify_result.new_suffixes)
+        profile.emit(
+            "SpecDecodeStep.decode",
+            ["handshake", "verify", "postprocess"],
+            ev,
+            step=step_num,
+            hits=n_hits,
+            toks=toks,
+        )
+        # Flush at end of step: aggregates events from this step + everything
+        # called inside (verifier, CG-path replays, in-model forward/compute_logits).
+        profile.flush()
 
         return sum(len(s) for s in out_verify_result.new_suffixes)

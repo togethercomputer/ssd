@@ -1,9 +1,8 @@
-import os
 import math
 import torch
 
+from ssd.utils import profile
 from ssd.utils.context import set_context, get_context, reset_context
-from time import perf_counter
 
 
 ## RUN CUDAGRAPHS
@@ -58,26 +57,25 @@ def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_va
     if block_tables is not None:
         graph_vars["block_tables"][:bs, :block_tables.size(1)] = block_tables
 
-    _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1"
-    if _pt:
-        torch.cuda.synchronize()
-        _t0 = perf_counter()
+    ev = profile.new_events(3)
+    if ev: ev[0].record()
 
     graph.replay()
-
-    if _pt:
-        torch.cuda.synchronize()
-        _t1 = perf_counter()
+    if ev: ev[1].record()
 
     # Extract outputs for the ORIGINAL batch size only
     outputs = graph_vars["outputs"][:orig_bs * k_plus_1]
     logits = model_runner.model.compute_logits(outputs, last_only)
+    if ev: ev[2].record()
 
-    if _pt:
-        torch.cuda.synchronize()
-        _t2 = perf_counter()
-        has_eagle = "eagle_acts" in graph_vars
-        print(f"[cuda_graph_helpers.run_verify_cudagraph][PROFILE verify_cg] replay={(_t1-_t0)*1000:.2f}ms logits={(_t2-_t1)*1000:.2f}ms eagle={has_eagle} bs={orig_bs} rank={model_runner.rank}", flush=True)
+    profile.emit(
+        "run_verify_cudagraph",
+        ["replay", "compute_logits"],
+        ev,
+        bs=orig_bs,
+        eagle="eagle_acts" in graph_vars,
+        rank=model_runner.rank,
+    )
 
     # For eagle target, also return eagle_acts
     if "eagle_acts" in graph_vars:
@@ -111,37 +109,28 @@ def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_va
         graph_vars["block_tables"][:flat_batch_size,
                                 :context.block_tables.size(1)] = context.block_tables
 
+    ev = profile.new_events(3)
+    if ev: ev[0].record()
+
     graph.replay()
+    if ev: ev[1].record()
 
     outputs = graph_vars["outputs"][:flat_batch_size]
     logits = model_runner.model.compute_logits(outputs, last_only)
+    if ev: ev[2].record()
+
+    profile.emit(
+        "run_decode_cudagraph",
+        ["replay", "compute_logits"],
+        ev,
+        flat_bs=flat_batch_size,
+    )
+
     # EAGLE draft: outputs is prenorm, return both
     if "hidden_states" in graph_vars:
         return logits, outputs
     return logits
 
-
-PROFILE = os.environ.get("SSD_PROFILE", "0") == "1"
-PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
-_draft_events = []  # [(step, label, start_event, end_event), ...]
-
-def flush_draft_profile():
-    """Sync once, read all CUDA events, print per-step breakdown, clear list."""
-    if not _draft_events:
-        return
-    torch.cuda.synchronize()
-    by_step = {}
-    for step, label, ev0, ev1 in _draft_events:
-        by_step.setdefault(step, []).append((label, ev0.elapsed_time(ev1)))
-    parts = []
-    total = 0.0
-    for step in sorted(by_step):
-        step_total = sum(t for _, t in by_step[step])
-        detail = " ".join(f"{l}={t:.2f}" for l, t in by_step[step])
-        parts.append(f"s{step}={step_total:.2f}({detail})")
-        total += step_total
-    print(f"[cuda_graph_helpers.flush_draft_profile][PROFILE draft_detail] K={len(by_step)} total={total:.2f}ms avg_step={total/len(by_step):.2f}ms | {' '.join(parts)}", flush=True)
-    _draft_events.clear()
 
 @torch.inference_mode()
 def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, step, cache_hits, hidden_states=None):
@@ -203,12 +192,6 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     if cache_hits.shape[0] < B:
         cache_hits = torch.cat([cache_hits, torch.zeros(B - cache_hits.shape[0], device=cache_hits.device)])
 
-    if PROFILE:
-        torch.cuda.synchronize()
-        start_time = torch.cuda.Event(enable_timing=True)
-        end_time = torch.cuda.Event(enable_timing=True)
-        start_time.record()
-
     # Build tree mask bias for this step and copy into pre-allocated buffer
     from ssd.layers.tree_mask import build_tree_mask_bias
     K = model_runner.config.speculate_k
@@ -235,30 +218,25 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     if step == 0:
         graph_vars["block_tables"][:B, :block_tables.size(1)] = block_tables
 
-    if PROFILE:
-        end_time.record()
-        torch.cuda.synchronize()
-        buffer_prep_time = start_time.elapsed_time(end_time)
-        start_time.record()
-
-    if PROFILE_DRAFT:
-        _ev_replay0 = torch.cuda.Event(enable_timing=True); _ev_replay0.record()
+    # NOTE: tree-decode capture includes compute_logits inside the graph
+    # (capture_fi_tree_decode_cudagraph), so the replay timing covers forward +
+    # lm_head together — no separate split is possible here.
+    ev = profile.new_events(2)
+    if ev: ev[0].record()
 
     graph.replay()
+    if ev: ev[1].record()
 
-    if PROFILE_DRAFT:
-        _ev_replay1 = torch.cuda.Event(enable_timing=True); _ev_replay1.record()
-        _draft_events.append((step, "replay", _ev_replay0, _ev_replay1))
-
-    if PROFILE:
-        end_time.record()
-        torch.cuda.synchronize()
-        replay_time = start_time.elapsed_time(end_time)
+    profile.emit(
+        "run_fi_tree_decode_cudagraph",
+        ["replay_incl_lm_head"],
+        ev,
+        step=step,
+        flat_bs=flat_batch_size,
+        B=B,
+    )
 
     logits_all = graph_vars["logits"][:flat_batch_size]
-
-    if PROFILE:
-        print(f"[cuda_graph_helpers.run_fi_tree_decode_cudagraph] step {step}: buffer={buffer_prep_time:.3f}ms, replay={replay_time:.3f}ms", flush=True)
 
     logits_out = logits_all[:orig_flat]
     if "hidden_states" in graph_vars:
@@ -518,11 +496,25 @@ def run_glue_decode_cudagraph(model_runner, input_ids, positions, last_only, gra
     if hidden_states is not None and "eagle_hidden_states" in graph_vars:
         graph_vars["eagle_hidden_states"][:orig_flat] = hidden_states
 
+    ev = profile.new_events(3)
+    if ev: ev[0].record()
+
     graph.replay()
+    if ev: ev[1].record()
 
     outputs = graph_vars["outputs"][:orig_flat]
     logits = model_runner.model.compute_logits(outputs, last_only)
     assert logits.dim() == 2, "ERROR in run_glue_decode_cudagraph: logits must be 2D"
+    if ev: ev[2].record()
+
+    profile.emit(
+        "run_glue_decode_cudagraph",
+        ["replay", "compute_logits"],
+        ev,
+        orig_flat=orig_flat,
+        orig_B=orig_B,
+    )
+
     if "eagle_hidden_states" in graph_vars:
         return logits, outputs
     return logits

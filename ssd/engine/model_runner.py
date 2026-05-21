@@ -9,6 +9,7 @@ from multiprocessing.shared_memory import SharedMemory
 from transformers import AutoTokenizer, AutoConfig
 import os
 from ssd.config import Config
+from ssd.utils import profile
 from ssd.engine.sequence import Sequence
 from ssd.models.qwen3 import Qwen3ForCausalLM
 from ssd.models.llama3 import LlamaForCausalLM
@@ -658,20 +659,15 @@ class ModelRunner:
         draft_return_logits: bool = False,
         hidden_states: torch.Tensor | None = None
     ) -> list[int] | tuple[list[int], torch.Tensor]:
-        _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1" and not is_prefill and not last_only
-        if _pt:
-            torch.cuda.synchronize()
-            _r0 = time.perf_counter()
+        ev = profile.new_events(3)
+        if ev: ev[0].record()
 
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
         else:
             input_ids, positions = self.prepare_decode(seqs, verify=not last_only)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-
-        if _pt:
-            torch.cuda.synchronize()
-            _r1 = time.perf_counter()
+        if ev: ev[1].record()
 
         # Handle EAGLE returning (logits, conditioning_vector for next iter)
         conditioning = None
@@ -680,11 +676,15 @@ class ModelRunner:
                 input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
         else:
             logits = self.run_model(input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
+        if ev: ev[2].record()
 
-        if _pt:
-            torch.cuda.synchronize()
-            _r2 = time.perf_counter()
-            print(f"[PROFILE target_run] prepare_decode={(_r1-_r0)*1000:.2f}ms run_model={(_r2-_r1)*1000:.2f}ms eagle={self.config.use_eagle}, phoenix={self.config.use_phoenix}, n_ids={input_ids.shape[0]}", flush=True)
+        profile.emit(
+            "ModelRunner.run",
+            ["prepare", "run_model"],
+            ev,
+            is_prefill=is_prefill,
+            n_ids=input_ids.shape[0],
+        )
 
         if last_only:
             token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None

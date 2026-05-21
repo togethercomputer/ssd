@@ -7,14 +7,12 @@ import dataclasses
 
 from ssd.engine.model_runner import ModelRunner
 from ssd.config import Config
+from ssd.utils import profile
 from ssd.utils.context import set_context, reset_context
 from ssd.utils.misc import compress_neg_ones_and_zeros
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
-from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
 from ssd.engine.helpers.runner_helpers import PrefillRequest, SpeculationRequest, SpeculationResponse, COMMAND
 
-PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
-PROFILE_EVENTS = os.environ.get("SSD_PROFILE_EVENTS", "0") == "1"  # CUDA event timing (no sync overhead)
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 BRIEF_LOG = os.environ.get("SSD_BRIEF_LOG", "0") == "1"
 
@@ -394,14 +392,9 @@ class DraftRunner(ModelRunner):
 
     def _service_spec_request(self):
         """Receives a speculation request, serves it from cache, and sends results back in a single response."""
-        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         DEBUG = os.environ.get("SSD_DEBUG", "0") == "1"
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d0 = time.perf_counter()
-        if PROFILE_EVENTS:
-            _ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
-            _ev[0].record()
+        ev = profile.new_events(4)
+        if ev: ev[0].record()
 
         speculation_request = SpeculationRequest.receive(
             async_pg=self.async_pg,
@@ -463,11 +456,7 @@ class DraftRunner(ModelRunner):
                             f"extend_token_ids out of [0,{vocab_size}): min={tid_min}, max={tid_max}"
                         )
 
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d1 = time.perf_counter()
-        if PROFILE_EVENTS:
-            _ev[1].record()
+        if ev: ev[1].record()
 
         out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache(
             cache_keys, B, K, num_tokens, temperatures, draft_block_tables,
@@ -476,11 +465,7 @@ class DraftRunner(ModelRunner):
             extend_token_ids=extend_token_ids,
         )
 
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d2 = time.perf_counter()
-        if PROFILE_EVENTS:
-            _ev[2].record()
+        if ev: ev[2].record()
 
         if self._acceptance_rate_log_path:
             # Collect per-step metrics for logging.
@@ -507,24 +492,14 @@ class DraftRunner(ModelRunner):
 
         speculation_response.send(self.async_pg, self.target_rank, tokenizer=self.tokenizer)
 
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d3 = time.perf_counter()
-            print(f"[PROFILE draft._service_spec_request] receive={(_d1-_d0)*1000:.2f}ms, "
-                  f"hit_cache={(_d2-_d1)*1000:.2f}ms, "
-                  f"send={(_d3-_d2)*1000:.2f}ms, "
-                  f"total={(_d3-_d0)*1000:.2f}ms",
-                  flush=True,
-            )
-        if PROFILE_EVENTS:
-            _ev[3].record()
-            _ev[3].synchronize()
-            print(f"[PROFILE_EVENTS draft._service_spec_request] receive={_ev[0].elapsed_time(_ev[1]):.2f}ms, "
-                  f"hit_cache={_ev[1].elapsed_time(_ev[2]):.2f}ms, "
-                  f"send={_ev[2].elapsed_time(_ev[3]):.2f}ms, "
-                  f"total={_ev[0].elapsed_time(_ev[3]):.2f}ms",
-                  flush=True,
-            )
+        if ev: ev[3].record()
+        profile.emit(
+            "draft._service_spec_request",
+            ["receive", "hit_cache", "send"],
+            ev,
+            B=B,
+            K=K,
+        )
 
         if NCCL_LOG:
             sep = '=' * 80
@@ -535,25 +510,6 @@ class DraftRunner(ModelRunner):
                 print(f"[{_ts()}]   req[{i}]: speculations={spec_ids}", flush=True)
                 print(f"[{_ts()}]            decoded={spec_text}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
-
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d3 = time.perf_counter()
-            print(f"[PROFILE draft._service_spec_request] receive={(_d1-_d0)*1000:.2f}ms, "
-                  f"hit_cache={(_d2-_d1)*1000:.2f}ms, "
-                  f"send={(_d3-_d2)*1000:.2f}ms, "
-                  f"total={(_d3-_d0)*1000:.2f}ms",
-                  flush=True,
-            )
-        if PROFILE_EVENTS:
-            _ev[3].record()
-            _ev[3].synchronize()
-            print(f"[PROFILE_EVENTS draft._service_spec_request] receive={_ev[0].elapsed_time(_ev[1]):.2f}ms, "
-                  f"hit_cache={_ev[1].elapsed_time(_ev[2]):.2f}ms, "
-                  f"send={_ev[2].elapsed_time(_ev[3]):.2f}ms, "
-                  f"total={_ev[0].elapsed_time(_ev[3]):.2f}ms",
-                  flush=True,
-            )
 
         partial_tree_decode_args = {
             "num_tokens": num_tokens,
@@ -726,13 +682,8 @@ class DraftRunner(ModelRunner):
         cache_hits = partial_tree_decode_args["cache_hits"]
         cache_hits_list = cache_hits.tolist()
 
-        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d0 = time.perf_counter()
-        if PROFILE_EVENTS:
-            _bev = [torch.cuda.Event(enable_timing=True) for _ in range(7)]
-            _bev[0].record()
+        ev = profile.new_events(7)
+        if ev: ev[0].record()
 
         if self.config.use_eagle_or_phoenix:
             B = partial_tree_decode_args["num_tokens"].shape[0]
@@ -855,11 +806,7 @@ class DraftRunner(ModelRunner):
                 dbt=dbt, B=B,
             )
 
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d1 = time.perf_counter()
-        if PROFILE_EVENTS:
-            _bev[1].record()
+        if ev: ev[1].record()
 
         # Pre-compute tree decode args (overlap CPU with GPU)
         _pre_b_flat = torch.arange(B, device=self.device, dtype=torch.int64)[:, None].expand(B, self.config.MQ_LEN).flatten()
@@ -882,11 +829,7 @@ class DraftRunner(ModelRunner):
             block_tables=glue_decode_ctxt["block_tables"],
         )
 
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d2 = time.perf_counter()
-        if PROFILE_EVENTS:
-            _bev[2].record()
+        if ev: ev[2].record()
 
         glue_prenorm = None
         if self.config.use_eagle_or_phoenix:
@@ -899,11 +842,7 @@ class DraftRunner(ModelRunner):
                 glue_decode_ctxt["input_ids"], glue_decode_ctxt["positions"],
                 is_prefill=False, last_only=False)
 
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d3 = time.perf_counter()
-        if PROFILE_EVENTS:
-            _bev[3].record()
+        if ev: ev[3].record()
 
         if self.config.verbose:
             print(f"[{_ts()}] [GLUE DECODE] logits shape={glue_decode_logits_flat.shape}, "
@@ -913,11 +852,7 @@ class DraftRunner(ModelRunner):
 
         reset_context()
 
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d4 = time.perf_counter()
-        if PROFILE_EVENTS:
-            _bev[4].record()
+        if ev: ev[4].record()
 
         # --- Extract K+1 logits/prenorms at rec+spec positions ---
         if self.config.use_eagle_or_phoenix:
@@ -969,11 +904,7 @@ class DraftRunner(ModelRunner):
         else:
             gd_for_fork = glue_decode_input_ids.reshape(B, K + 1)
 
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d5 = time.perf_counter()
-        if PROFILE_EVENTS:
-            _bev[5].record()
+        if ev: ev[5].record()
 
         forked_rec_tokens = get_forked_recovery_tokens_from_logits(
             self.config,
@@ -983,28 +914,21 @@ class DraftRunner(ModelRunner):
             tokenizer=self.tokenizer,
         ).view(-1)
 
-        if _prof or PROFILE_DRAFT:
-            torch.cuda.synchronize()
-            _d6 = time.perf_counter()
-            print(f"[PROFILE draft._build_tree_batch] prepare_glue_decode_ctxt={(_d1-_d0)*1000:.2f}ms "
-                f"set_context={(_d2-_d1)*1000:.2f}ms "
-                f"run_model={(_d3-_d2)*1000:.2f}ms "
-                f"reset_context={(_d4-_d3)*1000:.2f}ms "
-                f"prepare_get_forked_recovery_tokens={(_d5-_d4)*1000:.2f}ms "
-                f"get_forked_recovery_tokens={(_d6-_d5)*1000:.2f}ms, total={(_d6-_d0)*1000:.2f}ms",
-                flush=True,
-            )
-        if PROFILE_EVENTS:
-            _bev[6].record()
-            _bev[6].synchronize()
-            print(f"[PROFILE_EVENTS draft._build_tree_batch] prepare_glue_decode_ctxt={_bev[0].elapsed_time(_bev[1]):.2f}ms "
-                f"set_context={_bev[1].elapsed_time(_bev[2]):.2f}ms "
-                f"run_model={_bev[2].elapsed_time(_bev[3]):.2f}ms "
-                f"reset_context={_bev[3].elapsed_time(_bev[4]):.2f}ms "
-                f"prepare_get_forked_recovery_tokens={_bev[4].elapsed_time(_bev[5]):.2f}ms "
-                f"get_forked_recovery_tokens={_bev[5].elapsed_time(_bev[6]):.2f}ms, total={_bev[0].elapsed_time(_bev[6]):.2f}ms",
-                flush=True,
-            )
+        if ev: ev[6].record()
+        profile.emit(
+            "draft._build_tree_batch",
+            [
+                "prepare_glue_decode_ctxt",
+                "set_context",
+                "run_model",
+                "reset_context",
+                "prepare_get_forked_recovery_tokens",
+                "get_forked_recovery_tokens",
+            ],
+            ev,
+            B=B,
+            K=K,
+        )
         # Phoenix tree decode reuses the recovery activation per request.
         # In the new layout it lives at extend_eagle_acts_batch[i, extend_counts[i]].
         if self.config.use_phoenix:
@@ -1114,36 +1038,21 @@ class DraftRunner(ModelRunner):
             initial_positions, initial_rope_positions, dbt, B, K, F, N, self.config.MQ_LEN
         )
 
-        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         payload["_all_greedy"] = bool((payload["temps"] == 0).all())
-        _step_times = []
-        if PROFILE_EVENTS:
-            _tev = [torch.cuda.Event(enable_timing=True) for _ in range(K + 1)]
-            _tev[0].record()
+        ev = profile.new_events(K + 1)
+        if ev: ev[0].record()
         for depth in range(K):
-            if _prof or PROFILE_DRAFT:
-                torch.cuda.synchronize()
-                _st = time.perf_counter()
             current_input_ids = self._decode_tree_step(
                 depth, current_input_ids, step_rope_positions, step_slot_maps,
                 step_context_lens, dbt, payload, spec_tokens, spec_logits, spec_activations, target_recovery_activations,
             )
-            if _prof or PROFILE_DRAFT:
-                torch.cuda.synchronize()
-                _et = time.perf_counter()
-                _step_times.append((_et - _st) * 1000)
-                if _prof:
-                    print(f"[{_ts()}] [PROFILE draft] tree_step[{depth}]={_step_times[-1]:.2f}ms", flush=True)
-            if PROFILE_EVENTS:
-                _tev[depth + 1].record()
-        if PROFILE_DRAFT and _step_times:
-            avg = sum(_step_times) / len(_step_times)
-            print(f"[{_ts()}] [PROFILE draft] tree_decode: K={K} steps={' '.join(f'{t:.2f}' for t in _step_times)} avg={avg:.2f}ms total={sum(_step_times):.2f}ms", flush=True)
-        if PROFILE_EVENTS and K > 0:
-            _tev[K].synchronize()
-            _esteps = [f'{_tev[i].elapsed_time(_tev[i+1]):.2f}' for i in range(K)]
-            _etotal = _tev[0].elapsed_time(_tev[K])
-            print(f"[PROFILE_EVENTS draft] tree_decode: K={K} steps=[{', '.join(_esteps)}] total={_etotal:.2f}ms", flush=True)
+            if ev: ev[depth + 1].record()
+        profile.emit(
+            "draft._decode_tree",
+            [f"step_{i}" for i in range(K)],
+            ev,
+            K=K,
+        )
 
         return spec_tokens, spec_logits, spec_activations
 
@@ -1235,56 +1144,34 @@ class DraftRunner(ModelRunner):
             # SPECULATE request: serve out-of-cache or random speculations
             elif cmd == COMMAND.SPECULATION:
                 _ds0 = time.perf_counter()
-                _prof = os.environ.get("SSD_PROFILE", "0") == "1"
-                if _prof or PROFILE_DRAFT:
-                    torch.cuda.synchronize()
-                    _d0 = time.perf_counter()
-                if PROFILE_EVENTS:
-                    _lev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
-                    _lev[0].record()
+                ev = profile.new_events(5)
+                if ev: ev[0].record()
 
                 glue_decode_input_ids, partial_tree_decode_args = self._service_spec_request()
-
-                if _prof or PROFILE_DRAFT:
-                    torch.cuda.synchronize()
-                    _d1 = time.perf_counter()
-                if PROFILE_EVENTS:
-                    _lev[1].record()
+                if ev: ev[1].record()
 
                 self._reset_tree_cache_tensors()
-
                 tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)
-
-                if _prof or PROFILE_DRAFT:
-                    torch.cuda.synchronize()
-                    _d2 = time.perf_counter()
-                if PROFILE_EVENTS:
-                    _lev[2].record()
+                if ev: ev[2].record()
 
                 # Decode the branch tree
                 tokens, logits, activations = self._decode_tree(tree_decode_args)
-
-                if _prof or PROFILE_DRAFT:
-                    torch.cuda.synchronize()
-                    _d3 = time.perf_counter()
-                if PROFILE_EVENTS:
-                    _lev[3].record()
+                if ev: ev[3].record()
 
                 # Populate the local cache so future spec-requests can hit
                 self._populate_tree_cache(tree_decode_args, tokens, logits, activations)
                 self._draft_step_times.append(time.perf_counter() - _ds0)
+                if ev: ev[4].record()
 
-                if _prof or PROFILE_DRAFT:
-                    torch.cuda.synchronize()
-                    _d4 = time.perf_counter()
-                    print(f"[{_ts()}] [PROFILE draft] service={(_d1-_d0)*1000:.2f}ms build_tree={(_d2-_d1)*1000:.2f}ms decode_tree={(_d3-_d2)*1000:.2f}ms populate={(_d4-_d3)*1000:.2f}ms total={(_d4-_d0)*1000:.2f}ms", flush=True)
-                if PROFILE_EVENTS:
-                    _lev[4].record()
-                    _lev[4].synchronize()
-                    print(f"[PROFILE_EVENTS draft] service={_lev[0].elapsed_time(_lev[1]):.2f}ms build_tree={_lev[1].elapsed_time(_lev[2]):.2f}ms decode_tree={_lev[2].elapsed_time(_lev[3]):.2f}ms populate={_lev[3].elapsed_time(_lev[4]):.2f}ms total={_lev[0].elapsed_time(_lev[4]):.2f}ms", flush=True)
-
-                if PROFILE_DRAFT:
-                    flush_draft_profile()
+                profile.emit(
+                    "draft.spec_iter",
+                    ["service", "build_tree", "decode_tree", "populate"],
+                    ev,
+                )
+                # Single sync + aggregated print for everything emitted this iteration:
+                # _service_spec_request, _build_tree_batch, _decode_tree, run_*_cudagraph,
+                # model forward/compute_logits (eager), etc.
+                profile.flush()
 
                 continue
 
