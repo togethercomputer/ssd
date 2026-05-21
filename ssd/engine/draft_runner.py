@@ -1143,11 +1143,11 @@ class DraftRunner(ModelRunner):
             _tev[K].synchronize()
             _esteps = [f'{_tev[i].elapsed_time(_tev[i+1]):.2f}' for i in range(K)]
             _etotal = _tev[0].elapsed_time(_tev[K])
-            print(f"[PROFILE_EVENTS draft] tree_decode: K={K} steps={' '.join(_esteps)} total={_etotal:.2f}ms", flush=True)
+            print(f"[PROFILE_EVENTS draft] tree_decode: K={K} steps=[{', '.join(_esteps)}] total={_etotal:.2f}ms", flush=True)
 
         return spec_tokens, spec_logits, spec_activations
 
-    def _populate_tree_cache(self, payload, tokens, logits, cache_hits, activations=None):
+    def _populate_tree_cache(self, payload, tokens, logits, activations=None):
         """Populates the tensor-backed tree_cache with the results of the decoding.
         """
         seq_ids_expanded = payload["seq_ids_expanded"].to(torch.int64)
@@ -1271,7 +1271,7 @@ class DraftRunner(ModelRunner):
                     _lev[3].record()
 
                 # Populate the local cache so future spec-requests can hit
-                self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
+                self._populate_tree_cache(tree_decode_args, tokens, logits, activations)
                 self._draft_step_times.append(time.perf_counter() - _ds0)
 
                 if _prof or PROFILE_DRAFT:
