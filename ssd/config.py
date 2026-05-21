@@ -63,8 +63,14 @@ class Config:
         model = self.model
         assert os.path.isdir(model)
 
-        assert 1 <= self.num_gpus <= 8 # this codebase only works on one node 
+        assert 1 <= self.num_gpus <= 8 # this codebase only works on one node
         self.hf_config = AutoConfig.from_pretrained(model)
+
+        # Multimodal targets (e.g. Kimi K2.5) nest the LM config under `text_config`. The rest of this
+        # file expects a flat LM-style config (num_hidden_layers, hidden_size, rope_theta, ...), so
+        # collapse to the text sub-config when present. We don't use vision/quant fields here.
+        if hasattr(self.hf_config, "text_config"):
+            self.hf_config = self.hf_config.text_config
 
         if not self.speculate:
             if self.max_model_len:
@@ -96,9 +102,9 @@ class Config:
 
         if self.use_eagle_or_phoenix:
             if self.use_eagle and self.eagle_layers is None:
+                # Note: Currently we don't support Phoenix2, so only Eagle3 uses the `eagle_layers` config.
                 L = self.hf_config.num_hidden_layers
-                # self.eagle_layers = [3, L//2, L-3]
-                self.eagle_layers = [2, L//2, L-3] # [2, 16, 29] outputs, ie. [3, L//2+1, L-2] inputs
+                self.eagle_layers = [2, L//2, L-3]
                 print(f'[Config] just set eagle_layers={self.eagle_layers}', flush=True)
             # Eagle draft must use target's rope_theta (draft config may default to wrong value)
             if self.speculate and self.draft_hf_config is not None:
