@@ -39,7 +39,7 @@ from ssd.engine.helpers.cudagraph_helpers import (
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 
 def _ts():
-    return f'[[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}]]'
+    return f'[[{datetime.now().strftime("%H:%M:%S.%f")[:-3]}]]'
 
 
 class ModelRunner:
