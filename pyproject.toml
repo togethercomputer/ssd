@@ -24,6 +24,7 @@ dependencies = [
     "wandb==0.22.0",
     "hf_transfer",
     "tiktoken",
+    # Because this is a pre-release version, must install with `uv pip install -e . --prerelease=allow`.
     "flash-attn-4>=4.0.0b9",
 ]
 
