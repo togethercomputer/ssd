@@ -29,11 +29,11 @@ from ssd.engine.helpers.runner_helpers import (
 from ssd.engine.helpers.cudagraph_helpers import (
     run_verify_cudagraph,
     run_decode_cudagraph,
-    run_fi_tree_decode_cudagraph,
+    run_tree_decode_cudagraph,
     run_glue_decode_cudagraph,
     capture_cudagraph,
     capture_verify_cudagraph,
-    capture_fi_tree_decode_cudagraph,
+    capture_tree_decode_cudagraph,
     capture_glue_decode_cudagraph,
 )
 
@@ -276,11 +276,11 @@ class ModelRunner:
                 self.graphs["verify"] = verify_graphs
                 self.graph_bs_list["verify"] = verify_graph_bs_list
             if self.config.speculate and self.is_draft and self.config.draft_async:
-                fi_tree_decode_graph_vars, fi_tree_decode_graph_pool, fi_tree_decode_graphs, fi_tree_decode_graph_bs_list = capture_fi_tree_decode_cudagraph(self)  # fi tree decode cudagraph, draft only
-                self.graph_vars["fi_tree_decode"] = fi_tree_decode_graph_vars
-                self.graph_pools["fi_tree_decode"] = fi_tree_decode_graph_pool
-                self.graphs["fi_tree_decode"] = fi_tree_decode_graphs
-                self.graph_bs_list["fi_tree_decode"] = fi_tree_decode_graph_bs_list
+                tree_decode_graph_vars, tree_decode_graph_pool, tree_decode_graphs, tree_decode_graph_bs_list = capture_tree_decode_cudagraph(self)  # fi tree decode cudagraph, draft only
+                self.graph_vars["tree_decode"] = tree_decode_graph_vars
+                self.graph_pools["tree_decode"] = tree_decode_graph_pool
+                self.graphs["tree_decode"] = tree_decode_graphs
+                self.graph_bs_list["tree_decode"] = tree_decode_graph_bs_list
             if self.config.speculate and self.is_draft and self.config.draft_async and self.config.use_eagle_or_phoenix:
                 glue_gv, glue_pool, glue_graphs, glue_bs_list = capture_glue_decode_cudagraph(self)
                 self.graph_vars["glue_decode"] = glue_gv
@@ -640,7 +640,7 @@ class ModelRunner:
                 return logits 
 
         elif is_tree_decode:
-            return run_fi_tree_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["fi_tree_decode"], tree_decode_step, cache_hits, hidden_states=hidden_states)
+            return run_tree_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["tree_decode"], tree_decode_step, cache_hits, hidden_states=hidden_states)
         elif is_mq_kp1 and hidden_states is not None and "glue_decode" in self.graph_vars:
             # EAGLE draft glue decode with 2K+1 per seq
             return run_glue_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["glue_decode"], hidden_states)

@@ -14,7 +14,7 @@ from ssd.engine.helpers.cudagraph_helpers import (
     run_decode_cudagraph,
     capture_cudagraph,
     capture_verify_cudagraph,
-    run_fi_tree_decode_cudagraph,
+    run_tree_decode_cudagraph,
 )
 from ssd.engine.helpers.runner_helpers import (
     prepare_decode_tensors_from_seqs,

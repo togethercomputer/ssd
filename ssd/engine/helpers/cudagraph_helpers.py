@@ -133,18 +133,18 @@ def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_va
 
 
 @torch.inference_mode()
-def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, step, cache_hits, hidden_states=None):
+def run_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, step, cache_hits, hidden_states=None):
     context = get_context()
 
     MQ_LEN = sum(model_runner.config.fan_out_list)
     orig_flat = input_ids.size(0)
-    assert orig_flat % MQ_LEN == 0, f"ERROR in run_fi_tree_decode_cudagraph: flat_batch_size should be divisible by MQ_LEN, got {orig_flat} and {MQ_LEN}"
+    assert orig_flat % MQ_LEN == 0, f"ERROR in run_tree_decode_cudagraph: flat_batch_size should be divisible by MQ_LEN, got {orig_flat} and {MQ_LEN}"
     orig_B = orig_flat // MQ_LEN
 
     # Pick CUDA graph bucket
     wrapper_bs = next(
-        x for x in model_runner.graph_bs_list["fi_tree_decode"] if x >= orig_B)
-    graph = model_runner.graphs["fi_tree_decode"][wrapper_bs]
+        x for x in model_runner.graph_bs_list["tree_decode"] if x >= orig_B)
+    graph = model_runner.graphs["tree_decode"][wrapper_bs]
 
     # Prepare padded inputs/context if needed
     if wrapper_bs > orig_B:
@@ -219,7 +219,7 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         graph_vars["block_tables"][:B, :block_tables.size(1)] = block_tables
 
     # NOTE: tree-decode capture includes compute_logits inside the graph
-    # (capture_fi_tree_decode_cudagraph), so the replay timing covers forward +
+    # (capture_tree_decode_cudagraph), so the replay timing covers forward +
     # lm_head together — no separate split is possible here.
     ev = profile.new_events(2)
     if ev: ev[0].record()
@@ -228,7 +228,7 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     if ev: ev[1].record()
 
     profile.emit(
-        "run_fi_tree_decode_cudagraph",
+        "run_tree_decode_cudagraph",
         ["replay_incl_lm_head"],
         ev,
         step=step,
@@ -613,7 +613,7 @@ def capture_glue_decode_cudagraph(model_runner):
 
 
 @torch.inference_mode()
-def capture_fi_tree_decode_cudagraph(model_runner):
+def capture_tree_decode_cudagraph(model_runner):
     config = model_runner.config
     hf_config = config.hf_config
     max_bs = min(model_runner.config.max_num_seqs, 512)
@@ -641,9 +641,9 @@ def capture_fi_tree_decode_cudagraph(model_runner):
     graphs = {}
     graph_pool = None
 
-    fi_hidden_states = None
+    hidden_states = None
     if config.use_eagle_or_phoenix and model_runner.is_draft:
-        fi_hidden_states = torch.zeros(
+        hidden_states = torch.zeros(
             max_flat_batch_size,
             model_runner.hidden_states_dim,
             dtype=hf_config.torch_dtype,
@@ -661,7 +661,7 @@ def capture_fi_tree_decode_cudagraph(model_runner):
         max_flat_batch_size * config.max_model_len,
         dtype=torch.float32, device=model_runner.device)
 
-    print(f'[cuda_graph_helpers.capture_fi_tree_decode_cudagraph] About to capture FA4 tree decode cudagraphs for bs={graph_bs_list}', flush=True)
+    print(f'[cuda_graph_helpers.capture_tree_decode_cudagraph] About to capture FA4 tree decode cudagraphs for bs={graph_bs_list}', flush=True)
 
     for bs in reversed(graph_bs_list):
         graph = torch.cuda.CUDAGraph()
@@ -677,9 +677,9 @@ def capture_fi_tree_decode_cudagraph(model_runner):
         )
 
         # Warmup run
-        if fi_hidden_states is not None:
+        if hidden_states is not None:
             outputs[:bs * MQ_LEN] = model_runner.model(
-                input_ids[:bs * MQ_LEN], positions[:bs * MQ_LEN], fi_hidden_states[:bs * MQ_LEN])
+                input_ids[:bs * MQ_LEN], positions[:bs * MQ_LEN], hidden_states[:bs * MQ_LEN])
         else:
             outputs[:bs * MQ_LEN] = model_runner.model(
                 input_ids[:bs * MQ_LEN], positions[:bs * MQ_LEN])
@@ -687,9 +687,9 @@ def capture_fi_tree_decode_cudagraph(model_runner):
 
         # Capture both model run and logits computation
         with torch.cuda.graph(graph, graph_pool):
-            if fi_hidden_states is not None:
+            if hidden_states is not None:
                 outputs[:bs * MQ_LEN] = model_runner.model(
-                    input_ids[:bs * MQ_LEN], positions[:bs * MQ_LEN], fi_hidden_states[:bs * MQ_LEN])
+                    input_ids[:bs * MQ_LEN], positions[:bs * MQ_LEN], hidden_states[:bs * MQ_LEN])
             else:
                 outputs[:bs * MQ_LEN] = model_runner.model(input_ids[:bs * MQ_LEN], positions[:bs * MQ_LEN])
             logits[:bs * MQ_LEN] = model_runner.model.compute_logits(outputs[:bs * MQ_LEN], False)
@@ -712,7 +712,7 @@ def capture_fi_tree_decode_cudagraph(model_runner):
         tree_cu_seqlens_q=tree_cu_seqlens_q_dict,
         tree_mask_bias=tree_mask_bias,
     )
-    if fi_hidden_states is not None:
-        graph_vars["hidden_states"] = fi_hidden_states
+    if hidden_states is not None:
+        graph_vars["hidden_states"] = hidden_states
 
     return graph_vars, graph_pool, graphs, graph_bs_list
