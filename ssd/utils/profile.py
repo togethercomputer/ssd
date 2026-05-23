@@ -4,6 +4,10 @@ Records events without per-call `torch.cuda.synchronize()` — sync happens once
 at `flush()`. This avoids GPU drains perturbing the timing inside tight loops
 (e.g. the K-step tree decode).
 
+Each flushed PROFILE line is prefixed with `t_ns=<ns since epoch>` so that
+target and draft logs from NTP/PTP-synced hosts can be aligned post-hoc to
+visualize the async pipeline.
+
 CUDA-graph safety: timing events can't be recorded into a capturing stream, so
 `new_events()` returns None during capture and `emit()` no-ops on None.
 
@@ -23,6 +27,7 @@ Usage:
 """
 
 import os
+import time
 
 import torch
 
@@ -43,6 +48,32 @@ def new_events(n: int):
     if not is_active():
         return None
     return [torch.cuda.Event(enable_timing=True) for _ in range(n)]
+
+
+class _CpuEvent:
+    """CPU-only event for measuring wall-clock-blocking regions (e.g. waiting
+    on a network recv). CUDA events on an idle stream do NOT capture CPU-only
+    waits, so use this for those regions. API mirrors torch.cuda.Event so it
+    can flow through the same emit()/flush() pipeline."""
+    __slots__ = ("t",)
+
+    def __init__(self):
+        self.t = None
+
+    def record(self):
+        self.t = time.perf_counter()
+
+    def elapsed_time(self, other: "_CpuEvent") -> float:
+        return (other.t - self.t) * 1000.0
+
+
+def new_cpu_events(n: int):
+    """Same shape as `new_events`, but events are CPU-timed. Use for regions
+    that are CPU-blocking with no GPU work (e.g. `dist.recv` on the request
+    channel, or any wait_for_X)."""
+    if not is_active():
+        return None
+    return [_CpuEvent() for _ in range(n)]
 
 
 def emit(group: str, labels: list, events, **meta) -> None:
@@ -68,6 +99,9 @@ def flush() -> None:
     if not _buffer:
         return
     torch.cuda.synchronize()
+    # Single wall-clock stamp shared by all lines from this flush. Used to align
+    # target/draft logs post-hoc; assumes host clocks are NTP/PTP-synced.
+    t_ns = time.time_ns()
     grouped = {}
     for group, label, ev0, ev1, meta_key in _buffer:
         grouped.setdefault((group, meta_key), []).append(
@@ -76,7 +110,7 @@ def flush() -> None:
     for (group, meta_key), items in grouped.items():
         total = sum(t for _, t in items)
         parts = " ".join(f"{l}={t:.3f}ms" for l, t in items)
-        line = f"[PROFILE {group}] {parts} total={total:.3f}ms"
+        line = f"[PROFILE {group}] t_ns={t_ns} {parts} total={total:.3f}ms"
         if meta_key:
             line += " " + " ".join(f"{k}={v}" for k, v in meta_key)
         print(line, flush=True)

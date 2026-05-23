@@ -490,6 +490,20 @@ class DraftRunner(ModelRunner):
                 cache_hit_text = "HIT" if cache_hit == 1 else "MISS"
                 print(f"[{_ts()}] [SpeculationResponse.send] req[{i}]: CACHE {cache_hit_text}", flush=True)
 
+        # Profile-only ACK so the target can split nccl_recv into
+        # wait_for_draft vs bulk_recv. Only fires when SSD_PROFILE=1; both
+        # sides must agree on the gate or the wire format drifts.
+        if profile.is_active():
+            if not hasattr(self, "_profile_ack_tensor"):
+                self._profile_ack_tensor = torch.ones(
+                    1, dtype=torch.int32, device=self.device
+                )
+            dist.send(
+                self._profile_ack_tensor,
+                dst=self.target_rank,
+                group=self.async_pg,
+            )
+
         speculation_response.send(self.async_pg, self.target_rank, tokenizer=self.tokenizer)
 
         if ev: ev[3].record()
@@ -1133,8 +1147,15 @@ class DraftRunner(ModelRunner):
 
     def _draft_loop_inner(self):
         while True:
-            # 1) Wait for the next command (may be PREFILL, SPEC_REQUEST, or EXIT)
+            # 1) Wait for the next command (may be PREFILL, SPEC_REQUEST, or EXIT).
+            # Bracket the CPU-blocking wait with CPU events so we can see how
+            # long the draft sat idle between iters — high when target is
+            # gating, ~0 when draft is gating. CUDA events would not capture
+            # this region (idle stream).
+            ev_idle = profile.new_cpu_events(2)
+            if ev_idle: ev_idle[0].record()
             cmd, _ = self._wait_for_cmd()
+            if ev_idle: ev_idle[1].record()
 
             # PREFILL: run the draft prefill and then loop back
             if cmd == COMMAND.PREFILL:
@@ -1167,6 +1188,11 @@ class DraftRunner(ModelRunner):
                     "draft.spec_iter",
                     ["service", "build_tree", "decode_tree", "populate"],
                     ev,
+                )
+                profile.emit(
+                    "draft.idle",
+                    ["wait_for_cmd"],
+                    ev_idle,
                 )
                 # Single sync + aggregated print for everything emitted this iteration:
                 # _service_spec_request, _build_tree_batch, _decode_tree, run_*_cudagraph,
