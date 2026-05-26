@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--llama", action="store_true", default=True)
     parser.add_argument("--qwen", action="store_true")
     parser.add_argument("--size", type=int, default=0)
-    parser.add_argument("--mode", choices=["AR", "STANDALONE", "ASYNC_STANDALONE", "EAGLE3", "ASYNC_EAGLE3"], default="STANDALONE",
+    parser.add_argument("--mode", choices=["AR", "STANDALONE", "ASYNC_STANDALONE", "EAGLE3", "ASYNC_EAGLE3", "PHOENIX", "ASYNC_PHOENIX"], default="STANDALONE",
                         help="ar = autoregressive, sd = speculative decoding (default)")
     parser.add_argument("--backup", choices=["fast", "jit", "force-jit"], default="jit",
                         help="Backup strategy (fast, jit, force-jit)")
@@ -124,11 +124,11 @@ def main():
 
 
 def is_spec(mode):
-    return mode in ["STANDALONE", "ASYNC_STANDALONE", "EAGLE3", "ASYNC_EAGLE3"]
+    return mode in ["STANDALONE", "ASYNC_STANDALONE", "EAGLE3", "ASYNC_EAGLE3", "PHOENIX2", "ASYNC_PHOENIX2"]
 
 
 def is_async(mode):
-    return mode in ["ASYNC_STANDALONE", "ASYNC_EAGLE3"]
+    return mode in ["ASYNC_STANDALONE", "ASYNC_EAGLE3", "ASYNC_PHOENIX"]
 
 
 def is_standalone(mode):
@@ -136,6 +136,10 @@ def is_standalone(mode):
 
 def is_eagle3(mode):
     return mode in ["EAGLE3", "ASYNC_EAGLE3"]
+
+
+def is_phoenix(mode):
+    return mode in ["PHOENIX2", "ASYNC_PHOENIX2"]
 
 
 def get_server_cmd(args):
@@ -160,6 +164,9 @@ def get_server_cmd(args):
             draft = resolve_snapshot(MODELS["qwen_0.6b"])
         elif is_eagle3(args.mode):
             draft = resolve_snapshot(MODELS["eagle3_qwen_32b"])
+        elif is_phoenix(args.mode):
+            target = resolve_snapshot(MODELS["qwen_8b"])
+            draft = resolve_snapshot(MODELS["phoenix2_qwen_8b"])
         else:
             raise ValueError(f"Unsupported mode for qwen: {args.mode}")
 

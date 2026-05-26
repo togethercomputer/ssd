@@ -75,7 +75,7 @@ class SpeculatorAsync(SpeculatorBase):
         eagle_acts = verify_result.eagle_acts
         input_id_list = [seq.token_ids for seq in seqs]
 
-        # EAGLE token-conditioning shift: we duplicate the first target activation for each sequence.
+        # EAGLE/Phoenix token-conditioning shift: we duplicate the first target activation for each sequence.
         # [t0, h0], [t1, h0], [t2, h1], [t3, h2], ...
         if eagle_acts is not None:
             sliced = []

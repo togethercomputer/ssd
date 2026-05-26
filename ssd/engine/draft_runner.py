@@ -32,8 +32,8 @@ class DraftRunner(ModelRunner):
             cfg,
             model=cfg.draft,
             gpu_memory_utilization = (0.75 if not cfg.draft_async else 0.8), # REMAINING SPACE if not draft_async
-            tokenizer_path=cfg.model if cfg.use_eagle else None,
-            d_model_target=cfg.hf_config.hidden_size if cfg.use_eagle and cfg.hf_config else None,
+            tokenizer_path=cfg.model if cfg.use_eagle_or_phoenix else None,
+            d_model_target=cfg.hf_config.hidden_size if cfg.use_eagle_or_phoenix and cfg.hf_config else None,
         )
         return draft_cfg
 
@@ -68,7 +68,7 @@ class DraftRunner(ModelRunner):
             print(f'[{_ts()}] [draft_async_prefill] DRAFT ASYNC PREFILL STARTING', flush=True)
 
         prefill_request = PrefillRequest.receive(self.async_pg, self.target_rank, self.device, metadata_buffer=self._prefill_metadata)
-        total_new_tokens, batch_size, max_blocks, use_eagle, eagle_act_dim = prefill_request.metadata.tolist()
+        total_new_tokens, batch_size, max_blocks, use_eagle_or_phoenix, eagle_phoenix_act_dim = prefill_request.metadata.tolist()
         input_ids = prefill_request.input_ids
         num_tokens = prefill_request.num_tokens
         draft_block_table = prefill_request.draft_block_table
@@ -88,11 +88,15 @@ class DraftRunner(ModelRunner):
         prefill_ctxt = self.prepare_prefill_ctxt(num_tokens, draft_block_table)
 
         if self.config.use_eagle:
-            assert eagle_act_dim == 3 * self.config.d_model_target, (
-                f"EAGLE activation dimension {eagle_act_dim} does not match expected dimension 3 * {self.config.d_model_target}"
+            assert eagle_phoenix_act_dim == 3 * self.config.d_model_target, (
+                f"EAGLE activation dimension {eagle_phoenix_act_dim} does not match expected dimension 3 * {self.config.d_model_target}"
+            )
+        elif self.config.use_phoenix:
+            assert eagle_phoenix_act_dim == self.config.d_model_target, (
+                f"PHOENIX activation dimension {eagle_phoenix_act_dim} does not match expected dimension {self.config.d_model_target}"
             )
         if self.config.verbose:
-            print(f'[{_ts()}] [draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, batch_size={batch_size}, max_blocks={max_blocks}, use_eagle={use_eagle}, eagle_act_dim={eagle_act_dim}', flush=True)
+            print(f'[{_ts()}] [draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, batch_size={batch_size}, max_blocks={max_blocks}, use_eagle_or_phoenix={use_eagle_or_phoenix}, eagle_phoenix_act_dim={eagle_phoenix_act_dim}', flush=True)
 
 
         # 5) set up context exactly like prepare_prefill() does:
@@ -166,7 +170,7 @@ class DraftRunner(ModelRunner):
         hidden_states = None
         spec_activations = None
 
-        if self.config.use_eagle:
+        if self.config.use_eagle_or_phoenix:
             assert extend_activations is not None and extend_counts is not None and extend_token_ids is not None
 
             # Phase 1: warm up the draft KV cache with target-activation-based KV for the
@@ -200,7 +204,7 @@ class DraftRunner(ModelRunner):
                 is_jit=True,
             )
             
-            if self.config.use_eagle:
+            if self.config.use_eagle_or_phoenix:
                 logits, prenorm = self.run_model(input_ids, positions, is_prefill=False, last_only=True, hidden_states=hidden_states)
                 if self.config.use_eagle:
                     spec_activations[:, i] = prenorm
@@ -302,7 +306,7 @@ class DraftRunner(ModelRunner):
         out_activations = torch.empty(
             B, K, self.hidden_states_dim,
             dtype=self.hf_config.torch_dtype, device=self.device
-        ) if self.config.use_eagle else None
+        ) if self.config.use_eagle_or_phoenix else None
 
         # Statistics
         ttl += int(B)
@@ -342,7 +346,7 @@ class DraftRunner(ModelRunner):
                 extend_counts=extend_counts,
                 extend_token_ids=extend_token_ids,
                 )  # write into out_logits, out_tokens
-            if self.config.use_eagle:
+            if self.config.use_eagle_or_phoenix:
                 out_activations = jit_acts
         elif self.tree_cache_keys.numel() > 0:
             if self.config.verbose:
@@ -367,7 +371,7 @@ class DraftRunner(ModelRunner):
             out_tokens = self.tree_cache_tokens[idx]
             if self.config.communicate_logits:
                 out_logits = self.tree_cache_logits[idx]
-            if self.config.use_eagle:
+            if self.config.use_eagle_or_phoenix:
                 out_activations = self.tree_cache_activations[idx]
 
         rec_toks = request_keys[:, 2]
@@ -710,7 +714,7 @@ class DraftRunner(ModelRunner):
         ev = profile.new_events(7)
         if ev: ev[0].record()
 
-        if self.config.use_eagle:
+        if self.config.use_eagle_or_phoenix:
             B = partial_tree_decode_args["num_tokens"].shape[0]
             extend_counts = partial_tree_decode_args.get("extend_counts")
             if extend_counts is None:
@@ -745,7 +749,10 @@ class DraftRunner(ModelRunner):
                 # both hold [extend_0..extend_{n-1}, recovery].
                 fid_v[:, :n_ext_0 + 1] = extend_token_ids_batch[:, :n_ext_0 + 1]
                 fc_in = extend_eagle_acts_batch[:, :n_ext_0 + 1].reshape(B * (n_ext_0 + 1), -1).to(fc_dtype)
-                fc_out = self.model.fc(fc_in)
+                if self.config.use_eagle:
+                    fc_out = self.model.fc(fc_in)
+                else:
+                    fc_out = fc_in  # Phoenix: no fc, use activations directly
                 fhs_v[:, :n_ext_0 + 1, :] = fc_out.view(B, n_ext_0 + 1, hidden_size)
 
                 # Spec tokens: positions n_ext_0+1..sl-1 (no fc needed)
@@ -803,7 +810,10 @@ class DraftRunner(ModelRunner):
                 tc_acts = extend_eagle_acts_batch[ext_b, ext_local].to(fc_dtype)
                 fused_ids[is_extend] = extend_token_ids_batch[ext_b, ext_local]
 
-                fused_hs[is_extend] = self.model.fc(tc_acts)
+                if self.config.use_eagle:
+                    fused_hs[is_extend] = self.model.fc(tc_acts)
+                elif self.config.use_phoenix:
+                    fused_hs[is_extend] = tc_acts
 
                 spec_j = local_off[is_spec] - n_ext_per_tok[is_spec] - 1
                 fused_ids[is_spec] = spec_tok_ids[batch_idx[is_spec], spec_j]
@@ -851,7 +861,7 @@ class DraftRunner(ModelRunner):
         if ev: ev[2].record()
 
         glue_prenorm = None
-        if self.config.use_eagle:
+        if self.config.use_eagle_or_phoenix:
             fused_hs_flat = glue_decode_ctxt["hidden_states"]
             glue_decode_logits_flat, glue_prenorm = self.run_model(
                 glue_decode_ctxt["input_ids"], glue_decode_ctxt["positions"],
@@ -874,7 +884,7 @@ class DraftRunner(ModelRunner):
         if ev: ev[4].record()
 
         # --- Extract K+1 logits/prenorms at rec+spec positions ---
-        if self.config.use_eagle:
+        if self.config.use_eagle_or_phoenix:
             # Packed layout: rec at cu_seqlens_q[b] + n_ext[b], spec follows
             cu_q = glue_decode_ctxt["cu_seqlens_q"]
             rec_offsets = cu_q[:-1].long() + extend_counts.long()  # [B]
@@ -891,7 +901,7 @@ class DraftRunner(ModelRunner):
         # --- Build tree hidden states from K+1 prenorms ---
         tree_hidden_states = None
         if glue_prenorm is not None:
-            assert self.config.use_eagle, "ERROR in _build_tree_batch: use_eagle must be True when glue_prenorm is not None."
+            assert self.config.use_eagle_or_phoenix, "ERROR in _build_tree_batch: use_eagle_or_phoenix must be True when glue_prenorm is not None."
             # Vectorized: for each (b, depth), repeat prenorm by fan_out[depth]
             # fan_out_t[depth] for hits, fan_out_t_miss[depth] for misses
             fan_hit = self.config.fan_out_t  # [K+1]
@@ -904,12 +914,21 @@ class DraftRunner(ModelRunner):
             )  # [B, K+1]
             reps_flat = per_batch_fan.reshape(-1)  # [B*(K+1)]
 
-            prenorms_flat = glue_prenorm_kp1.reshape(B * (K + 1), -1)   # [B*(K+1), d]
-            tree_hidden_states = torch.repeat_interleave(prenorms_flat, reps_flat, dim=0)
+            if self.config.use_eagle:
+                prenorms_flat = glue_prenorm_kp1.reshape(B * (K + 1), -1)   # [B*(K+1), d]
+                tree_hidden_states = torch.repeat_interleave(prenorms_flat, reps_flat, dim=0)
+            else:
+                assert self.config.use_phoenix
+                # Phoenix conditions on target activations (recovery slot), not prenorms.
+                # The recovery activation per request is at extend_eagle_acts_batch[i, extend_counts[i]].
+                rec_acts = extend_eagle_acts_batch[torch.arange(B, device=self.device), extend_counts.long()]  # [B, target_dim]
+                target_acts_expanded = rec_acts.unsqueeze(1).expand(B, K + 1, -1)  # [B, K+1, target_dim]
+                acts_flat = target_acts_expanded.reshape(B * (K + 1), -1)  # [B*(K+1), target_dim]
+                tree_hidden_states = torch.repeat_interleave(acts_flat, reps_flat, dim=0)
 
         # --- Fork tokens from K+1 logits ---
         # Need [B, K+1] input_ids for forking (rec + spec tokens)
-        if self.config.use_eagle:
+        if self.config.use_eagle_or_phoenix:
             gd_for_fork = gd_view  # [B, K+1] already computed above
         else:
             gd_for_fork = glue_decode_input_ids.reshape(B, K + 1)
@@ -939,7 +958,16 @@ class DraftRunner(ModelRunner):
             B=B,
             K=K,
         )
-        target_recovery_activations = None
+        # Phoenix tree decode reuses the recovery activation per request.
+        # In the new layout it lives at extend_eagle_acts_batch[i, extend_counts[i]].
+        if self.config.use_phoenix:
+            ext_acts_p = partial_tree_decode_args["extend_eagle_acts"]
+            ext_counts_p = partial_tree_decode_args["extend_counts"]
+            target_recovery_activations = ext_acts_p[
+                torch.arange(ext_acts_p.shape[0], device=self.device), ext_counts_p.long()
+            ]
+        else:
+            target_recovery_activations = None
         tree_decode_args = {
             "metadata_ints": _pre_metadata_ints,
             "input_ids": forked_rec_tokens,
@@ -987,7 +1015,7 @@ class DraftRunner(ModelRunner):
         )
 
         hidden_states = payload.get("hidden_states")
-        if self.config.use_eagle:
+        if self.config.use_eagle_or_phoenix:
             logits, prenorm = self.run_model(current_input_ids, step_rope_positions[depth], is_prefill=False, last_only=False, tree_decode_step=depth, cache_hits=payload["cache_hits"], hidden_states=hidden_states)
             assert spec_activations is not None
             if self.config.use_eagle:
@@ -1024,7 +1052,7 @@ class DraftRunner(ModelRunner):
         spec_activations = torch.empty(
             N, K, self.hidden_states_dim,
             dtype=self.hf_config.torch_dtype, device=self.device
-        ) if self.config.use_eagle else None
+        ) if self.config.use_eagle_or_phoenix else None
 
         # Precompute all positions, context_lens, and slot_maps for all K steps
         # PERFORMANCE: no .clone() needed — these are not modified in-place

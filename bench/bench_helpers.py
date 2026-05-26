@@ -6,9 +6,9 @@ from random import randint
 from typing import List, Optional, Tuple
 from transformers import AutoTokenizer
 try:
-    from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
+    from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B, PHOENIX_70B
 except ImportError:
-    from bench_paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
+    from bench_paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B, PHOENIX_70B
 
 
 def _get_snapshot_path(base_path: str) -> str:
@@ -61,6 +61,15 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
                 return EAGLE3_QWEN_32B
             else:
                 raise ValueError(f"EAGLE draft not available for Qwen size {args.size}")
+
+    if getattr(args, "phoenix", False):
+        if args.llama:
+            if args.size == "70":
+                return PHOENIX_70B
+            else:
+                raise ValueError(f"Phoenix draft not available for Llama size {args.size}")
+        else:
+            raise ValueError(f"Phoenix draft not available for Qwen models")
 
     if args.llama:
         draft_size_to_model = {

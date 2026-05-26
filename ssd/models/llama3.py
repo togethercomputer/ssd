@@ -210,6 +210,7 @@ class LlamaModel(nn.Module):
         async_fan_out: int = 1,
         draft_async: bool = False,
         use_eagle: bool = False,
+        use_phoenix: bool = False,
         eagle_layers: list[int] | None = None,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
@@ -221,8 +222,9 @@ class LlamaModel(nn.Module):
         self.async_fan_out = async_fan_out
         self.draft_async = draft_async
         self.use_eagle = use_eagle
+        self.use_phoenix = use_phoenix
         self.eagle_layers = eagle_layers
-        print(f'[LlamaModel] use_eagle={use_eagle}, eagle_layers={eagle_layers}', flush=True)
+        print(f'[LlamaModel] use_eagle={use_eagle}, use_phoenix={use_phoenix}, eagle_layers={eagle_layers}', flush=True)
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -256,15 +258,19 @@ class LlamaModel(nn.Module):
         residual = None
         
         # Collect activations if use_eagle
-        collected_acts = [] if not self.draft and self.use_eagle else None
-
+        collected_acts = [] if not self.draft and (self.use_eagle or self.use_phoenix) else None
+        
         for layer_idx, layer in enumerate(self.layers):
             if collected_acts is not None and self.eagle_layers is not None and layer_idx in self.eagle_layers:
-                current_act = hidden_states if residual is None else hidden_states + residual
+                current_act = hidden_states if residual is None else hidden_states + residual 
                 collected_acts.append(current_act)
             hidden_states, residual = layer(positions, hidden_states, residual)
+        
+        hidden_states, _ = self.norm(hidden_states, residual) 
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not self.draft and self.use_phoenix:
+            assert self.eagle_layers is None, "ERROR in LlamaModel: use_phoenix and eagle_layers are not compatible"
+            collected_acts.append(hidden_states)
 
         if collected_acts is not None:
             if len(collected_acts) > 1:
@@ -293,6 +299,7 @@ class LlamaForCausalLM(nn.Module):
         draft: bool = False,
         speculate: bool = False,
         use_eagle: bool = False,
+        use_phoenix: bool = False,
         eagle_layers: list[int] | None = None,
         spec_k: int = 1,
         async_fan_out: int = 1,
@@ -307,10 +314,11 @@ class LlamaForCausalLM(nn.Module):
         self.async_fan_out = async_fan_out
         self.draft_async = draft_async
         self.use_eagle = use_eagle
+        self.use_phoenix = use_phoenix
         self.eagle_layers = eagle_layers
         self.tp_group = tp_group
         self.tp_size = tp_size
-
+        
         assert not (use_eagle and draft), "ERROR in LlamaForCausalLM: use_eagle should be on EagleDraftForCausalLM and not LlamaForCausalLM"
         assert not (tp_group is None and self.tp_size > 1), "ERROR in LlamaForCausalLM: tp_group is None and tp_size > 1"
 
@@ -324,6 +332,7 @@ class LlamaForCausalLM(nn.Module):
             async_fan_out,
             draft_async,
             use_eagle=use_eagle,
+            use_phoenix=use_phoenix,
             eagle_layers=eagle_layers,
             tp_group=tp_group,
             tp_size=self.tp_size,

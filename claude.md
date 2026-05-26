@@ -16,7 +16,7 @@ Then, for all these possible verification outcomes, we can in parallel draft a s
 
 There are two ways to run this algorithm:
 - Using the LLM engine defined in this SSD code base: `git/ssd/ssd/engine/llm_engine.py` -- can create an `LLMEngine` object and called `generate` on it with a prompt.
-- Using our private fork of SGLang (at `/work/avner/git/tgl`), and specifying `ASYNC_STANDALONE` or `ASYNC_EAGLE3` as the `--speculative-algorithm`, and then sending requests to this server in the standard manner.
+- Using our private fork of SGLang (at `/work/avner/git/tgl`), and specifying `ASYNC_STANDALONE`, `ASYNC_EAGLE3`, or `ASYNC_PHOENIX` as the `--speculative-algorithm`, and then sending requests to this server in the standard manner.
 
 ## Speculative decoding background
 Speculative decoding is an algorithm for speeding up the decoding phase of LLM inference.
@@ -65,7 +65,7 @@ SSD Repo (at `/work/avner/git/ssd/`):
     - `draft_runner.py`: Outer loop of the draft model process. This code is used in both the TGL and SSD inference engines.
     - `helpers/runner_helpers.py`: Dataclasses that handle communication between the draft and target processes for both TGL and SSD inference engines.
   - `layers/`: Implementation of the different components of the transformer architecture (including support for tensor parallelism).
-  - `models/`: Implementation of the full draft (including Eagle3) and target model classes, for both Llama and Qwen families of models.
+  - `models/`: Implementation of the full draft (including Eagle3 and Phoenix) and target model classes, for both Llama and Qwen families of models.
   - `utils/`: A variety of helper methods/classes, including `verify.py` that contains the logic for deciding which of the drafted tokens get accepted.
 - `tests/`: All the unit and integration tests for this repository.
   - `hf/`: This directory contains `test_ssd_vs_hf_reference.py`, the most important end-to-end test of the engines' performance.
