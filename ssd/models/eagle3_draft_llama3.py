@@ -220,7 +220,6 @@ class Eagle3DraftForCausalLM(nn.Module):
         draft: bool = False,
         speculate: bool = False,
         use_eagle: bool = False,
-        use_phoenix: bool = False,
         eagle_layers: list[int] | None = None,
         d_model_target: int = 4096,
         spec_k: int = 1,
@@ -235,7 +234,6 @@ class Eagle3DraftForCausalLM(nn.Module):
         assert draft, "ERROR in Eagle3DraftForLlama3: draft must be True"
         assert use_eagle, "ERROR in Eagle3DraftForLlama3: config.use_eagle must be True"
         assert eagle_layers is not None, "ERROR in Eagle3DraftForLlama3: eagle_layers must be set"
-        assert not use_phoenix, "ERROR in Eagle3DraftForLlama3: config.use_phoenix must be False"
 
         # this will be the draft that does tree decode, just needs a modified fwd pass that takes in hidden states and uses fc and dicts to sample, etc 
         self.config = config

@@ -39,25 +39,20 @@ class Config:
     communicate_logits: bool = False
     communicate_cache_hits: bool = False
 
-    # eagle3 / phoenix
-    use_eagle: bool = False 
-    use_phoenix: bool = False
-    eagle_layers: list[int] | None = None   
+    # eagle3
+    use_eagle: bool = False
+    eagle_layers: list[int] | None = None
     d_model_target: int | None = None
     tokenizer_path: str | None = None
 
     # Debugging
-    verbose: bool = False 
-    debug_mode: bool = False 
+    verbose: bool = False
+    debug_mode: bool = False
     max_steps: int | None = None
 
     @property
-    def max_blocks(self): 
+    def max_blocks(self):
         return (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
-
-    @property
-    def use_eagle_or_phoenix(self):
-        return self.use_eagle or self.use_phoenix
 
     def __post_init__(self):
         model = self.model
@@ -100,9 +95,8 @@ class Config:
 
                 assert sum(self.fan_out_list_miss) == sum(self.fan_out_list), "ERROR in Config: fan_out_list_miss must be the same as fan_out_list"
 
-        if self.use_eagle_or_phoenix:
-            if self.use_eagle and self.eagle_layers is None:
-                # Note: Currently we don't support Phoenix2, so only Eagle3 uses the `eagle_layers` config.
+        if self.use_eagle:
+            if self.eagle_layers is None:
                 L = self.hf_config.num_hidden_layers
                 self.eagle_layers = [2, L//2, L-3]
                 print(f'[Config] just set eagle_layers={self.eagle_layers}', flush=True)

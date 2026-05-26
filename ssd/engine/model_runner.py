@@ -14,7 +14,6 @@ from ssd.engine.sequence import Sequence
 from ssd.models.qwen3 import Qwen3ForCausalLM
 from ssd.models.llama3 import LlamaForCausalLM
 from ssd.models.eagle3_draft_llama3 import Eagle3DraftForCausalLM
-from ssd.models.phoenix_draft_llama3 import PhoenixLlamaForCausalLM
 from ssd.layers.sampler import Sampler
 from ssd.utils.context import set_context, reset_context, get_context
 from ssd.utils.loader import load_model
@@ -76,7 +75,6 @@ class ModelRunner:
         self.world_size = config.num_gpus if should_use_dist else 1
         self.rank = rank
         self.use_eagle = config.use_eagle
-        self.use_phoenix = config.use_phoenix
 
         if config.draft_async:
             self.draft_rank = config.num_gpus - 1
@@ -122,7 +120,7 @@ class ModelRunner:
             assert num_tp_gpus == 1, "ERROR in ModelRunner: draft should have tp_size=1"
             self.tp_pg = None # every rank is given an object from self.tp_pg, even tho draft doesnt participate it gets GROUP_NON_MEMBER object != None back, so we can't assert None here, we 
         
-        print(f'[model_runner] about to setup and warmup model and cudagraphs, is use_eagle={self.use_eagle}, is use_phoenix={self.use_phoenix}', flush=True)
+        print(f'[model_runner] about to setup and warmup model and cudagraphs, is use_eagle={self.use_eagle}', flush=True)
         model_type = self.setup_and_warmup_model_and_cudagraphs(config, self.hf_config, init_q, is_draft)
 
         if self.verbose: print(f'-----CAPTURED {model_type}CUDAGRAPH----', flush=True)
@@ -175,9 +173,6 @@ class ModelRunner:
         if config.use_eagle and is_draft:
             print(f'[EAGLE3] Loading Eagle3DraftForCausalLM as model_class', flush=True)
             model_class = Eagle3DraftForCausalLM
-        elif config.use_phoenix and is_draft:
-            print(f'[PHOENIX] Loading PhoenixDraftForCausalLM as model_class', flush=True)
-            model_class = PhoenixLlamaForCausalLM
         elif hf_config.model_type == 'llama':
             model_class = LlamaForCausalLM
         elif hf_config.model_type == 'qwen3':
@@ -197,12 +192,11 @@ class ModelRunner:
             tp_size=self.num_tp_gpus,
         )
         
-        if config.use_eagle_or_phoenix:
+        if config.use_eagle:
             kwargs['use_eagle'] = config.use_eagle
-            kwargs['use_phoenix'] = config.use_phoenix
             kwargs['eagle_layers'] = self.config.eagle_layers
 
-        if model_class in [Eagle3DraftForCausalLM, PhoenixLlamaForCausalLM]:
+        if model_class is Eagle3DraftForCausalLM:
             kwargs['d_model_target'] = config.d_model_target
             kwargs['debug_mode'] = config.debug_mode
             
@@ -269,7 +263,7 @@ class ModelRunner:
             self.graph_pools["decode"] = decode_graph_pool
             self.graphs["decode"] = decode_graphs
             self.graph_bs_list["decode"] = decode_graph_bs_list
-            if self.config.speculate and not (self.is_draft and self.config.use_eagle_or_phoenix):  # verify CG: target always, non-EAGLE draft for fan-out; EAGLE draft uses glue_decode CG instead
+            if self.config.speculate and not (self.is_draft and self.config.use_eagle):  # verify CG: target always, non-EAGLE draft for fan-out; EAGLE draft uses glue_decode CG instead
                 verify_graph_vars, verify_graph_pool, verify_graphs, verify_graph_bs_list = capture_verify_cudagraph(self)
                 self.graph_vars["verify"] = verify_graph_vars
                 self.graph_pools["verify"] = verify_graph_pool
@@ -281,7 +275,7 @@ class ModelRunner:
                 self.graph_pools["tree_decode"] = tree_decode_graph_pool
                 self.graphs["tree_decode"] = tree_decode_graphs
                 self.graph_bs_list["tree_decode"] = tree_decode_graph_bs_list
-            if self.config.speculate and self.is_draft and self.config.draft_async and self.config.use_eagle_or_phoenix:
+            if self.config.speculate and self.is_draft and self.config.draft_async and self.config.use_eagle:
                 glue_gv, glue_pool, glue_graphs, glue_bs_list = capture_glue_decode_cudagraph(self)
                 self.graph_vars["glue_decode"] = glue_gv
                 self.graph_pools["glue_decode"] = glue_pool
@@ -450,15 +444,10 @@ class ModelRunner:
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         
         hidden_states = None
-        if self.config.use_eagle_or_phoenix and self.is_draft:
+        if self.config.use_eagle and self.is_draft:
             num_tokens = num_seqs * max_model_len
             d_model_target = self.config.d_model_target or 4096
-            if self.config.use_eagle:
-                hidden_states = torch.zeros(num_tokens, 3 * d_model_target, dtype=self.hf_config.torch_dtype, device=self.device)
-            elif self.config.use_phoenix:
-                hidden_states = torch.zeros(num_tokens, d_model_target, dtype=self.hf_config.torch_dtype, device=self.device)
-            else:
-                raise ValueError(f"Unsupported model type: {self.config.use_eagle_or_phoenix}")
+            hidden_states = torch.zeros(num_tokens, 3 * d_model_target, dtype=self.hf_config.torch_dtype, device=self.device)
         
         self.run(seqs, True, hidden_states=hidden_states)
         torch.cuda.empty_cache()
@@ -599,13 +588,13 @@ class ModelRunner:
     @property
     def hidden_states_dim(self):
         # The dimension of the hidden states that are concatenated with the draft tokens embeddings
-        # as the input to the Eagle/Phoenix draft model.
-        assert self.config.use_eagle_or_phoenix and self.is_draft
-        return self.config.hf_config.hidden_size if self.config.use_eagle else self.config.d_model_target
+        # as the input to the Eagle draft model.
+        assert self.config.use_eagle and self.is_draft
+        return self.config.hf_config.hidden_size
 
     @property
     def eagle_acts_dim(self):
-        assert self.config.use_eagle_or_phoenix and not self.is_draft
+        assert self.config.use_eagle and not self.is_draft
         if self.config.eagle_layers:
             return len(self.config.eagle_layers) * self.config.hf_config.hidden_size
         else:
@@ -623,10 +612,10 @@ class ModelRunner:
             if is_tree_decode:
                 self.eager_tree_decode_plan(input_ids, positions, tree_decode_step, cache_hits)
             
-            if self.config.use_eagle_or_phoenix:
+            if self.config.use_eagle:
                 if self.is_draft:
                     assert hidden_states is not None, "hidden_states required for EAGLE draft"
-                    assert isinstance(self.model, Eagle3DraftForCausalLM) or isinstance(self.model, PhoenixLlamaForCausalLM)
+                    assert isinstance(self.model, Eagle3DraftForCausalLM)
                     prenorm = self.model(input_ids, positions, hidden_states)
                     logits = self.model.compute_logits(prenorm, last_only)
                     return logits, prenorm  # return prenorm as conditioning vector for next iteration
@@ -671,7 +660,7 @@ class ModelRunner:
 
         # Handle EAGLE returning (logits, conditioning_vector for next iter)
         conditioning = None
-        if self.config.use_eagle_or_phoenix:
+        if self.config.use_eagle:
             logits, conditioning = self.run_model(
                 input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
         else:

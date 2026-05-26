@@ -31,7 +31,6 @@ def parse_arguments():
     # Speculative decoding configuration
     parser.add_argument("--spec", action="store_true", help="Enable speculative decoding")
     parser.add_argument("--eagle", action="store_true", help="Enable eagle speculative decoding (implies --spec, uses default eagle draft for model)")
-    parser.add_argument("--phoenix", action="store_true", help="Enable eagle speculative decoding (implies --spec, uses default eagle draft for model)")
     parser.add_argument("--k", type=int, default=6, help="Speculative decoding k value")
     parser.add_argument("--async", action="store_true", help="Enable async speculative decoding")
     parser.add_argument("--f", type=int, default=3, help="Async fan out value")
@@ -81,11 +80,11 @@ def parse_arguments():
     assert not (args.qwen and '--llama' in sys.argv), "--llama and --qwen are mutually exclusive"
     if args.qwen:
         args.llama = False
-    if args.eagle or args.phoenix:
+    if args.eagle:
         args.spec = True
-        assert args.llama, "Eagle and Phoenix currently only support llama models"
-        assert args.temp == 0.0 and args.dtemp is None, "Eagle and Phoenix currently only support greedy decoding (temp=0)"
-        assert getattr(args, 'async', False), "Eagle and Phoenix currently only support async speculative decoding"
+        assert args.llama, "Eagle currently only supports llama models"
+        assert args.temp == 0.0 and args.dtemp is None, "Eagle currently only supports greedy decoding (temp=0)"
+        assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
     if getattr(args, 'async', False):
         args.spec = True
     return args
@@ -147,7 +146,6 @@ def initialize_wandb(args, run_name):
             "block_size": args.block_sz,
             "eager": args.eager,
             "eagle": args.eagle,
-            "phoenix": args.phoenix,
             "example_mode": args.example,
             "humaneval_mode": args.humaneval,
             "alpaca_mode": args.alpaca,
@@ -304,8 +302,6 @@ def main():
     llm_kwargs = create_llm_kwargs(args, draft_path)
     if args.eagle:
         llm_kwargs['use_eagle'] = True
-    if args.phoenix:
-        llm_kwargs['use_phoenix'] = True
     if args.debug:
         llm_kwargs['debug_mode'] = True
 
