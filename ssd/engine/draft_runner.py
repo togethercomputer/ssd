@@ -507,12 +507,27 @@ class DraftRunner(ModelRunner):
         speculation_response.send(self.async_pg, self.target_rank, tokenizer=self.tokenizer)
 
         if ev: ev[3].record()
+        # Per-iter meta for downstream analysis:
+        #   cache_hit:    number of requests in this batch whose prior speculation
+        #                 was found in the draft's tree cache (0..B).
+        #   accepted_prev: total tokens the target accepted from the *previous*
+        #                 spec iter (across the batch). Decoded from
+        #                 cache_keys[:, 1], which carries (accept_length - 1)
+        #                 from the target. The first iter has -1 as a sentinel
+        #                 ("no prior acceptance"); we clamp to 0 in that case.
+        # Gated on `ev` so the two .item() syncs (≈10-20μs total) only fire
+        # when profiling is on.
+        _meta = {"B": B, "K": K}
+        if ev is not None:
+            _meta["cache_hit"] = int(cache_hits.sum().item())
+            _meta["accepted_prev"] = int(
+                (cache_keys[:, 1] + 1).clamp(min=0).sum().item()
+            )
         profile.emit(
             "draft._service_spec_request",
             ["receive", "hit_cache", "send"],
             ev,
-            B=B,
-            K=K,
+            **_meta,
         )
 
         if NCCL_LOG:
