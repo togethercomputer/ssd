@@ -219,7 +219,7 @@ class ModelRunner:
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
             if config.async_nccl_port is not None:
-                _nccl_timeout = timedelta(minutes=20)
+                _nccl_timeout = timedelta(minutes=24 * 60)
                 _banner = "=" * 80
                 print(
                     f'\n{_banner}\n'
