@@ -966,6 +966,14 @@ class DraftRunner(ModelRunner):
             target_recovery_activations = ext_acts_p[
                 torch.arange(ext_acts_p.shape[0], device=self.device), ext_counts_p.long()
             ]
+            # Expand (B, dim) → (N=B*MQ_LEN, dim). Every branch of the tree decode
+            # needs to see the same recovery activation; without this expansion,
+            # _decode_tree_step stores a (B, dim) tensor into payload["hidden_states"]
+            # for depths >= 1, and run_tree_decode_cudagraph silently zero-pads it
+            # to (N, dim), poisoning branches 1..N-1 with zero hidden states.
+            target_recovery_activations = target_recovery_activations.repeat_interleave(
+                self.config.MQ_LEN, dim=0
+            )
         else:
             target_recovery_activations = None
         tree_decode_args = {
@@ -1016,6 +1024,25 @@ class DraftRunner(ModelRunner):
 
         hidden_states = payload.get("hidden_states")
         if self.config.use_eagle_or_phoenix:
+            # Diagnostic: Phoenix bug was that payload["hidden_states"] was stored as
+            # (B, dim) for depths >= 1, then silently zero-padded to (N, dim) by
+            # run_tree_decode_cudagraph — poisoning branches 1..N-1. With the fix in
+            # _build_tree_batch (target_recovery_activations is now repeat_interleaved
+            # to (N, dim)), depths 0 AND >=1 should both report shape (N, dim) here.
+            # Print once per unique (depth, hs_shape) so logs stay terse.
+            if not hasattr(self, "_phnx_hs_shapes_logged"):
+                self._phnx_hs_shapes_logged = set()
+            _hs_shape = tuple(hidden_states.shape) if hidden_states is not None else None
+            _key = (depth, _hs_shape, tuple(current_input_ids.shape))
+            if _key not in self._phnx_hs_shapes_logged:
+                self._phnx_hs_shapes_logged.add(_key)
+                print(
+                    f"[{_ts()}] [PHX_DIAG] _decode_tree_step depth={depth} "
+                    f"current_input_ids.shape={tuple(current_input_ids.shape)} "
+                    f"payload['hidden_states'].shape={_hs_shape} "
+                    f"use_phoenix={self.config.use_phoenix} MQ_LEN={self.config.MQ_LEN}",
+                    flush=True,
+                )
             logits, prenorm = self.run_model(current_input_ids, step_rope_positions[depth], is_prefill=False, last_only=False, tree_decode_step=depth, cache_hits=payload["cache_hits"], hidden_states=hidden_states)
             assert spec_activations is not None
             if self.config.use_eagle:
