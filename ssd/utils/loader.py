@@ -191,6 +191,10 @@ def load_safetensors_model(model: nn.Module, path: str, packed_modules_mapping: 
     for file in tqdm(safetensor_files, desc="Loading model files"):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
+                # Phoenix-Diffusion checkpoints ship a top-level `mask_tensor`
+                # weight that this runner does not consume — skip it.
+                if weight_name == "mask_tensor":
+                    continue
                 for k in packed_modules_mapping:
                     if k in weight_name:
                         v, shard_id = packed_modules_mapping[k]
