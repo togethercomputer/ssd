@@ -51,11 +51,7 @@ class ModelRunner:
         
         assert is_draft in [True, False], "ERROR in ModelRunner: is_draft must be True or False"
         self.is_draft = is_draft
-        if self.is_draft: 
-            if config.draft_hf_config.torch_dtype != config.hf_config.torch_dtype:
-                if self.verbose:
-                    print(f"Warning: Draft dtype {config.draft_hf_config.torch_dtype} differs from target {config.hf_config.torch_dtype}. Casting draft to {config.hf_config.torch_dtype}.")
-                config.draft_hf_config.torch_dtype = config.hf_config.torch_dtype
+        if self.is_draft:
             assert (config.draft_hf_config.vocab_size == config.hf_config.vocab_size) or config.use_eagle, "ERROR in ModelRunner: draft_hf_config.vocab_size != hf_config.vocab_size"
 
         self.hf_config = config.hf_config if not is_draft else config.draft_hf_config
