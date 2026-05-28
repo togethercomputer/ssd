@@ -46,10 +46,13 @@ from ssd.engine.helpers.runner_helpers import (
 from ssd.utils.dist_utils import init_custom_process_group
 
 
-LLAMA_1B = "/scratch/avner/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
-LLAMA_70B = "/scratch/avner/huggingface/hub/models--meta-llama--Llama-3.3-70B-Instruct/snapshots/6f6073b423013f6a7d4d9f39144961bfbfbc386b"
-EAGLE_PATH = "/scratch/avner/huggingface/hub/models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge/snapshots/63ebaa6585f96b89685adad8fdfa0da53be6a8fd"
-PHOENIX_PATH = "/scratch/avner/huggingface/hub/models--togethercomputer--phoenix-Llama-3p2-1B-Instruct-tgt-Llama-3p3-70b-instruct-UNTRAINED/snapshots/3af59d71514388e14d8685f2b684f74e3e311717"
+# LLAMA_1B = "/scratch/avner/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
+# LLAMA_70B = "/scratch/avner/huggingface/hub/models--meta-llama--Llama-3.3-70B-Instruct/snapshots/6f6073b423013f6a7d4d9f39144961bfbfbc386b"
+# EAGLE_PATH = "/scratch/avner/huggingface/hub/models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge/snapshots/63ebaa6585f96b89685adad8fdfa0da53be6a8fd"
+# PHOENIX_PATH = "/scratch/avner/huggingface/hub/models--togethercomputer--phoenix-Llama-3p2-1B-Instruct-tgt-Llama-3p3-70b-instruct-UNTRAINED/snapshots/3af59d71514388e14d8685f2b684f74e3e311717"
+
+KIMI_K25 = "/data/huggingface/hub/models--nvidia--Kimi-K2.5-NVFP4"
+KIMI_K25_PHOENIX = "/data/huggingface/hub/models--togethercomputer--phoenix-3layer-kimi-k25-lookahead16"
 
 
 def _free_port() -> int:
@@ -315,9 +318,9 @@ def _run_one_kf(args, K: int, F: int, results: list):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default=LLAMA_70B,
+    parser.add_argument("--model", type=str, default=KIMI_K25,
                         help="Target model path (for vocab/hidden_size).")
-    parser.add_argument("--draft", type=str, default=LLAMA_1B,
+    parser.add_argument("--draft", type=str, default=KIMI_K25_PHOENIX,
                         help="Draft model path.")
     parser.add_argument("--eagle", action="store_true",
                         help="Use EAGLE3 draft (overrides --draft to the EAGLE path).")
@@ -342,11 +345,12 @@ def main():
 
     assert not (args.eagle and args.phoenix), "Pick at most one of --eagle / --phoenix"
     if args.eagle:
-        args.draft = EAGLE_PATH
-        args.model = LLAMA_70B
+        raise ValueError("EAGLE is not supported for Kimi-K2.5")
+        # if not args.draft: args.draft = EAGLE_PATH
+        # if not args.model: args.model = LLAMA_70B
     elif args.phoenix:
-        args.draft = PHOENIX_PATH
-        args.model = LLAMA_70B
+        if not args.draft: args.draft = KIMI_K25_PHOENIX
+        if not args.model: args.model = KIMI_K25
 
     for p in (args.model, args.draft):
         assert os.path.isdir(p), f"Not a directory: {p}"
