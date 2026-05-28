@@ -71,7 +71,7 @@ class Config:
         assert os.path.isdir(model)
 
         assert 1 <= self.num_gpus <= 8 # this codebase only works on one node
-        self.hf_config = AutoConfig.from_pretrained(model)
+        self.hf_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
 
         # Multimodal targets (e.g. Kimi K2.5) nest the LM config under `text_config`. The rest of this
         # file expects a flat LM-style config (num_hidden_layers, hidden_size, rope_theta, ...), so
@@ -87,7 +87,7 @@ class Config:
                 self.max_model_len = self.hf_config.max_position_embeddings
         else:
             draft = self.draft
-            self.draft_hf_config = AutoConfig.from_pretrained(draft)
+            self.draft_hf_config = AutoConfig.from_pretrained(draft, trust_remote_code=True)
             if self.max_model_len:
                 self.max_model_len = min(
                     self.max_model_len, self.draft_hf_config.max_position_embeddings)
