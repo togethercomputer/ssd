@@ -226,7 +226,7 @@ def _exit_draft(pg, draft_rank: int, device: torch.device):
     send_tensor(cmd, pg, draft_rank, name="exit cmd")
 
 
-def _run_one_kf(args, K: int, F: int, results: list):
+def _run_one_kf(args, K: int, F: int, results: list, csv_file=None):
     port = _free_port()
     target_cfg = _build_target_config(args, port, K, F)
     draft_cfg = DraftRunner.create_draft_config(target_cfg)
@@ -300,6 +300,11 @@ def _run_one_kf(args, K: int, F: int, results: list):
             results.append((K, F, B, ms))
             print(f"[bench] K={K:>2} F={F:>2} B={B:>4}: {ms:8.3f} ms/iter",
                   flush=True)
+            if csv_file is not None:
+                # Append + flush as we go so partial results survive a crash/hang.
+                csv_file.write(f"{K},{F},{B},{ms:.4f}\n")
+                csv_file.flush()
+                os.fsync(csv_file.fileno())
     finally:
         try:
             _exit_draft(pg, draft_rank, target_device)
@@ -365,10 +370,23 @@ def main():
     print(f"[bench] sweep: K={args.lookaheads} F={args.fanouts} B={args.batch_sizes}",
           flush=True)
 
+    # Open the CSV up front (header + flush) and write each row as it's measured
+    # so partial results are persisted even if a later (K, F) combo hangs/crashes.
+    csv_file = None
+    if args.csv_out:
+        csv_file = open(args.csv_out, "w")
+        csv_file.write("K,F,B,ms_per_iter\n")
+        csv_file.flush()
+        print(f"[bench] streaming results to {args.csv_out}", flush=True)
+
     results = []  # (K, F, B, ms_per_iter)
-    for K in args.lookaheads:
-        for F in args.fanouts:
-            _run_one_kf(args, K, F, results)
+    try:
+        for K in args.lookaheads:
+            for F in args.fanouts:
+                _run_one_kf(args, K, F, results, csv_file=csv_file)
+    finally:
+        if csv_file is not None:
+            csv_file.close()
 
     print("\n=== Results ===")
     print(f"{'K':>4} {'F':>4} {'B':>6} {'ms/iter':>12}")
@@ -376,10 +394,6 @@ def main():
         print(f"{K:>4} {F:>4} {B:>6} {ms:>12.3f}")
 
     if args.csv_out:
-        with open(args.csv_out, "w") as f:
-            f.write("K,F,B,ms_per_iter\n")
-            for K, F, B, ms in results:
-                f.write(f"{K},{F},{B},{ms:.4f}\n")
         print(f"[bench] wrote {args.csv_out}", flush=True)
 
 
