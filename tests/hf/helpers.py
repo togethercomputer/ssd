@@ -31,6 +31,7 @@ QWEN3_0_6B_SNAPSHOT = "/data/shared/huggingface/hub/models--Qwen--Qwen3-0.6B/sna
 EAGLE3_LLAMA_8B_SNAPSHOT = "/data/shared/huggingface/hub/models--lmsys--SGLang-EAGLE3-Llama-3.1-8B-Instruct-SpecForge/snapshots/4a8e38f7dbee5d6dc82369f59a58540855fe09af"
 EAGLE3_QWEN3_8B_SNAPSHOT = "/data/shared/huggingface/hub/models--AngelSlim--Qwen3-8B_eagle3/snapshots/9629dfce7a4a10564dd48d3e5485c3976095653c"
 
+PHOENIX_LLAMA_8B_SNAPSHOT = "/data/avner/checkpoints/phoenix-4layer-llama-3p1-8b-lookahead16"
 
 def require_8b_target() -> str:
     assert Path(LLAMA_3_1_8B_SNAPSHOT).is_dir(), f"Llama-3.1-8B snapshot not found at {LLAMA_3_1_8B_SNAPSHOT}"
@@ -57,6 +58,11 @@ def require_eagle_llama_8b_draft() -> str:
     return EAGLE3_LLAMA_8B_SNAPSHOT
 
 
+def require_phoenix_llama_8b_draft() -> str:
+    assert Path(PHOENIX_LLAMA_8B_SNAPSHOT).is_dir(), f"Phoenix-4layer-Llama3.1-8B snapshot not found at {PHOENIX_LLAMA_8B_SNAPSHOT}"
+    return PHOENIX_LLAMA_8B_SNAPSHOT
+
+
 def require_eagle_qwen3_8b_draft() -> str:
     assert Path(EAGLE3_QWEN3_8B_SNAPSHOT).is_dir(), f"EAGLE3 Qwen3 snapshot not found at {EAGLE3_QWEN3_8B_SNAPSHOT}"
     return EAGLE3_QWEN3_8B_SNAPSHOT
@@ -71,6 +77,8 @@ def _get_speculative_algorithm(speculator_type: str) -> str:
         return "ASYNC_EAGLE3"
     elif speculator_type == "sync_eagle":
         return "EAGLE3"
+    elif speculator_type == "phoenix":
+        return "ASYNC_PHOENIX"
     else:
         raise ValueError(f"unknown speculator type: {speculator_type}")
 
@@ -114,7 +122,7 @@ def launch_tgl_server(
         # "--disable-cuda-graph",
     ]
 
-    if speculator_type in ["standalone", "eagle"]:
+    if speculator_type in ["standalone", "eagle", "phoenix"]:
         if backup == "force-jit":
             cmd.append("--speculative-async-jit-speculate")
             cmd.append("--speculative-async-force-jit-speculate")
@@ -142,6 +150,14 @@ def launch_tgl_server(
             draft_cmd.append("--jit-speculate")
         if backup == "force-jit":
             draft_cmd.append("--force-jit-speculate")
+        if speculator_type == "phoenix":
+            draft_cmd.append("--use-phoenix")
+            draft_cmd.append("--d-model-target", "4096")
+            draft_cmd.append("--tokenizer-path", "/data/shared/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/")
+        if speculator_type == "eagle":
+            draft_cmd.append("--use-eagle")
+            draft_cmd.append("--d-model-target", "4096")
+            draft_cmd.append("--tokenizer-path", "/data/shared/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/")
         
         print(f"[tgl] Launching draft: {' '.join(draft_cmd)}", flush=True)
         draft_process = subprocess.Popen(draft_cmd, start_new_session=True, env=env)

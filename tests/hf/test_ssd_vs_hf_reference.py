@@ -10,13 +10,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ssd import LLM, SamplingParams
 from .eagle3_hf import Eagle3Model, load_eagle3_specforge
-from .helpers import require_8b_target, require_eagle_llama_8b_draft, require_1b_draft, launch_tgl_server, wait_for_server, kill_server
+from .phoenix_hf import PhoenixModel, load_phoenix_specforge
+from .helpers import require_8b_target, require_eagle_llama_8b_draft, require_1b_draft, require_phoenix_llama_8b_draft, launch_tgl_server, wait_for_server, kill_server
 
 
 PORT = 40023
 LOGIT_GAP_THRESHOLD = 0.3
 EAGLE_LAYERS = [2, 16, 29]
 D_MODEL = 4096
+PHOENIX_LAYERS = [31]
 
 ASYNC_BACKUPS = ["force-jit", "jit", "fast"]
 SPECULATOR_TYPES = ["standalone", "eagle"]
@@ -26,7 +28,7 @@ CROSS_NODE = [True, False]
 # @pytest.mark.parametrize("cross_node", [False])
 # @pytest.mark.parametrize("backup", ["force-jit"])
 @pytest.mark.parametrize("backup", ["fast", "jit", "force-jit"])
-@pytest.mark.parametrize("speculator_type", ["eagle", "standalone"])
+@pytest.mark.parametrize("speculator_type", ["phoenix"])
 @pytest.mark.parametrize("cross_node", [False])
 @pytest.mark.parametrize("engine", ["tgl"])
 @pytest.mark.parametrize("max_new_tokens", [128])
@@ -34,10 +36,17 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
     lookahead = 4
     fanout = 3
     eagle = speculator_type in ["eagle", "sync_eagle"]
-    sync_speculator = speculator_type in ["sync_standalone", "sync_eagle"]
+    phoenix = speculator_type in ["phoenix", "sync_phoenix"]
+    sync_speculator = speculator_type in ["sync_standalone", "sync_eagle", "sync_phoenix"]
     dtype = torch.bfloat16
     target_path = require_8b_target()
-    draft_path = require_eagle_llama_8b_draft() if eagle else require_1b_draft()
+    if eagle:
+        draft_path = require_eagle_llama_8b_draft()
+    elif phoenix:
+        draft_path = require_phoenix_llama_8b_draft()
+    else:
+        draft_path = require_1b_draft()
+
     trace_dir = tmp_path / "trace"
     trace_dir.mkdir(exist_ok=True)
     os.environ["SSD_DUMP_TENSORS_DIR"] = str(trace_dir)
@@ -107,6 +116,12 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
                 print(f"[{engine}] draft process stopped", flush=True)
 
     elif engine == "ssd":
+        if eagle:
+            eagle_layers = EAGLE_LAYERS
+        elif phoenix:
+            eagle_layers = PHOENIX_LAYERS
+        else:
+            eagle_layers = None
         ssd_kwargs = dict(
             enforce_eager=False,
             num_gpus=2,
@@ -124,7 +139,8 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
             communicate_cache_hits=True,
             communicate_logits=True,
             use_eagle=eagle,
-            eagle_layers=EAGLE_LAYERS if eagle else None,
+            use_phoenix=phoenix,
+            eagle_layers=eagle_layers,
         )
         llm = None
         try:
@@ -198,6 +214,12 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
             dtype=dtype,
         )
         draft_model.eval()
+    elif phoenix:
+        draft_model = load_phoenix_specforge(
+            draft_path, target_model.config.hidden_size, draft_device,
+            dtype=dtype,
+        )
+        draft_model.eval()
     else:
         assert speculator_type == "standalone"
         draft_model = AutoModelForCausalLM.from_pretrained(draft_path, torch_dtype=dtype).to(draft_device)
@@ -214,9 +236,12 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
         completion_tokens,
         backup=backup,
         eagle=eagle,
+        phoenix=phoenix,
         lookahead=lookahead,
         tokenizer=tokenizer,
     )
+    if phoenix:
+        return
 
     # COMPARE SPECULATIONS TO HF REFERENCE
     print(f"====================================================")
@@ -229,6 +254,7 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
         prompt_tokens,
         completion_tokens,
         eagle=eagle,
+        phoenix=phoenix,
         backup=backup,
         tokenizer=tokenizer,
         engine=engine,
@@ -288,11 +314,12 @@ def compare_completion_to_hf_reference(
 
 def full_ssd_simulation(
     target_model: AutoModelForCausalLM,
-    draft_model: AutoModelForCausalLM | Eagle3Model,
+    draft_model: AutoModelForCausalLM | Eagle3Model | PhoenixModel,
     prompt_tokens: list[int],
     completion_tokens: list[int],
     backup: str = "force-jit",
     eagle: bool = False,
+    phoenix: bool = False,
     lookahead: int = 4,
     full_target_logits: torch.Tensor = None,
     full_target_activations: torch.Tensor = None, # Note: These should already be projected into the draft space.
@@ -305,15 +332,15 @@ def full_ssd_simulation(
     all_tokens_tensor = torch.tensor([all_tokens], device=draft_model.device, dtype=torch.long)
     draft_device = draft_model.device
     dtype = draft_model.lm_head.weight.dtype
-    if full_target_activations is None and eagle:
-        full_target_activations = get_hf_target_activations_for_eagle(target_model, all_tokens).to(draft_model.device)
+    if full_target_activations is None and (eagle or phoenix):
+        full_target_activations = get_hf_target_activations_for_eagle_or_phoenix(target_model, all_tokens, eagle, phoenix).to(draft_model.device)
         if duplicate_first_token:
             full_target_activations = torch.cat([
                 full_target_activations[:1],
                 full_target_activations
             ])
-            full_target_activations = draft_model.fc(full_target_activations.to(dtype=dtype))
-            # print(f"[SIMULATION] full_target_activations.shape: {full_target_activations.shape}")
+            if eagle:
+                full_target_activations = draft_model.fc(full_target_activations.to(dtype=dtype))
         else:
             raise ValueError("Unsupported at the moment")
 
@@ -336,7 +363,7 @@ def full_ssd_simulation(
         if tokens_remaining < lookahead + 1:
             break
 
-        if eagle:
+        if eagle or phoenix:
             if backup == "force-jit" or (not cache_hit and backup == "jit") or cache_hit:
 
                 # For cache hits, we don't have the target activations from the previous round.
@@ -358,11 +385,15 @@ def full_ssd_simulation(
                     # print(f"[SIMULATION] current_activations.shape: {current_activations.shape}")
                     if i > 0:
                         # print(f"[SIMULATION] draft_activations.shape: {draft_activations.shape}")
-                        current_activations = torch.cat([current_activations, draft_activations[-1:]])
+                        if phoenix:
+                            current_activations = torch.cat([current_activations, full_target_activations[base_len - 1:base_len]])
+                        else:
+                            current_activations = torch.cat([current_activations, draft_activations[-1:]])
                     draft_activations = draft_model.forward_with_cond(current_prefix, torch.arange(curr_len, device=draft_device), current_activations)
                 speculation_activations = draft_model.norm(draft_activations[-(lookahead + 1):])
                 speculation_logits = draft_model.lm_head(speculation_activations)
-                speculation_logits = convert_to_full_vocab_logits(draft_model, speculation_logits)
+                if eagle:
+                    speculation_logits = convert_to_full_vocab_logits(draft_model, speculation_logits)
                 speculation_preds = speculation_logits.argmax(dim=-1)
             else:
                 # Fast speculation on cache miss: the engine sends zeros as the K speculation
@@ -378,7 +409,8 @@ def full_ssd_simulation(
                     current_activations,
                 )
                 recovery_logits = draft_model.lm_head(draft_model.norm(draft_activations[-1:]))
-                recovery_logits = convert_to_full_vocab_logits(draft_model, recovery_logits)
+                if eagle:
+                    recovery_logits = convert_to_full_vocab_logits(draft_model, recovery_logits)
 
                 speculation_logits = torch.full((lookahead + 1, draft_model.config.vocab_size), float("-inf"), device=draft_device, dtype=dtype)
                 speculation_logits[:, 0] = 0.0
@@ -576,7 +608,7 @@ def compare_completion_to_hf_reference_eagle(
 
 
 
-def validate_request_and_response(request, response, request_num, eagle: bool = False):
+def validate_request_and_response(request, response, request_num, eagle: bool = False, phoenix: bool = False):
     assert request["cache_keys"].shape[0] == 1
     assert request["num_tokens"].shape[0] == 1
     cache_keys = request["cache_keys"][0]
@@ -586,7 +618,7 @@ def validate_request_and_response(request, response, request_num, eagle: bool = 
     else:
         assert num_accepted >= 0
 
-    if eagle:
+    if eagle or phoenix:
         assert request["extend_token_ids"].shape[0] == 1
         assert request["extend_counts"].shape[0] == 1
         assert request["extend_activations"].shape[0] == 1
@@ -602,6 +634,7 @@ def compare_speculations_to_hf_reference(
     prompt_tokens: list[int],
     completion_tokens: list[int],
     eagle: bool = False,
+    phoenix: bool = False,
     backup: str = "force-jit",
     tokenizer: AutoTokenizer = None,
     engine: str = "tgl",
@@ -619,11 +652,11 @@ def compare_speculations_to_hf_reference(
     speculation_requests = [torch.load(f) for f in speculation_request_files]
     speculation_responses = [torch.load(f) for f in speculation_response_files]
 
-    if not eagle:
+    if not eagle and not phoenix:
         prompt_tokens_from_prefill_request = prefill_request["input_ids"].tolist()
         assert prompt_tokens_from_prefill_request == prompt_tokens, f"{prompt_tokens_from_prefill_request=} != {prompt_tokens=}"
     else:
-        hf_full_eagle_acts = get_hf_target_activations_for_eagle(target_model, all_tokens).to(draft_model.device)
+        hf_full_eagle_acts = get_hf_target_activations_for_eagle_or_phoenix(target_model, all_tokens, eagle, phoenix).to(draft_model.device)
         hf_full_eagle_acts = torch.cat([
             hf_full_eagle_acts[:1],
             hf_full_eagle_acts
@@ -643,7 +676,7 @@ def compare_speculations_to_hf_reference(
     num_tokens = []
     cache_hits = []
     logits = []
-    if eagle:
+    if eagle or phoenix:
         extend_token_ids = []
         extend_counts = []
         extend_activations = []
@@ -652,7 +685,7 @@ def compare_speculations_to_hf_reference(
     for i in range(len(speculation_requests)):
         request = speculation_requests[i]
         response = speculation_responses[i]
-        validate_request_and_response(request, response, i, eagle)
+        validate_request_and_response(request, response, i, eagle, phoenix)
 
         cache_keys = request["cache_keys"][0]
         num_tokens.append(request["num_tokens"][0].item())
@@ -664,7 +697,7 @@ def compare_speculations_to_hf_reference(
             # Does the speculation contain the recovery token? I think it does?
             prefixes.append(prefixes[-1] + speculations[-1][:num_accepted[-1]] + [rec_token])
 
-        if eagle:
+        if eagle or phoenix:
             extend_token_ids.append(request["extend_token_ids"][0])
             extend_counts.append(request["extend_counts"][0].item())
             extend_activations.append(request["extend_activations"][0])
@@ -794,11 +827,18 @@ def compare_speculations_to_hf_reference(
     # assert max_gap < LOGIT_GAP_THRESHOLD, f"COMPARE SPECULATIONS TO HF REFERENCE: max gap {max_gap} exceeds threshold {LOGIT_GAP_THRESHOLD}, {all_gaps=}"
 
 
-def get_hf_target_activations_for_eagle(target_model, all_tokens: list[int]) -> torch.Tensor:
+def get_hf_target_activations_for_eagle_or_phoenix(target_model, all_tokens: list[int], eagle: bool = False, phoenix: bool = False) -> torch.Tensor:
+    if eagle:
+        assert not phoenix
+        layers = EAGLE_LAYERS
+    elif phoenix:
+        layers = PHOENIX_LAYERS
+    else:
+        raise ValueError(f"Invalid speculator type: {eagle=}, {phoenix=}")
     with torch.no_grad():
         ids = torch.tensor([all_tokens], device=target_model.device, dtype=torch.long)
         out = target_model(ids, output_hidden_states=True, use_cache=False)
-    acts = [out.hidden_states[li].squeeze(0).float() for li in EAGLE_LAYERS]
+    acts = [out.hidden_states[li].squeeze(0).float() for li in layers]
     return torch.cat(acts, dim=-1).detach()  # [N, 3*D] 
 
 
