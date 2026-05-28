@@ -46,9 +46,16 @@ class Config:
     d_model_target: int | None = None
     tokenizer_path: str | None = None
 
+    # Runtime dtype for both target and draft. When set, overrides whatever
+    # the checkpoints' config.json files say. FA4 only supports fp16/bf16, so
+    # callers (e.g. the sglang scheduler) should pass the target server's
+    # resolved dtype here. Left as None for standalone callers that are happy
+    # to inherit dtype from the checkpoints.
+    dtype: torch.dtype | None = None
+
     # Debugging
-    verbose: bool = False 
-    debug_mode: bool = False 
+    verbose: bool = False
+    debug_mode: bool = False
     max_steps: int | None = None
 
     @property
@@ -121,6 +128,15 @@ class Config:
                 if target_max_pos != draft_max_pos:
                     print(f'[Config] Overriding eagle draft max_position_embeddings: {draft_max_pos} -> {target_max_pos}', flush=True)
                     self.draft_hf_config.max_position_embeddings = target_max_pos
+
+        if self.dtype is not None:
+            assert self.dtype in (torch.float16, torch.bfloat16), (
+                f"[Config] dtype={self.dtype} is not supported; FA4 requires "
+                f"float16 or bfloat16. Pass a supported dtype from the caller."
+            )
+            self.hf_config.torch_dtype = self.dtype
+            if self.draft_hf_config is not None:
+                self.draft_hf_config.torch_dtype = self.dtype
 
         if self.sampler_x is not None and not self.communicate_cache_hits:
             self.communicate_cache_hits = True
