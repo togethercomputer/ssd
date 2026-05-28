@@ -356,7 +356,7 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
         if os.path.exists(trace_path):
             os.remove(trace_path)  # avoid stale data from a prior run
 
-    n_timed = args.profile_iters if args.profile else args.num_iters
+    n_timed = args.profile_iters if args.profile_csv else args.num_iters
 
     try:
         # Spawn the DraftRunner.
@@ -431,7 +431,7 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
             ms = (time.perf_counter() - t0) * 1000.0 / n_timed
 
             results.append((K, F, B, ms))
-            note = " (profiled; ms/iter inflated by per-iter sync)" if args.profile else ""
+            note = " (profiled; ms/iter inflated by per-iter sync)" if args.profile_csv else ""
             print(f"[bench] K={K:>2} F={F:>2} B={B:>4}: {ms:8.3f} ms/iter{note}",
                   flush=True)
             if csv_file is not None:
@@ -517,7 +517,7 @@ def main():
         os.environ["SSD_PROFILE"] = "1"
 
     if args.profile_csv is not None and args.profile_trace_dir is None:
-        args.profile_trace_dir = os.path.join(os.path.dirname(args.profile_csv), "traces")
+        args.profile_trace_dir = os.path.join(os.path.dirname(args.profile_csv), "traces", f"{time.strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(args.profile_trace_dir, exist_ok=True)
 
     assert not (args.eagle and args.phoenix), "Pick at most one of --eagle / --phoenix"
