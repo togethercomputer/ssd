@@ -21,9 +21,11 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import signal
 import socket
+import statistics
 import sys
 import time
 from contextlib import closing
@@ -295,7 +297,41 @@ def _shutdown_draft(proc, pg, device, draft_rank, graceful: bool):
     _CURRENT_DRAFT_PROC = None
 
 
-def _run_one_kf(args, K: int, F: int, results: list, csv_file=None):
+def _aggregate_trace(trace_path: str, K: int, F: int, n_timed: int) -> list:
+    """Parse a DraftRunner chrome-trace JSON and aggregate per (B, group, label).
+
+    Each "X" event is one profiled segment: cat=group, name=label, dur=µs,
+    args carries the metadata (B, K). One draft process serves the whole
+    batch-size sweep for this (K, F), so events from all B values share the file;
+    we key by the B in args. For each (B, group, label) we keep the *last*
+    `n_timed` occurrences (= the timed iters; earlier ones are warmup) and report
+    mean/std. Returns rows: (K, F, B, group, label, mean_ms, std_ms, n).
+    """
+    with open(trace_path) as f:
+        data = json.load(f)
+
+    samples = {}  # (B, group, label) -> [ms in file/iter order]
+    for ev in data.get("traceEvents", []):
+        if ev.get("ph") != "X":
+            continue
+        meta = ev.get("args", {})
+        B = meta.get("B")
+        if B is None:  # groups without B meta (e.g. draft.idle) — skip
+            continue
+        key = (int(B), ev.get("cat"), ev.get("name"))
+        samples.setdefault(key, []).append(ev.get("dur", 0.0) / 1000.0)  # µs -> ms
+
+    rows = []
+    for (B, group, label), vals in sorted(samples.items()):
+        timed = vals[-n_timed:] if (n_timed and len(vals) >= n_timed) else vals
+        mean = sum(timed) / len(timed)
+        std = statistics.pstdev(timed) if len(timed) > 1 else 0.0
+        rows.append((K, F, B, group, label, mean, std, len(timed)))
+    return rows
+
+
+def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
+                prof_csv=None):
     global _CURRENT_DRAFT_PROC
     port = _free_port()
     target_cfg = _build_target_config(args, port, K, F)
@@ -306,6 +342,22 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None):
     proc = None
     pg = None
     success = False
+
+    # When building the granular CSV, have the draft dump a structured chrome
+    # trace for this (K, F). Env is read at the child's import time; since it's
+    # spawned fresh, setting it here (per K,F) is picked up by the child.
+    trace_path = None
+    if prof_csv is not None:
+        os.environ["SSD_PROFILE"] = "1"
+        os.environ["SSD_PROFILE_TRACE"] = "1"
+        os.environ["SSD_PROFILE_TRACE_NAME"] = f"draft_K{K}_F{F}"
+        trace_path = os.path.join(args.profile_trace_dir, f"draft_K{K}_F{F}.json")
+        os.environ["SSD_PROFILE_TRACE_OUT"] = trace_path
+        if os.path.exists(trace_path):
+            os.remove(trace_path)  # avoid stale data from a prior run
+
+    n_timed = args.profile_iters if args.profile else args.num_iters
+
     try:
         # Spawn the DraftRunner.
         ctx = mp.get_context("spawn")
@@ -368,16 +420,19 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None):
                 resp.receive(pg, draft_rank, batch_size=B)
 
             # Timed: includes target-side send + NCCL round-trip + draft compute.
+            # The trace aggregation keys off these being the LAST n_timed iters
+            # for this B, so run exactly n_timed here (warmup ran first).
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            for _ in range(args.num_iters):
+            for _ in range(n_timed):
                 req.send(pg, draft_rank)
                 resp.receive(pg, draft_rank, batch_size=B)
             torch.cuda.synchronize()
-            ms = (time.perf_counter() - t0) * 1000.0 / args.num_iters
+            ms = (time.perf_counter() - t0) * 1000.0 / n_timed
 
             results.append((K, F, B, ms))
-            print(f"[bench] K={K:>2} F={F:>2} B={B:>4}: {ms:8.3f} ms/iter",
+            note = " (profiled; ms/iter inflated by per-iter sync)" if args.profile else ""
+            print(f"[bench] K={K:>2} F={F:>2} B={B:>4}: {ms:8.3f} ms/iter{note}",
                   flush=True)
             if csv_file is not None:
                 # Append + flush as we go so partial results survive a crash/hang.
@@ -387,6 +442,32 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None):
         success = True
     finally:
         _shutdown_draft(proc, pg, target_device, draft_rank, graceful=success)
+
+    # After the draft has exited cleanly, its atexit hook has written the trace.
+    # Parse it into aggregated per-stage rows and append to the granular CSV.
+    if prof_csv is not None and trace_path is not None:
+        if success and os.path.exists(trace_path):
+            try:
+                rows = _aggregate_trace(trace_path, K, F, n_timed)
+                for (rK, rF, rB, group, label, mean, std, n) in rows:
+                    prof_csv.write(
+                        f"{rK},{rF},{rB},{group},{label},{mean:.4f},{std:.4f},{n}\n"
+                    )
+                prof_csv.flush()
+                os.fsync(prof_csv.fileno())
+                print(f"[bench] [K={K} F={F}] wrote {len(rows)} profile rows", flush=True)
+            except Exception as e:
+                print(f"[bench] [K={K} F={F}] failed to aggregate trace "
+                      f"{trace_path}: {e}", flush=True)
+            finally:
+                if not args.keep_traces:
+                    try:
+                        os.remove(trace_path)
+                    except OSError:
+                        pass
+        else:
+            print(f"[bench] [K={K} F={F}] no trace at {trace_path} "
+                  f"(draft did not exit cleanly?); skipping profile rows", flush=True)
 
 
 def main():
@@ -414,7 +495,30 @@ def main():
                         help="GPU device for this (simulator-target) process.")
     parser.add_argument("--csv-out", type=str, default=None,
                         help="Optional path to dump CSV results.")
+    parser.add_argument("--profile-csv", type=str, default=None,
+                        help="If set, we run profiling. Path for the granular per-stage CSV "
+                             "(K,F,B,group,label,mean_ms,std_ms,n). Implies --profile. "
+                             "Aggregate build+decode tree from group=draft.spec_iter "
+                             "labels build_tree+decode_tree; JIT speculate from "
+                             "group=draft._service_spec_request label=hit_cache.")
+    parser.add_argument("--profile-trace-dir", type=str, default=None,
+                        help="Directory for per-(K,F) chrome trace JSONs (the structured "
+                             "source the granular CSV is built from).")
+    parser.add_argument("--profile-iters", type=int, default=50,
+                        help="Timed iters per (K,F,B) used as profile samples (the last "
+                             "this-many per stage are aggregated into --profile-csv).")
+    parser.add_argument("--keep-traces", action="store_true",
+                        help="Keep the per-(K,F) chrome trace JSONs (default: delete after "
+                             "aggregating into --profile-csv).")
     args = parser.parse_args()
+
+    if args.profile_csv:
+        # Read by the draft child at its import time (inherited via spawn env).
+        os.environ["SSD_PROFILE"] = "1"
+
+    if args.profile_csv is not None and args.profile_trace_dir is None:
+        args.profile_trace_dir = os.path.join(os.path.dirname(args.profile_csv), "traces")
+        os.makedirs(args.profile_trace_dir, exist_ok=True)
 
     assert not (args.eagle and args.phoenix), "Pick at most one of --eagle / --phoenix"
     if args.eagle:
@@ -447,6 +551,14 @@ def main():
         csv_file.flush()
         print(f"[bench] streaming results to {args.csv_out}", flush=True)
 
+    prof_csv = None
+    if args.profile_csv:
+        os.makedirs(args.profile_trace_dir, exist_ok=True)
+        prof_csv = open(args.profile_csv, "w")
+        prof_csv.write("K,F,B,group,label,mean_ms,std_ms,n\n")
+        prof_csv.flush()
+        print(f"[bench] streaming granular profile to {args.profile_csv}", flush=True)
+
     _install_sigint_handler()
 
     results = []  # (K, F, B, ms_per_iter)
@@ -454,7 +566,8 @@ def main():
     try:
         for K in args.lookaheads:
             for F in args.fanouts:
-                _run_one_kf(args, K, F, results, csv_file=csv_file)
+                _run_one_kf(args, K, F, results, csv_file=csv_file,
+                            prof_csv=prof_csv)
     except KeyboardInterrupt:
         interrupted = True
         print("\n[bench] interrupted by user; cleaned up draft subprocess. "
@@ -462,6 +575,8 @@ def main():
     finally:
         if csv_file is not None:
             csv_file.close()
+        if prof_csv is not None:
+            prof_csv.close()
 
     print("\n=== Results ===")
     print(f"{'K':>4} {'F':>4} {'B':>6} {'ms/iter':>12}")
@@ -470,6 +585,8 @@ def main():
 
     if args.csv_out:
         print(f"[bench] wrote {args.csv_out}", flush=True)
+    if args.profile_csv:
+        print(f"[bench] wrote {args.profile_csv}", flush=True)
 
     if interrupted:
         sys.exit(130)  # conventional exit code for SIGINT

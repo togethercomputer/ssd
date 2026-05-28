@@ -1107,6 +1107,7 @@ class DraftRunner(ModelRunner):
             "draft._decode_tree",
             [f"step_{i}" for i in range(K)],
             ev,
+            B=B,
             K=K,
         )
 
@@ -1230,6 +1231,7 @@ class DraftRunner(ModelRunner):
                     "draft.spec_iter",
                     ["service", "build_tree", "decode_tree", "populate"],
                     ev,
+                    B=int(partial_tree_decode_args["num_tokens"].shape[0]),
                 )
                 profile.emit(
                     "draft.idle",
