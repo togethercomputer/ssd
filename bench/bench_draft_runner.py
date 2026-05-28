@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import os
+import signal
 import socket
 import sys
 import time
@@ -128,19 +129,34 @@ def _do_handshake(pg, draft_rank: int, device: torch.device) -> int:
     return int(ready.item())
 
 
-def _alloc_block_tables(B: int, num_tokens: int, K: int, max_blocks: int,
-                        block_size: int, num_kv_blocks: int,
+def _alloc_block_tables(B: int, num_tokens: int, K: int, mq_len: int,
+                        max_blocks: int, block_size: int, num_kv_blocks: int,
                         device: torch.device) -> torch.Tensor:
     """Hand each seq a contiguous run of distinct block ids.
 
-    We need to cover positions [0 .. num_tokens-1+K] = num_tokens+K positions.
-    Block_size=1 -> blocks_per_seq = num_tokens+K. We give a small pad too.
+    The draft addresses KV positions far beyond the sequence: tree decode reads
+    `step_positions = initial_positions + depth * MQ_LEN`, where
+    `initial_positions ≈ (num_tokens-1) + (K+1) + [0 .. MQ_LEN-1]` and depth runs
+    0..K-1 (see DraftRunner._compute_step_positions_and_slot_maps). The maximum
+    position touched is therefore:
+
+        max_pos = (num_tokens-1) + (K+1) + (MQ_LEN-1) + (K-1)*MQ_LEN
+                = num_tokens + K + K*MQ_LEN - 1
+
+    Under-sizing the table makes tree decode index the -1 padding, producing a
+    negative slot and an illegal CUDA memory access. We size to cover max_pos
+    (the +1 for context_len) plus a small pad.
     """
-    needed = (num_tokens + K + block_size - 1) // block_size + 2
-    assert needed <= max_blocks, f"block_table too narrow: need {needed}, have {max_blocks}"
+    max_pos = num_tokens + K + K * mq_len  # = (max addressed pos) + 1, generous
+    needed = (max_pos + block_size - 1) // block_size + 2
+    assert needed <= max_blocks, (
+        f"block_table too narrow: need {needed} blocks (max_pos≈{max_pos}), have "
+        f"max_blocks={max_blocks}. Raise --max-model-len or --block-size, or lower "
+        f"K/F/--prompt-len."
+    )
     assert B * needed <= num_kv_blocks, (
         f"not enough KV blocks: B={B} * needed={needed} = {B*needed} > "
-        f"num_kvcache_blocks={num_kv_blocks}. Lower --prompt-len, --batch-sizes, "
+        f"num_kvcache_blocks={num_kv_blocks}. Lower --prompt-len, --batch-sizes, K, F, "
         f"or raise --gpu-memory-utilization."
     )
     bt = torch.full((B, max_blocks), -1, dtype=torch.int32, device=device)
@@ -153,10 +169,12 @@ def _alloc_block_tables(B: int, num_tokens: int, K: int, max_blocks: int,
 def _do_prefill(pg, draft_rank: int, device: torch.device,
                 draft_cfg: Config, B: int, prompt_len: int,
                 max_blocks: int, num_kv_blocks: int,
-                eagle_act_dim: int, K_for_padding: int) -> torch.Tensor:
+                eagle_act_dim: int, K_for_padding: int,
+                mq_len: int) -> torch.Tensor:
     block_size = draft_cfg.kvcache_block_size
     block_tables = _alloc_block_tables(
-        B, prompt_len, K_for_padding, max_blocks, block_size, num_kv_blocks, device,
+        B, prompt_len, K_for_padding, mq_len, max_blocks, block_size,
+        num_kv_blocks, device,
     )
     vocab = draft_cfg.draft_hf_config.vocab_size
     input_ids_flat = torch.randint(
@@ -226,45 +244,106 @@ def _exit_draft(pg, draft_rank: int, device: torch.device):
     send_tensor(cmd, pg, draft_rank, name="exit cmd")
 
 
+# Handle to the currently-running draft subprocess, so a SIGINT handler can
+# force-kill it (which unblocks any in-flight NCCL recv in this process, since
+# the peer disappearing makes the collective error out).
+_CURRENT_DRAFT_PROC = None
+
+
+def _install_sigint_handler():
+    def _handler(signum, frame):
+        p = _CURRENT_DRAFT_PROC
+        if p is not None and p.is_alive():
+            print("\n[bench] SIGINT: killing draft subprocess...", flush=True)
+            try:
+                p.kill()
+            except Exception:
+                pass
+        # Re-raise as KeyboardInterrupt so the normal try/finally cleanup runs.
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _handler)
+
+
+def _shutdown_draft(proc, pg, device, draft_rank, graceful: bool):
+    """Tear down the draft subprocess + NCCL group. On the normal path we ask the
+    draft to exit over NCCL; on any abnormal exit (Ctrl+C, crash) we skip that
+    (it could hang against a wedged/dead peer) and force-terminate instead."""
+    global _CURRENT_DRAFT_PROC
+    if graceful and pg is not None and proc is not None and proc.is_alive():
+        try:
+            _exit_draft(pg, draft_rank, device)
+        except Exception as e:
+            print(f"[bench] exit signal failed: {e}", flush=True)
+
+    if proc is not None:
+        proc.join(timeout=30 if graceful else 5)
+        if proc.is_alive():
+            print("[bench] terminating draft subprocess", flush=True)
+            proc.terminate()
+            proc.join(timeout=10)
+        if proc.is_alive():
+            print("[bench] killing draft subprocess", flush=True)
+            proc.kill()
+            proc.join(timeout=5)
+
+    if pg is not None:
+        try:
+            dist.destroy_process_group(pg)
+        except Exception:
+            pass
+    _CURRENT_DRAFT_PROC = None
+
+
 def _run_one_kf(args, K: int, F: int, results: list, csv_file=None):
+    global _CURRENT_DRAFT_PROC
     port = _free_port()
     target_cfg = _build_target_config(args, port, K, F)
     draft_cfg = DraftRunner.create_draft_config(target_cfg)
 
-    # Spawn the DraftRunner.
     draft_rank = 1
-    ctx = mp.get_context("spawn")
-    proc = ctx.Process(target=_draft_entrypoint, args=(draft_cfg, draft_rank))
-    proc.start()
-
     target_device = torch.device(f"cuda:{args.target_gpu}")
-    torch.cuda.set_device(target_device)
-
-    pg = _make_async_pg_as_target(port, target_device)
-    print(f"[bench] [K={K} F={F}] NCCL group formed; handshaking...", flush=True)
-    num_kv_blocks = _do_handshake(pg, draft_rank, target_device)
-    print(f"[bench] [K={K} F={F}] draft num_kvcache_blocks={num_kv_blocks}",
-          flush=True)
-
-    eagle = draft_cfg.use_eagle_or_phoenix
-    if draft_cfg.use_eagle:
-        eagle_act_dim = 3 * draft_cfg.d_model_target
-    elif draft_cfg.use_phoenix:
-        eagle_act_dim = draft_cfg.d_model_target
-    else:
-        eagle_act_dim = 0
-    draft_dtype = draft_cfg.draft_hf_config.torch_dtype
-    vocab_size = target_cfg.hf_config.vocab_size  # draft now returns target-vocab logits
-    block_size = draft_cfg.kvcache_block_size
-    max_blocks = (draft_cfg.max_model_len + block_size - 1) // block_size
-
+    proc = None
+    pg = None
+    success = False
     try:
+        # Spawn the DraftRunner.
+        ctx = mp.get_context("spawn")
+        proc = ctx.Process(target=_draft_entrypoint, args=(draft_cfg, draft_rank))
+        proc.start()
+        _CURRENT_DRAFT_PROC = proc
+
+        torch.cuda.set_device(target_device)
+
+        pg = _make_async_pg_as_target(port, target_device)
+        print(f"[bench] [K={K} F={F}] NCCL group formed; handshaking...", flush=True)
+        num_kv_blocks = _do_handshake(pg, draft_rank, target_device)
+        print(f"[bench] [K={K} F={F}] draft num_kvcache_blocks={num_kv_blocks}",
+              flush=True)
+
+        eagle = draft_cfg.use_eagle_or_phoenix
+        if draft_cfg.use_eagle:
+            eagle_act_dim = 3 * draft_cfg.d_model_target
+        elif draft_cfg.use_phoenix:
+            eagle_act_dim = draft_cfg.d_model_target
+        else:
+            eagle_act_dim = 0
+        draft_dtype = draft_cfg.draft_hf_config.torch_dtype
+        vocab_size = target_cfg.hf_config.vocab_size  # draft now returns target-vocab logits
+        block_size = draft_cfg.kvcache_block_size
+        max_blocks = (draft_cfg.max_model_len + block_size - 1) // block_size
+        # Constant fan-out: MQ_LEN = sum(fan_out_list) = F * (K+1). (draft_cfg may not
+        # carry the dynamically-set MQ_LEN attribute after create_draft_config, so
+        # compute it directly.)
+        mq_len = F * (K + 1)
+
         for B in args.batch_sizes:
             block_tables = _do_prefill(
                 pg, draft_rank, target_device, draft_cfg,
                 B=B, prompt_len=args.prompt_len,
                 max_blocks=max_blocks, num_kv_blocks=num_kv_blocks,
                 eagle_act_dim=eagle_act_dim, K_for_padding=K,
+                mq_len=mq_len,
             )
 
             req = _build_spec_request(
@@ -305,20 +384,9 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None):
                 csv_file.write(f"{K},{F},{B},{ms:.4f}\n")
                 csv_file.flush()
                 os.fsync(csv_file.fileno())
+        success = True
     finally:
-        try:
-            _exit_draft(pg, draft_rank, target_device)
-        except Exception as e:
-            print(f"[bench] exit signal failed: {e}", flush=True)
-        proc.join(timeout=120)
-        if proc.is_alive():
-            print("[bench] draft did not exit cleanly; terminating", flush=True)
-            proc.terminate()
-            proc.join(timeout=10)
-        try:
-            dist.destroy_process_group(pg)
-        except Exception:
-            pass
+        _shutdown_draft(proc, pg, target_device, draft_rank, graceful=success)
 
 
 def main():
@@ -379,11 +447,18 @@ def main():
         csv_file.flush()
         print(f"[bench] streaming results to {args.csv_out}", flush=True)
 
+    _install_sigint_handler()
+
     results = []  # (K, F, B, ms_per_iter)
+    interrupted = False
     try:
         for K in args.lookaheads:
             for F in args.fanouts:
                 _run_one_kf(args, K, F, results, csv_file=csv_file)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[bench] interrupted by user; cleaned up draft subprocess. "
+              "Partial results below.", flush=True)
     finally:
         if csv_file is not None:
             csv_file.close()
@@ -395,6 +470,9 @@ def main():
 
     if args.csv_out:
         print(f"[bench] wrote {args.csv_out}", flush=True)
+
+    if interrupted:
+        sys.exit(130)  # conventional exit code for SIGINT
 
 
 if __name__ == "__main__":
