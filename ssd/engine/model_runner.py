@@ -365,6 +365,15 @@ class ModelRunner:
         if self.is_draft:
             if self.verbose:
                 print(f"[ModelRunner] Draft hard-exit", flush=True)
+            # os._exit() skips atexit handlers, so the profile trace (registered
+            # via atexit in ssd.utils.profile) would never be written. Flush +
+            # dump explicitly here. No-op unless SSD_PROFILE_TRACE=1.
+            try:
+                from ssd.utils import profile
+                profile.flush()
+                profile.dump_trace()
+            except Exception:
+                pass
             os._exit(0)
         # Target ranks: let the process return if we're a worker (subprocess),
         # main rank will be force-exited by the engine after it joins children.
