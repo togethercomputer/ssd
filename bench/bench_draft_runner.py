@@ -246,6 +246,23 @@ def _exit_draft(pg, draft_rank: int, device: torch.device):
     send_tensor(cmd, pg, draft_rank, name="exit cmd")
 
 
+# Buffer for the profile-only ACK the draft sends before its bulk response.
+_PROFILE_ACK_BUF = None
+
+
+def _recv_profile_ack(pg, draft_rank: int, device: torch.device):
+    """Mirror the real target (async_spec_worker._draft_forward): when profiling
+    is active the draft sends a 1-int ACK right before SpeculationResponse.send
+    (see draft_runner._service_spec_request). We must consume it, or the
+    untagged NCCL send/recv stream desyncs and both processes deadlock. .item()
+    forces a CPU wait for the NCCL stream so the recv actually completes."""
+    global _PROFILE_ACK_BUF
+    if _PROFILE_ACK_BUF is None:
+        _PROFILE_ACK_BUF = torch.zeros(1, dtype=torch.int32, device=device)
+    dist.recv(_PROFILE_ACK_BUF, src=draft_rank, group=pg)
+    _PROFILE_ACK_BUF.item()
+
+
 # Handle to the currently-running draft subprocess, so a SIGINT handler can
 # force-kill it (which unblocks any in-flight NCCL recv in this process, since
 # the peer disappearing makes the collective error out).
@@ -414,9 +431,15 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
                 communicate_cache_hits=False,
             )
 
+            # When profiling, the draft sends a 1-int ACK before each response;
+            # consume it here to keep the NCCL send/recv stream in sync.
+            profile_active = prof_csv is not None
+
             # Warmup
             for _ in range(args.warmup_iters):
                 req.send(pg, draft_rank)
+                if profile_active:
+                    _recv_profile_ack(pg, draft_rank, target_device)
                 resp.receive(pg, draft_rank, batch_size=B)
 
             # Timed: includes target-side send + NCCL round-trip + draft compute.
@@ -426,6 +449,8 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
             t0 = time.perf_counter()
             for _ in range(n_timed):
                 req.send(pg, draft_rank)
+                if profile_active:
+                    _recv_profile_ack(pg, draft_rank, target_device)
                 resp.receive(pg, draft_rank, batch_size=B)
             torch.cuda.synchronize()
             ms = (time.perf_counter() - t0) * 1000.0 / n_timed

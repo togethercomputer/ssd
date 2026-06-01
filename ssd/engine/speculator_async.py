@@ -5,6 +5,7 @@ from transformers import AutoTokenizer
 from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, SpeculatorBase
 from ssd.engine.helpers.runner_helpers import PrefillRequest, SpeculationRequest, SpeculationResponse
 from ssd.engine.sequence import Sequence
+from ssd.utils import profile
 from ssd.utils.misc import decode_tokens
 
 
@@ -203,7 +204,49 @@ class SpeculatorAsync(SpeculatorBase):
             self._speculation_request.extend_token_ids[i, n] = seq.recovery_token_id
 
     def _make_speculation_request(self, seqs: list[Sequence], eagle: bool):
+        # Profiling timeline mirrors tgl async_spec_worker._draft_forward:
+        #   ev[0] prep_start, ev[1] prep_done (before nccl_send),
+        #   ev[2] nccl_send_done (before ack recv), ev[3] ack_received
+        #   (before bulk recv), ev[4] bulk_recv_done.
+        # This tiles step.py's SpecDecodeStep.decode "handshake" segment, the
+        # same way sglang_draft tiles sglang_decode.handshake in tgl. ev is None
+        # when profiling is off. tgl's trailing tp_broadcast segment has no
+        # analogue here: the ssd async target isn't TP-sharded on this path.
+        ev = profile.new_events(5)
+        if ev: ev[0].record()
         speculation_request = self._prepare_speculation_request(seqs, eagle)
+        if ev: ev[1].record()
         speculation_request.send(self.async_pg, self.draft_runner_rank)
+        if ev: ev[2].record()
+        # Profile-only ACK: when profiling is active the draft sends a 1-int ACK
+        # right before its bulk response (see draft_runner._service_spec_request).
+        # We must consume it, or the untagged NCCL send/recv stream desyncs and
+        # both processes deadlock. Both sides gate on profile.is_active(), so the
+        # ACK is sent/received in lockstep. The wait on this recv is the
+        # "wait_for_draft" segment (target idle while the draft is still
+        # working); the subsequent bulk recv is just wire transfer.
+        #
+        # NCCL stream fix: dist.recv enqueues on the NCCL stream and returns
+        # CPU-immediately, so a cuda.Event.record() on the current stream would
+        # fire before the recv completes and lump its wait into the next
+        # segment. Calling .item() on the recv'd tensor forces a CPU-side wait
+        # for the NCCL stream, so the next event times the right region.
+        if ev is not None:
+            if not hasattr(self, "_profile_ack_recv_buf"):
+                self._profile_ack_recv_buf = torch.zeros(1, dtype=torch.int32, device=self.device)
+            dist.recv(self._profile_ack_recv_buf, src=self.draft_runner_rank, group=self.async_pg)
+            self._profile_ack_recv_buf.item()  # force NCCL stream sync
+            ev[3].record()
         self._speculation_response.receive(self.async_pg, self.draft_runner_rank, batch_size=len(seqs))
+        if ev is not None:
+            # Same NCCL stream fix for the bulk recv: read one int to force the
+            # CPU to wait for the bulk recv before ev[4] is recorded.
+            self._speculation_response.speculations.view(-1)[0].item()
+        if ev: ev[4].record()
+        profile.emit(
+            "target.spec_request",
+            ["prep", "nccl_send", "wait_for_draft", "bulk_recv"],
+            ev,
+            B=len(seqs),
+        )
         return self._speculation_response
