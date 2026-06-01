@@ -16,6 +16,14 @@ from .helpers import require_8b_target, require_eagle_llama_8b_draft, require_1b
 
 PORT = 40023
 LOGIT_GAP_THRESHOLD = 0.3
+# When reconstructing the engine's speculations with the HF reference draft, the
+# engine's speculated token must stay near the top of the HF draft's distribution
+# (only bf16-level numerical drift should separate them). A rank above this means
+# the reconstruction is conditioning on the wrong activation/position — a real bug.
+SPEC_RANK_THRESHOLD = 4
+# The acceptance length recomputed from the engine's dumped prefixes must match the
+# engine's own reported spec_accept_length to within this tolerance.
+ACCEPT_LENGTH_TOLERANCE = 0.03
 EAGLE_LAYERS = [2, 16, 29]
 D_MODEL = 4096
 # Phoenix conditions on the target's final post-norm hidden state (the vector
@@ -26,20 +34,21 @@ D_MODEL = 4096
 PHOENIX_LAYERS = [32]
 
 ASYNC_BACKUPS = ["force-jit", "jit", "fast"]
-SPECULATOR_TYPES = ["standalone", "eagle"]
+SPECULATOR_TYPES = ["standalone", "eagle", "phoenix"]
 CROSS_NODE = [True, False]
 
 # @pytest.mark.parametrize("speculator_type", ["standalone"])
 # @pytest.mark.parametrize("cross_node", [False])
 # @pytest.mark.parametrize("backup", ["force-jit"])
 @pytest.mark.parametrize("backup", ["fast", "jit", "force-jit"])
-@pytest.mark.parametrize("speculator_type", ["phoenix"])
+@pytest.mark.parametrize("speculator_type", ["phoenix", "eagle", "standalone"])
 @pytest.mark.parametrize("cross_node", [False])
 @pytest.mark.parametrize("engine", ["tgl"])
 @pytest.mark.parametrize("max_new_tokens", [128])
 def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_new_tokens, tmp_path):
     lookahead = 4
     fanout = 3
+    engine_accept_length = None  # engine's reported spec_accept_length; set for tgl below
     eagle = speculator_type in ["eagle", "sync_eagle"]
     phoenix = speculator_type in ["phoenix", "sync_phoenix"]
     sync_speculator = speculator_type in ["sync_standalone", "sync_eagle", "sync_phoenix"]
@@ -101,6 +110,7 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
             print(f"[{engine}] response json: {resp_json}", flush=True)
             # completion_text = resp_json["text"]
             completion_tokens = resp_json["output_ids"]
+            engine_accept_length = resp_json["meta_info"]["spec_accept_length"]
             print(f"[{engine}] prompt tokens: {prompt_tokens}", flush=True)
             print(f"[{engine}] response tokens: {completion_tokens}", flush=True)
 
@@ -245,14 +255,11 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
         lookahead=lookahead,
         tokenizer=tokenizer,
     )
-    if phoenix:
-        return
-
     # COMPARE SPECULATIONS TO HF REFERENCE
     print(f"====================================================")
     print(f"[{engine}] Beginning comparison of speculations to hf reference ({speculator_type}, {backup})")
     print(f"=====================================================")
-    compare_speculations_to_hf_reference(
+    spec_ranks, recon_accept_length = compare_speculations_to_hf_reference(
         trace_dir,
         target_model,
         draft_model,
@@ -265,6 +272,26 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
         engine=engine,
         full_target_logits=full_target_logits,
     )
+
+    # The engine's speculated tokens must stay near the top of the HF draft's distribution.
+    # A rank above SPEC_RANK_THRESHOLD means the reconstruction is conditioning on the wrong
+    # activation/position rather than mere bf16 drift. (eagle/phoenix only; standalone has none.)
+    if spec_ranks:
+        worst_rank = max(max(r) for r in spec_ranks)
+        assert worst_rank <= SPEC_RANK_THRESHOLD, (
+            f"COMPARE SPECULATIONS TO HF REFERENCE: worst speculated-token rank {worst_rank} "
+            f"exceeds threshold {SPEC_RANK_THRESHOLD}, {spec_ranks=}"
+        )
+
+    # The acceptance length recomputed from the engine's dumped prefixes must match the
+    # engine's own reported spec_accept_length.
+    if engine_accept_length is not None:
+        accept_length_delta = abs(recon_accept_length - engine_accept_length)
+        assert accept_length_delta <= ACCEPT_LENGTH_TOLERANCE, (
+            f"COMPARE SPECULATIONS TO HF REFERENCE: reconstructed acceptance length "
+            f"{recon_accept_length:.4f} differs from engine spec_accept_length "
+            f"{engine_accept_length:.4f} by {accept_length_delta:.4f} > {ACCEPT_LENGTH_TOLERANCE}"
+        )
 
 
 def compare_completion_to_hf_reference(
@@ -519,7 +546,7 @@ def convert_to_full_vocab_logits(draft_model: Eagle3Model, draft_logits: torch.T
 
 
 def compare_completion_to_hf_reference_eagle(
-    draft_model: Eagle3Model,
+    draft_model: Eagle3Model | PhoenixModel,
     prefix: list[int],
     speculation: list[int],
     eagle_acts: torch.Tensor,
@@ -536,8 +563,21 @@ def compare_completion_to_hf_reference_eagle(
     funky: bool = False,
     prefixes: list[list[int]] = None,
     full_target_logits: torch.Tensor = None,
+    phoenix: bool = False,
     verbose: bool = False,
 ):
+    """Reconstruct the draft's speculation logits the way the engine produced them and
+    compare argmax to the engine's dumped speculation tokens.
+
+    Eagle and Phoenix differ in how the conditioning stream is built:
+      - Eagle projects the target acts through `fc` and fills the speculated positions
+        via its self-recurrence (each speculated position conditions on the draft's own
+        previous prenorm), so it needs the two iterative forward-pass loops below.
+      - Phoenix has no `fc` and no recurrence: it conditions on the raw target acts up to
+        the recovery point, then reuses the single recovery activation for every
+        speculated position. That's a fixed conditioning stream, so one causal forward
+        pass over prefix+speculation suffices.
+    """
     if funky and jit:
         if request_index == 0:
             eagle_activation_index = len(prefixes[0])
@@ -549,68 +589,92 @@ def compare_completion_to_hf_reference_eagle(
     all_tokens = torch.tensor(prefix + speculation, device=device, dtype=torch.long)
     eagle_acts = eagle_acts.to(device=device, dtype=dtype)
     # eagle_acts = engine_acts.to(device=device, dtype=dtype)  # WE ARE TESTING OUT ENGINE ACTS INSTEAD OF HF ACTS
-    all_eagle_acts_proj = draft_model.fc(eagle_acts)
-
     speculation_length = len(speculation)
-    target_eagle_acts = eagle_acts[:eagle_activation_index]
-    target_eagle_acts = draft_model.fc(target_eagle_acts)
 
-    draft_eagle_acts = torch.zeros(all_tokens.shape[0] - eagle_activation_index, target_eagle_acts.shape[1], device=device, dtype=dtype)
-    joint_eagle_acts = torch.cat([target_eagle_acts, draft_eagle_acts], dim=0)
-    joint_eagle_acts[:eagle_activation_index] = target_eagle_acts
-    # First we do len(prefix) - eagle_activation_index steps of forward passes to catch up to the current speculation.
-    for i in range(len(prefix) - eagle_activation_index):
-        idx = eagle_activation_index + i
-        with torch.no_grad():
-            if funky and idx == len(prefix) - 1:
-                joint_eagle_acts[idx] = all_eagle_acts_proj[idx]
-            else:
-                # teacher-force with the actual speculation tokens.
+    if not phoenix:
+        all_eagle_acts_proj = draft_model.fc(eagle_acts)
+        target_eagle_acts = eagle_acts[:eagle_activation_index]
+        target_eagle_acts = draft_model.fc(target_eagle_acts)
+
+        draft_eagle_acts = torch.zeros(all_tokens.shape[0] - eagle_activation_index, target_eagle_acts.shape[1], device=device, dtype=dtype)
+        joint_eagle_acts = torch.cat([target_eagle_acts, draft_eagle_acts], dim=0)
+        joint_eagle_acts[:eagle_activation_index] = target_eagle_acts
+        # First we do len(prefix) - eagle_activation_index steps of forward passes to catch up to the current speculation.
+        for i in range(len(prefix) - eagle_activation_index):
+            idx = eagle_activation_index + i
+            with torch.no_grad():
+                if funky and idx == len(prefix) - 1:
+                    joint_eagle_acts[idx] = all_eagle_acts_proj[idx]
+                else:
+                    # teacher-force with the actual speculation tokens.
+                    prenorm = draft_model.forward_with_cond(all_tokens[:idx], torch.arange(idx, device=device), joint_eagle_acts[:idx])
+                    joint_eagle_acts[idx] = prenorm[-1]
+
+        # Now we do the remaining steps of forward passes to get the logits for the speculation.
+        for i in range(speculation_length):
+            idx = len(prefix) + i
+            with torch.no_grad():
                 prenorm = draft_model.forward_with_cond(all_tokens[:idx], torch.arange(idx, device=device), joint_eagle_acts[:idx])
                 joint_eagle_acts[idx] = prenorm[-1]
 
-    # Now we do the remaining steps of forward passes to get the logits for the speculation.
-    for i in range(speculation_length):
-        idx = len(prefix) + i
+        # joint_eagle_acts[idx] holds the prenorm that predicts token idx, so the last
+        # speculation_length entries predict speculation[0..S-1].
+        post_norm_final_draft_acts = draft_model.norm(joint_eagle_acts[-speculation_length:])
+        draft_logits = draft_model.lm_head(post_norm_final_draft_acts)
+
+        # Scatter draft-vocab draft_logits into target-vocab space via d2t so argmax /
+        # indexing by the engine's target-vocab ids is well-defined. Non-draft
+        # positions stay -inf (the draft cannot produce those tokens).
+        draft_logits = convert_to_full_vocab_logits(draft_model, draft_logits)
+    else:
+        # Phoenix: raw target acts up to the recovery point, recovery activation reused
+        # afterwards, single causal forward pass over prefix+speculation.
+        #
+        # Build the conditioning at full (prefix+speculation) length. Positions
+        # [0, activation_index) use the true target acts; everything after reuses the
+        # recovery activation (the target hidden at the last real position). We must NOT
+        # index eagle_acts past what's available: the final speculation extends a token or
+        # two beyond the dumped completion (it speculates K past the last accepted token),
+        # and those trailing positions live entirely in the recovery-reuse region anyway.
+        recovery_act = eagle_acts[eagle_activation_index - 1]
+        joint_eagle_acts = recovery_act.unsqueeze(0).repeat(all_tokens.shape[0], 1)
+        joint_eagle_acts[:eagle_activation_index] = eagle_acts[:eagle_activation_index]
         with torch.no_grad():
-            prenorm = draft_model.forward_with_cond(all_tokens[:idx], torch.arange(idx, device=device), joint_eagle_acts[:idx])
-            joint_eagle_acts[idx] = prenorm[-1]
-
-    post_norm_final_draft_acts = draft_model.norm(joint_eagle_acts[-speculation_length:])
-    draft_logits = draft_model.lm_head(post_norm_final_draft_acts)
-
-    # Scatter draft-vocab draft_logits into target-vocab space via d2t so argmax /
-    # indexing by the engine's target-vocab ids is well-defined. Non-draft
-    # positions stay -inf (the draft cannot produce those tokens).
-    draft_logits = convert_to_full_vocab_logits(draft_model, draft_logits)
+            prenorm = draft_model.forward_with_cond(
+                all_tokens, torch.arange(all_tokens.shape[0], device=device), joint_eagle_acts,
+            )
+        # prenorm[j] is the draft output at position j, which predicts token j+1, so the
+        # output at position (len(prefix)-1+i) predicts speculation[i].
+        start = len(prefix) - 1
+        post_norm_final_draft_acts = draft_model.norm(prenorm[start : start + speculation_length])
+        draft_logits = draft_model.lm_head(post_norm_final_draft_acts)
 
     greedy_preds = draft_logits.argmax(dim=-1)
 
-    # print(f"[{engine}] model moved to cuda", flush=True)
-    # hf_logits_for_speculation = get_hf_logits_for_speculation(model, all_tokens, speculation_length)
-    # print(f"[{engine}] hf draft_logits for speculation loaded", flush=True)
     gaps = []
+    per_token_match = []
+    ranks = []
     for i in range(speculation_length):
         speculation_token = speculation[i]
         hf_logit = draft_logits[i, speculation_token]
         hf_max_logit = draft_logits[i].max()
-        # print(f"[{engine}] hf logit {hf_logit}, hf max logit {hf_max_logit}, logit_norm {torch.norm(hf_logits_for_speculation[i])}")
         gaps.append(torch.abs(hf_logit - hf_max_logit).item())
+        per_token_match.append(int(greedy_preds[i].item() == speculation_token))
+        # Rank of the engine's speculated token within the HF draft's logits: number of
+        # tokens with a strictly larger logit. 0 means it's (tied for) the HF argmax.
+        # Numerical noise => near-top ranks; a real conditioning/indexing bug => the
+        # engine's token lands at a much worse rank.
+        ranks.append(int((draft_logits[i] > hf_logit).sum().item()))
 
+    matching = tokenizer.decode(greedy_preds) == tokenizer.decode(speculation)
+    match_str = "YES" if matching else " NO"
     if verbose:
-        max_gap = max(gaps)
-        print("=============")
-        matching = tokenizer.decode(greedy_preds) == tokenizer.decode(speculation)
-        match_str = "YES" if matching else " NO"
         prefix_str = tokenizer.decode(prefix)
         print(f"[{engine}][{request_index}] prefix[-40:]: {prefix_str[-40:]}")
-        print(f"[{engine}][{request_index}][{match_str}] speculation (hf reference): {tokenizer.decode(greedy_preds)}")
-        print(f"[{engine}][{request_index}][{match_str}] speculation (engine - tgl): {tokenizer.decode(speculation)}")
-        print(f"[{engine}][{request_index}][{match_str}] max gap: {max_gap}, gaps: {gaps}")
-        # if max_gap > 0.0:
-        #     pytest.set_trace()
-    return gaps
-
+        print(f"[{engine}][{request_index}][{match_str}] speculation (hf reference): {tokenizer.decode(greedy_preds).replace('\n', '\\n')}")
+        print(f"[{engine}][{request_index}][{match_str}] speculation (engine - tgl): {tokenizer.decode(speculation).replace('\n', '\\n')}")
+    print(f"[{engine}][{request_index}][{match_str}] per-token match: {per_token_match}, ranks: {ranks}, max gap: {max(gaps):.4f}, gaps: {gaps}, engine: '{tokenizer.decode(speculation).replace('\n', '\\n')}', hf: '{tokenizer.decode(greedy_preds).replace('\n', '\\n')}'")
+    return gaps, ranks
 
 
 def validate_request_and_response(request, response, request_num, eagle: bool = False, phoenix: bool = False):
@@ -726,8 +790,11 @@ def compare_speculations_to_hf_reference(
                 print(f"[{engine}] prefix: {prefixes[-1]}, speculation: {speculations[-1]}, num_accepted: {num_accepted[-1]}, num_tokens: {num_tokens[-1]}, rec_token: {rec_token}")
 
     prompt_len = len(prompt_tokens)
-    if eagle:
-        engine_acts = torch.zeros((len(all_tokens), 4096*3), dtype=draft_model.lm_head.weight.dtype, device="cpu")
+    engine_acts = None  # reconstructed below for eagle/phoenix from the dumped extend acts
+    if eagle or phoenix:
+        # act dim is len(EAGLE_LAYERS)*hidden for eagle, len(PHOENIX_LAYERS)*hidden for phoenix.
+        act_dim = hf_full_eagle_acts.shape[-1]
+        engine_acts = torch.zeros((len(all_tokens), act_dim), dtype=draft_model.lm_head.weight.dtype, device="cpu")
         engine_acts[:prompt_len] = prompt_eagle_acts.cpu()
         t = prompt_len
         for i in range(len(speculation_requests)):
@@ -744,10 +811,11 @@ def compare_speculations_to_hf_reference(
             for i, diff in enumerate(diffs):
                 print(f"DIFF {i}: {diff:.4f}")
 
-            print(f"[{engine}] eagle extend counts: {extend_counts}")
+            print(f"[{engine}] extend counts: {extend_counts}")
 
     # pytest.set_trace()
     all_gaps = []
+    all_ranks = []  # per-token rank of the engine's speculated token in the HF draft (eagle/phoenix only)
     if verbose:
         print(f"[{engine}] prefix lengths: [{[len(p) for p in prefixes]}")
     
@@ -764,7 +832,7 @@ def compare_speculations_to_hf_reference(
         if backup == "fast" and not cache_hits[i]:
             continue
 
-        if not eagle:
+        if not eagle and not phoenix:
             gaps, _ = compare_completion_to_hf_reference(
                 draft_model,
                 prefix,
@@ -787,7 +855,7 @@ def compare_speculations_to_hf_reference(
             # if i > 0:
                 # assert len(prefixes[i-1]) + extend_counts[i-1] == len(prefix)
 
-            gaps = compare_completion_to_hf_reference_eagle(
+            gaps, ranks = compare_completion_to_hf_reference_eagle(
                 draft_model,
                 prefix,
                 speculation,
@@ -805,31 +873,41 @@ def compare_speculations_to_hf_reference(
                 funky=False,
                 prefixes=prefixes,
                 full_target_logits=full_target_logits,
+                phoenix=phoenix,
                 verbose=verbose,
             )
             all_gaps.append(gaps)
+            all_ranks.append(ranks)
 
-    method_str = "eagle" if eagle else "standalone"
+    method_str = "eagle" if eagle else ("phoenix" if phoenix else "standalone")
     print(f" ****** SUMMARY OF ALL RESULTS (engine={engine}, method={method_str}, backup={backup}) ******")
 
     if eagle:
         # extend counts don't include the recovery token, so we add 1 to the average.
-        print(f"[{engine},{method_str},{backup}][FINAL_METRIC] Average acceptance lengths: {1 + (sum(extend_counts) / (len(extend_counts) - 1)):.4f}")
+        avg_acceptance_length = 1 + (sum(extend_counts) / (len(extend_counts) - 1))
+        print(f"[{engine},{method_str},{backup}][FINAL_METRIC] Average acceptance lengths: {avg_acceptance_length:.4f}")
         print(f"[{engine},{method_str},{backup}] Full list of acceptance lengths: {[e + 1 for e in extend_counts[1:]]}")
     else:
         prefix_lengths = np.array([len(p) for p in prefixes])
-        acceptance_lengths = prefix_lengths[1:] - prefix_lengths[:-1]   
-        print(f"[{engine},{method_str},{backup}][FINAL_METRIC] Average acceptance lengths: {sum(acceptance_lengths) / len(acceptance_lengths):.4f}")
+        acceptance_lengths = prefix_lengths[1:] - prefix_lengths[:-1]
+        avg_acceptance_length = sum(acceptance_lengths) / len(acceptance_lengths)
+        print(f"[{engine},{method_str},{backup}][FINAL_METRIC] Average acceptance lengths: {avg_acceptance_length:.4f}")
         print(f"[{engine},{method_str},{backup}] Full list of acceptance lengths: {acceptance_lengths}")
 
     print(f"[{engine},{method_str},{backup}][FINAL_METRIC] Average cache hit rate: {sum(cache_hits) / len(cache_hits)}")
     print(f"[{engine},{method_str},{backup}] Full list of cache hits: {cache_hits}")
-    
+
     print(f"[{engine},{method_str},{backup}][FINAL_METRIC] Average gap: {np.array(all_gaps).mean():.4f}")
     print(f"[{engine},{method_str},{backup}] Full list of gaps: {all_gaps}")
 
     max_gap = max(max(gaps) for gaps in all_gaps)
     # assert max_gap < LOGIT_GAP_THRESHOLD, f"COMPARE SPECULATIONS TO HF REFERENCE: max gap {max_gap} exceeds threshold {LOGIT_GAP_THRESHOLD}, {all_gaps=}"
+
+    # Return the metrics the caller asserts on:
+    #   all_ranks            — per-token rank of each engine-speculated token in the HF
+    #                          draft's logits (eagle/phoenix only; empty otherwise).
+    #   avg_acceptance_length — acceptance length recomputed from the engine's dumped prefixes.
+    return all_ranks, avg_acceptance_length
 
 
 def get_hf_target_activations_for_eagle_or_phoenix(target_model, all_tokens: list[int], eagle: bool = False, phoenix: bool = False) -> torch.Tensor:
