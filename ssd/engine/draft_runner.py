@@ -289,6 +289,13 @@ class DraftRunner(ModelRunner):
                   extend_activations=None, extend_counts=None, extend_token_ids=None):
         """Hits the cache (tensor-backed) and returns tensors to respond to the spec request."""
         global ttl
+        # Exhaustive breakdown of hit_cache: the four segments below sum to the
+        # parent's "hit_cache" time. alloc -> cache_lookup -> build_speculation
+        # -> build_glue. The build_speculation slice (JIT speculate, or the
+        # tensor-indexing cache fill) is the dominant part of the draft runner's
+        # non-build/decode latency.
+        ev = profile.new_events(5)
+        if ev: ev[0].record()
         # Draft model now returns full target vocab size logits (after d2t expansion)
         V = self.hf_config.vocab_size
 
@@ -310,6 +317,7 @@ class DraftRunner(ModelRunner):
 
         # Statistics
         ttl += int(B)
+        if ev: ev[1].record()  # end: alloc
 
         if self.config.verbose:
             print(f"[{_ts()}] [hit_cache] Request keys: {request_keys}", flush=True)
@@ -325,6 +333,10 @@ class DraftRunner(ModelRunner):
             cache_hits, idx = match.max(dim=1)  # cache_hits: [B] bool, idx: [B] first-match index.
 
         there_was_a_cache_miss = not cache_hits.all()
+        if ev: ev[2].record()  # end: cache_lookup
+        # The build_speculation segment spans this whole if/elif: it times the
+        # JIT speculate when (force-)jitting, or the tensor-indexing cache fill
+        # otherwise. Either way it's where the speculation tokens are produced.
         if self.config.force_jit_speculate or (self.config.jit_speculate and there_was_a_cache_miss):
             if self.config.verbose:
                 if self.config.force_jit_speculate:
@@ -374,6 +386,8 @@ class DraftRunner(ModelRunner):
             if self.config.use_eagle_or_phoenix:
                 out_activations = self.tree_cache_activations[idx]
 
+        if ev: ev[3].record()  # end: build_speculation
+
         rec_toks = request_keys[:, 2]
 
         if self.config.verbose:
@@ -388,7 +402,14 @@ class DraftRunner(ModelRunner):
                     print(f"[{_ts()}]     Detokenized: {tokens_text}", flush=True)
             print(f"[{_ts()}] ", flush=True)
 
-        return out_tokens, out_logits, make_glue_decode_input_ids(out_tokens, rec_toks), cache_hits, out_activations
+        glue_decode_input_ids = make_glue_decode_input_ids(out_tokens, rec_toks)
+        if ev: ev[4].record()  # end: build_glue
+        profile.emit(
+            "draft.hit_cache",
+            ["alloc", "cache_lookup", "build_speculation", "build_glue"],
+            ev, B=B, K=K,
+        )
+        return out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations
 
     def _service_spec_request(self):
         """Receives a speculation request, serves it from cache, and sends results back in a single response."""

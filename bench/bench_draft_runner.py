@@ -18,11 +18,14 @@ supported via --eagle / --phoenix.
 Usage:
   python bench/bench_draft_runner.py --batch-sizes 1 4 16 --lookaheads 3 5 7 --fanouts 1 3 5
   python bench/bench_draft_runner.py --eagle --batch-sizes 1 4 16
+  # Sweep the 1/2/3/4-layer Phoenix Kimi-K2.5 draft checkpoints:
+  python bench/bench_draft_runner.py --draft-layers 1 2 3 4 --batch-sizes 1 4 16
 """
 
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import statistics
@@ -55,7 +58,16 @@ from ssd.utils.dist_utils import init_custom_process_group
 # PHOENIX_PATH = "/scratch/avner/huggingface/hub/models--togethercomputer--phoenix-Llama-3p2-1B-Instruct-tgt-Llama-3p3-70b-instruct-UNTRAINED/snapshots/3af59d71514388e14d8685f2b684f74e3e311717"
 
 KIMI_K25 = "/data/huggingface/hub/models--nvidia--Kimi-K2.5-NVFP4"
-KIMI_K25_PHOENIX = "/data/huggingface/hub/models--togethercomputer--phoenix-3layer-kimi-k25-lookahead16"
+# Phoenix draft checkpoints come in 1/2/3/4-layer variants; --draft-layers picks them.
+KIMI_K25_PHOENIX_TMPL = "/data/huggingface/hub/models--togethercomputer--phoenix-{n}layer-kimi-k25-lookahead16"
+KIMI_K25_PHOENIX = KIMI_K25_PHOENIX_TMPL.format(n=3)
+
+
+def _infer_draft_layers(path: str) -> int:
+    """Best-effort extraction of the layer count from a phoenix checkpoint path
+    (e.g. '...phoenix-3layer-kimi...' -> 3). Returns 0 if not found."""
+    m = re.search(r"phoenix-(\d+)layer", path)
+    return int(m.group(1)) if m else 0
 
 
 def _free_port() -> int:
@@ -64,12 +76,13 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _build_target_config(args, port: int, K: int, F: int) -> Config:
+def _build_target_config(args, port: int, K: int, F: int,
+                         draft_path: str) -> Config:
     """Build a target-style Config; DraftRunner.create_draft_config flips it
     into the draft-side view (model=draft path, d_model_target set, etc.)."""
     return Config(
         model=args.model,
-        draft=args.draft,
+        draft=draft_path,
         speculate=True,
         speculate_k=K,
         draft_async=True,
@@ -314,7 +327,7 @@ def _shutdown_draft(proc, pg, device, draft_rank, graceful: bool):
     _CURRENT_DRAFT_PROC = None
 
 
-def _aggregate_trace(trace_path: str, K: int, F: int, n_timed: int) -> list:
+def _aggregate_trace(trace_path: str, L: int, K: int, F: int, n_timed: int) -> list:
     """Parse a DraftRunner chrome-trace JSON and aggregate per (B, group, label).
 
     Each "X" event is one profiled segment: cat=group, name=label, dur=µs,
@@ -322,7 +335,7 @@ def _aggregate_trace(trace_path: str, K: int, F: int, n_timed: int) -> list:
     batch-size sweep for this (K, F), so events from all B values share the file;
     we key by the B in args. For each (B, group, label) we keep the *last*
     `n_timed` occurrences (= the timed iters; earlier ones are warmup) and report
-    mean/std. Returns rows: (K, F, B, group, label, mean_ms, std_ms, n).
+    mean/std. Returns rows: (L, K, F, B, group, label, mean_ms, std_ms, n).
     """
     with open(trace_path) as f:
         data = json.load(f)
@@ -343,15 +356,15 @@ def _aggregate_trace(trace_path: str, K: int, F: int, n_timed: int) -> list:
         timed = vals[-n_timed:] if (n_timed and len(vals) >= n_timed) else vals
         mean = sum(timed) / len(timed)
         std = statistics.pstdev(timed) if len(timed) > 1 else 0.0
-        rows.append((K, F, B, group, label, mean, std, len(timed)))
+        rows.append((L, K, F, B, group, label, mean, std, len(timed)))
     return rows
 
 
-def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
-                prof_csv=None):
+def _run_one_kf(args, L: int, draft_path: str, K: int, F: int, results: list,
+                csv_file=None, prof_csv=None):
     global _CURRENT_DRAFT_PROC
     port = _free_port()
-    target_cfg = _build_target_config(args, port, K, F)
+    target_cfg = _build_target_config(args, port, K, F, draft_path)
     draft_cfg = DraftRunner.create_draft_config(target_cfg)
 
     draft_rank = 1
@@ -367,8 +380,8 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
     if prof_csv is not None:
         os.environ["SSD_PROFILE"] = "1"
         os.environ["SSD_PROFILE_TRACE"] = "1"
-        os.environ["SSD_PROFILE_TRACE_NAME"] = f"draft_K{K}_F{F}"
-        trace_path = os.path.join(args.profile_trace_dir, f"draft_K{K}_F{F}.json")
+        os.environ["SSD_PROFILE_TRACE_NAME"] = f"draft_L{L}_K{K}_F{F}"
+        trace_path = os.path.join(args.profile_trace_dir, f"draft_L{L}_K{K}_F{F}.json")
         os.environ["SSD_PROFILE_TRACE_OUT"] = trace_path
         if os.path.exists(trace_path):
             os.remove(trace_path)  # avoid stale data from a prior run
@@ -385,9 +398,9 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
         torch.cuda.set_device(target_device)
 
         pg = _make_async_pg_as_target(port, target_device)
-        print(f"[bench] [K={K} F={F}] NCCL group formed; handshaking...", flush=True)
+        print(f"[bench] [L={L} K={K} F={F}] NCCL group formed; handshaking...", flush=True)
         num_kv_blocks = _do_handshake(pg, draft_rank, target_device)
-        print(f"[bench] [K={K} F={F}] draft num_kvcache_blocks={num_kv_blocks}",
+        print(f"[bench] [L={L} K={K} F={F}] draft num_kvcache_blocks={num_kv_blocks}",
               flush=True)
 
         eagle = draft_cfg.use_eagle_or_phoenix
@@ -455,13 +468,13 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
             torch.cuda.synchronize()
             ms = (time.perf_counter() - t0) * 1000.0 / n_timed
 
-            results.append((K, F, B, ms))
+            results.append((L, K, F, B, ms))
             note = " (profiled; ms/iter inflated by per-iter sync)" if args.profile_csv else ""
-            print(f"[bench] K={K:>2} F={F:>2} B={B:>4}: {ms:8.3f} ms/iter{note}",
+            print(f"[bench] L={L:>2} K={K:>2} F={F:>2} B={B:>4}: {ms:8.3f} ms/iter{note}",
                   flush=True)
             if csv_file is not None:
                 # Append + flush as we go so partial results survive a crash/hang.
-                csv_file.write(f"{K},{F},{B},{ms:.4f}\n")
+                csv_file.write(f"{L},{K},{F},{B},{ms:.4f}\n")
                 csv_file.flush()
                 os.fsync(csv_file.fileno())
         success = True
@@ -473,16 +486,16 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
     if prof_csv is not None and trace_path is not None:
         if success and os.path.exists(trace_path):
             try:
-                rows = _aggregate_trace(trace_path, K, F, n_timed)
-                for (rK, rF, rB, group, label, mean, std, n) in rows:
+                rows = _aggregate_trace(trace_path, L, K, F, n_timed)
+                for (rL, rK, rF, rB, group, label, mean, std, n) in rows:
                     prof_csv.write(
-                        f"{rK},{rF},{rB},{group},{label},{mean:.4f},{std:.4f},{n}\n"
+                        f"{rL},{rK},{rF},{rB},{group},{label},{mean:.4f},{std:.4f},{n}\n"
                     )
                 prof_csv.flush()
                 os.fsync(prof_csv.fileno())
-                print(f"[bench] [K={K} F={F}] wrote {len(rows)} profile rows", flush=True)
+                print(f"[bench] [L={L} K={K} F={F}] wrote {len(rows)} profile rows", flush=True)
             except Exception as e:
-                print(f"[bench] [K={K} F={F}] failed to aggregate trace "
+                print(f"[bench] [L={L} K={K} F={F}] failed to aggregate trace "
                       f"{trace_path}: {e}", flush=True)
             finally:
                 if not args.keep_traces:
@@ -491,7 +504,7 @@ def _run_one_kf(args, K: int, F: int, results: list, csv_file=None,
                     except OSError:
                         pass
         else:
-            print(f"[bench] [K={K} F={F}] no trace at {trace_path} "
+            print(f"[bench] [L={L} K={K} F={F}] no trace at {trace_path} "
                   f"(draft did not exit cleanly?); skipping profile rows", flush=True)
 
 
@@ -500,7 +513,11 @@ def main():
     parser.add_argument("--model", type=str, default=KIMI_K25,
                         help="Target model path (for vocab/hidden_size).")
     parser.add_argument("--draft", type=str, default=KIMI_K25_PHOENIX,
-                        help="Draft model path.")
+                        help="Draft model path (used when --draft-layers is not given).")
+    parser.add_argument("--draft-layers", type=int, nargs="+", default=None,
+                        choices=[1, 2, 3, 4],
+                        help="Sweep over N-layer Phoenix Kimi-K2.5 draft checkpoints "
+                             "(e.g. --draft-layers 1 2 3 4). Overrides --draft.")
     parser.add_argument("--eagle", action="store_true",
                         help="Use EAGLE3 draft (overrides --draft to the EAGLE path).")
     parser.add_argument("--phoenix", action="store_true",
@@ -554,7 +571,15 @@ def main():
         if not args.draft: args.draft = KIMI_K25_PHOENIX
         if not args.model: args.model = KIMI_K25
 
-    for p in (args.model, args.draft):
+    # Drafts to sweep, as (layers, path). --draft-layers expands to the
+    # corresponding Phoenix checkpoints; otherwise a single entry from --draft.
+    if args.draft_layers:
+        args.draft_specs = [(L, KIMI_K25_PHOENIX_TMPL.format(n=L))
+                            for L in args.draft_layers]
+    else:
+        args.draft_specs = [(_infer_draft_layers(args.draft), args.draft)]
+
+    for p in (args.model, *(d for _, d in args.draft_specs)):
         assert os.path.isdir(p), f"Not a directory: {p}"
 
     assert torch.cuda.device_count() >= 2, (
@@ -562,9 +587,12 @@ def main():
     )
 
     print(f"[bench] target={args.model}", flush=True)
-    print(f"[bench] draft={args.draft}", flush=True)
+    print(f"[bench] drafts (layers->path):", flush=True)
+    for L, p in args.draft_specs:
+        print(f"[bench]   L={L}: {p}", flush=True)
     print(f"[bench] eagle={args.eagle} phoenix={args.phoenix}", flush=True)
-    print(f"[bench] sweep: K={args.lookaheads} F={args.fanouts} B={args.batch_sizes}",
+    print(f"[bench] sweep: L={[L for L, _ in args.draft_specs]} "
+          f"K={args.lookaheads} F={args.fanouts} B={args.batch_sizes}",
           flush=True)
 
     # Open the CSV up front (header + flush) and write each row as it's measured
@@ -572,7 +600,7 @@ def main():
     csv_file = None
     if args.csv_out:
         csv_file = open(args.csv_out, "w")
-        csv_file.write("K,F,B,ms_per_iter\n")
+        csv_file.write("L,K,F,B,ms_per_iter\n")
         csv_file.flush()
         print(f"[bench] streaming results to {args.csv_out}", flush=True)
 
@@ -580,19 +608,20 @@ def main():
     if args.profile_csv:
         os.makedirs(args.profile_trace_dir, exist_ok=True)
         prof_csv = open(args.profile_csv, "w")
-        prof_csv.write("K,F,B,group,label,mean_ms,std_ms,n\n")
+        prof_csv.write("L,K,F,B,group,label,mean_ms,std_ms,n\n")
         prof_csv.flush()
         print(f"[bench] streaming granular profile to {args.profile_csv}", flush=True)
 
     _install_sigint_handler()
 
-    results = []  # (K, F, B, ms_per_iter)
+    results = []  # (L, K, F, B, ms_per_iter)
     interrupted = False
     try:
-        for K in args.lookaheads:
-            for F in args.fanouts:
-                _run_one_kf(args, K, F, results, csv_file=csv_file,
-                            prof_csv=prof_csv)
+        for L, draft_path in args.draft_specs:
+            for K in args.lookaheads:
+                for F in args.fanouts:
+                    _run_one_kf(args, L, draft_path, K, F, results,
+                                csv_file=csv_file, prof_csv=prof_csv)
     except KeyboardInterrupt:
         interrupted = True
         print("\n[bench] interrupted by user; cleaned up draft subprocess. "
@@ -604,9 +633,9 @@ def main():
             prof_csv.close()
 
     print("\n=== Results ===")
-    print(f"{'K':>4} {'F':>4} {'B':>6} {'ms/iter':>12}")
-    for K, F, B, ms in results:
-        print(f"{K:>4} {F:>4} {B:>6} {ms:>12.3f}")
+    print(f"{'L':>4} {'K':>4} {'F':>4} {'B':>6} {'ms/iter':>12}")
+    for L, K, F, B, ms in results:
+        print(f"{L:>4} {K:>4} {F:>4} {B:>6} {ms:>12.3f}")
 
     if args.csv_out:
         print(f"[bench] wrote {args.csv_out}", flush=True)
