@@ -18,7 +18,12 @@ PORT = 40023
 LOGIT_GAP_THRESHOLD = 0.3
 EAGLE_LAYERS = [2, 16, 29]
 D_MODEL = 4096
-PHOENIX_LAYERS = [31]
+# Phoenix conditions on the target's final post-norm hidden state (the vector
+# fed to the LM head). In HF's output_hidden_states tuple (length num_layers+1),
+# that is the last entry, index 32 for the 32-layer Llama-3.1-8B target. Index 31
+# would be the *input* to the last layer (pre-norm), which is what the engine does
+# NOT use.
+PHOENIX_LAYERS = [32]
 
 ASYNC_BACKUPS = ["force-jit", "jit", "fast"]
 SPECULATOR_TYPES = ["standalone", "eagle"]
