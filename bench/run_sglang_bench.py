@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--llama", action="store_true", default=True)
     parser.add_argument("--qwen", action="store_true")
     parser.add_argument("--size", type=int, default=0)
-    parser.add_argument("--mode", choices=["AR", "STANDALONE", "ASYNC_STANDALONE", "EAGLE3", "ASYNC_EAGLE3", "PHOENIX", "ASYNC_PHOENIX"], default="STANDALONE",
+    parser.add_argument("--mode", choices=["AR", "STANDALONE", "ASYNC_STANDALONE", "EAGLE3", "ASYNC_EAGLE3", "PHOENIX", "ASYNC_PHOENIX", "PHOENIX2", "ASYNC_PHOENIX2"], default="STANDALONE",
                         help="ar = autoregressive, sd = speculative decoding (default)")
     parser.add_argument("--backup", choices=["fast", "jit", "force-jit"], default="jit",
                         help="Backup strategy (fast, jit, force-jit)")
@@ -124,11 +124,11 @@ def main():
 
 
 def is_spec(mode):
-    return mode in ["STANDALONE", "ASYNC_STANDALONE", "EAGLE3", "ASYNC_EAGLE3", "PHOENIX2", "ASYNC_PHOENIX2"]
+    return mode in ["STANDALONE", "ASYNC_STANDALONE", "EAGLE3", "ASYNC_EAGLE3", "PHOENIX", "ASYNC_PHOENIX", "PHOENIX2", "ASYNC_PHOENIX2"]
 
 
 def is_async(mode):
-    return mode in ["ASYNC_STANDALONE", "ASYNC_EAGLE3", "ASYNC_PHOENIX"]
+    return mode in ["ASYNC_STANDALONE", "ASYNC_EAGLE3", "ASYNC_PHOENIX", "ASYNC_PHOENIX2"]
 
 
 def is_standalone(mode):
@@ -139,7 +139,7 @@ def is_eagle3(mode):
 
 
 def is_phoenix(mode):
-    return mode in ["PHOENIX2", "ASYNC_PHOENIX2"]
+    return mode in ["PHOENIX", "ASYNC_PHOENIX", "PHOENIX2", "ASYNC_PHOENIX2"]
 
 
 def get_server_cmd(args):
@@ -148,16 +148,22 @@ def get_server_cmd(args):
         if args.size == 70:
             if is_eagle3(args.mode):
                 target = resolve_snapshot(MODELS["llama_70b_3p1"])
+                draft = resolve_snapshot(MODELS["eagle3_llama_70b"])
+            elif is_phoenix(args.mode):
+                target = resolve_snapshot(MODELS["llama_70b"])
+                draft = resolve_snapshot(MODELS["phoenix_llama_70b"])
             else:
                 target = resolve_snapshot(MODELS["llama_70b"])
-            draft_name = "llama_1b" if is_standalone(args.mode) else "eagle3_llama_70b"
+                draft = resolve_snapshot(MODELS["llama_1b"])
         elif args.size == 8:
+            assert not is_phoenix(args.mode), "Phoenix is not supported for Llama 8B"
             target = resolve_snapshot(MODELS["llama_8b"])
-            draft_name = "llama_1b" if is_standalone(args.mode) else "eagle3_llama_8b"
+            if is_standalone(args.mode):
+                draft = resolve_snapshot(MODELS["llama_1b"])
+            else:
+                draft = resolve_snapshot(MODELS["eagle3_llama_8b"])
         else:
             raise ValueError(f"Unsupported size for llama: {args.size}")
-
-        draft = resolve_snapshot(MODELS[draft_name])
     else:
         target = resolve_snapshot(MODELS["qwen_32b"])
         if is_standalone(args.mode):

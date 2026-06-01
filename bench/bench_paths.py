@@ -86,6 +86,10 @@ MODELS = {
         "BENCH_EAGLE3_QWEN_32B",
         "Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3",
     ),
+    "phoenix_llama_70b": os.environ.get(
+        "BENCH_PHOENIX_LLAMA_70B",
+        PHOENIX_70B,
+    ),
     "phoenix2_qwen_8b": os.environ.get(
         "BENCH_PHOENIX2_QWEN_8B",
         "togethercomputer/phnx2-llama-decagon-4layer-v1.0",
