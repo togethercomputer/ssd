@@ -233,13 +233,21 @@ standalone on a quiet node):
 `claude.md`'s fast-backup description updated to the own-branch-fallback
 semantics (commit `25ece79`).
 
+## e2e suite status (post-fix rerun)
+
+`tests/e2e/test_sync_vs_force_jit.py`: **3 passed, 1 xfailed in 5:56** (was 3
+timeout-failures in 43:24). Single-prompt sync ≡ async on tokens AND per-step
+trace; multi-prompt final tokens identical; seq #0 trace exact at 64 tokens.
+The historical seq #1 trace divergence (B10) reproduces exactly as recorded
+and is now *characterized* rather than mysterious: benign per-row bf16
+numerics between the two process topologies flipping near-tie draft proposals
+at batch rows > 0 — final tokens asserted identical, the draft process proven
+bit-deterministic and row-permutation-equivariant at fixed shapes, and its
+conditioning inputs proven HF-correct. Kept as a strict xfail with the
+evidence written into its reason.
+
 ## Known remaining issues
 
-- The historical `test_multi_prompt_greedy_matches_trace` strict xfail (B10)
-  awaits a clean e2e rerun on the fixed runner mechanics. The batch-side
-  evidence gathered here (draft bit-determinism + row-permutation equivariance
-  + benign chain near-ties, same final tokens) is consistent with that
-  divergence being benign kernel drift, not state corruption.
 - verify()'s greedy fallback on miss rows at temperature>0 accepts a proposed
   token iff it equals argmax(p) — a slight distributional bias inherent to the
   fast backup (documented; ratio acceptance can't apply without q).
