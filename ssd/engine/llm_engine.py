@@ -64,6 +64,21 @@ class LLMEngine:
         ctx = mp.get_context("spawn")
         self.num_tp_gpus = config.num_gpus if not self.config.draft_async else config.num_gpus - 1
 
+        # Pick the default-process-group rendezvous port BEFORE any worker/draft
+        # spawn so every rank (this process + spawned children, which receive a
+        # pickled copy of config) agrees on it. A fixed port (the old 1223) hangs
+        # engine startup forever if anything else on the box holds it — observed
+        # on shared nodes where another user's server had claimed it.
+        if config.dist_init_port is None and (
+            config.num_gpus > 1 or (config.speculate and config.draft_async)
+        ):
+            import socket
+            from contextlib import closing
+
+            with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as _s:
+                _s.bind(("127.0.0.1", 0))
+                config.dist_init_port = _s.getsockname()[1]
+
         if config.speculate and config.draft_async:
             self.draft_ps = None
 
