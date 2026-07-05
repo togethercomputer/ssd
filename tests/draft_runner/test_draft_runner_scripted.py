@@ -44,6 +44,10 @@ K = 2
 FANOUT = 3
 MQ = FANOUT * (K + 1)
 BLOCK = 64
+MAX_MODEL_LEN = 2048
+# The DraftRunner's CUDA-graph static block-table buffers are sized
+# max_model_len/block_size wide; requests must use that width.
+MAX_BLOCKS = MAX_MODEL_LEN // BLOCK
 PROMPT_LEN = 33
 MAX_SEQS = 4
 ACT_DIM = 3 * 4096
@@ -176,7 +180,7 @@ def _drive_round(session, seqs: list[ScriptedSeq], outcomes: list[tuple],
         k, rec = outcomes[i][0], outcomes[i][1]
         fields.append((seqs[i], seqs[i].round_fields(k, rec)))
     B = len(fields)
-    max_blocks = 12
+    max_blocks = MAX_BLOCKS
     req = dict(
         cache_keys=torch.stack([f["cache_keys"] for _, f in fields]),
         num_tokens=torch.tensor([f["num_tokens"] for _, f in fields], dtype=torch.int64),
@@ -250,6 +254,13 @@ def _fresh_seqs(bank, n: int, tag_base: int):
             10_000 + _SEQ_COUNTER[0], tag_base + i, bank.draft, bank.session,
             bank.target, bank.tokenizer,
         ))
+    # Prefill the draft with the group's prompts + dup-shifted target acts —
+    # without this the glue decode attends unwritten prompt KV.
+    input_ids = torch.tensor([t for s in out for t in s.prompt], dtype=torch.int64)
+    num_tokens = torch.tensor([len(s.prompt) for s in out], dtype=torch.int64)
+    block_tables = torch.stack([s.block_table(MAX_BLOCKS) for s in out])
+    eagle_acts = torch.cat([s._dup_acts[: len(s.prompt)].float() for s in out])
+    bank.session.send_prefill(input_ids, num_tokens, block_tables, eagle_acts, MAX_BLOCKS)
     return out
 
 
