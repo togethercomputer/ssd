@@ -49,7 +49,13 @@ Three related defects around continuous batching (commits `8f196015b`, `9600ceb5
 
 **T4. Draft temperatures were never sent** (`# TODO: Set temperatures`): the
 draft always speculated greedily regardless of request temperature. Now plumbed
-from `sampling_info`; greedy runs unchanged. Commit `8f196015b`.
+from `sampling_info` — with one crucial subtlety found the hard way: sglang
+normalizes greedy requests to `temperature=1.0` + `top_k=1`
+(`sampling_params.py`), so the verbatim value made the draft SAMPLE its
+speculations for greedy requests (acceptance tanked, every
+reconstruction-based check failed with ranks in the hundreds, and for a while
+stale `.pyc` bytecode masked the change entirely). `top_k<=1` rows are now
+mapped to temperature 0. Commits `8f196015b`, `6f81b7e78`.
 
 **T5. Finished requests desynced batch state (crash on first early finisher).**
 `prepare_extend_after_decode` rebinds `batch.seq_lens/seq_lens_cpu/
@@ -178,25 +184,28 @@ e2e suite silently skip; now shared with `tests/hf/helpers.py` constants.
   batching-honesty gate. `SSD_TRACE_REUSE` skips the server phase when
   iterating on reconstruction.
 
-## Verification status
+## Verification status (final code state, fresh bytecode)
 
 - `tests/unit`: **116 passed** (CPU, seconds).
-- Reference matrix (B=1, lookahead 4): **9/9 passed** (standalone/eagle/phoenix
-  × fast/jit/force-jit) after the test fixes.
-- Batched server test (TGL, eagle-fast, N=4 concurrent): **passed**, both from a
-  saved trace and a fresh server run — completions exactly HF, per-request
-  accept lengths exact, shipped activations clean per slot, joins/leaves
-  exercised (B ramps 1→4, early finishers leave).
+- Full reference matrix (B=1, lookahead 4): **9/9 passed** (standalone/eagle/
+  phoenix × fast/jit/force-jit). Acceptance metrics bit-identical to the
+  original healthy baseline (e.g. eagle-fast 2.0317 over 63 rounds,
+  standalone-force-jit 3.6571 over 35 rounds) — confirming the own-row miss
+  fallback reproduces the original engine exactly at B=1.
+- Batched server test (TGL, N=4 concurrent): **4/4 combos passed**
+  (eagle-fast, eagle-jit, phoenix-fast, standalone-fast) — completions exactly
+  HF per request, accept lengths exact, shipped activations clean per slot,
+  joins/leaves exercised (B ramps 1→4, early finishers leave). Chain-round
+  fractions at B=4 sit at 0.94–1.0 token / 0.77–0.95 round — essentially B=1
+  levels once the greedy-temperature bug was fixed (the earlier 0.43–0.71
+  readings were sampled-draft artifacts, not batch effects).
 - Scripted DraftRunner suite: **8/8 passed** (hit/miss exactness at B=1/2/4,
   mirror content, row-permutation equivariance bit-exact, rerun determinism,
   batch shrink/regrow with stale-cache probe).
-- PENDING at time of writing (ssh credentials to the GPU nodes expired
-  mid-campaign): a final rerun of the fast-mode combos + full matrix + the
-  remaining batch combos (eagle-jit, phoenix-fast, standalone-fast) on the
-  final code state. NOTE: the last fast-lane attempt executed stale .pyc
-  bytecode (NFS attribute caching defeated Python's mtime check after an
-  over-NFS edit) — pycache has been purged; treat "edit locally, run remotely
-  immediately" with caution.
+- Operational gotchas recorded for future runs: purge `__pycache__` after
+  over-NFS edits before remote runs (stale bytecode silently masked an engine
+  change); pin every run's GPUs; derive the async store port from the HTTP
+  port (fixed 29600 collides with other users' servers on shared nodes).
 
 ## Known remaining issues
 
