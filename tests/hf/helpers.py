@@ -92,6 +92,8 @@ def launch_tgl_server(
     fanout: int,
     port: int,
     cross_node: bool = False,
+    max_running_requests: int = 1,
+    extra_args: tuple[str, ...] = (),
 ):
     env = os.environ.copy()
     env["NCCL_CUMEM_ENABLE"] = "0"  # match sglang; avoids P2P/IPC vs P2P/CUMEM mismatch on same-node
@@ -102,7 +104,7 @@ def launch_tgl_server(
         "--speculative-algorithm", _get_speculative_algorithm(speculator_type),
         "--speculative-draft-model-path", draft,
         "--tp", "1", "--mem-fraction-static", "0.7",
-        "--max-running-requests", "1",
+        "--max-running-requests", str(max_running_requests),
         "--log-level", "warning",
         "--port", str(port),
         "--context-length", "2048",
@@ -121,6 +123,7 @@ def launch_tgl_server(
         "--speculative-async-communicate-logits",
         # "--disable-cuda-graph",
     ]
+    cmd.extend(extra_args)
 
     if speculator_type in ["standalone", "eagle", "phoenix"]:
         if backup == "force-jit":

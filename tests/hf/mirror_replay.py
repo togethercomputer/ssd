@@ -159,6 +159,17 @@ class EagleMirror:
         self.fork_sets = {}
         for kk, tok in zip(k_layout, forks.tolist()):
             self.fork_sets.setdefault(kk, []).append(tok)
+        # fork margins: how decisively position k's TOP candidate beats the first
+        # EXCLUDED one (the (fan+1)-th). Scripted-hit drivers use this to avoid
+        # asserting on boundary ties between the mirror and the engine kernels.
+        self.fork_margins = {}
+        masked = glue_logits.float().clone()
+        for j in range(self.K):
+            masked[j, spec_tokens_engine[j]] = float("-inf")
+        for kk in set(k_layout):
+            f = fan[kk]
+            vals = masked[kk].topk(f + 1).values
+            self.fork_margins[kk] = float(vals[0] - vals[f])
 
         # tree decode: one branch per fork candidate
         new_cache = {}
