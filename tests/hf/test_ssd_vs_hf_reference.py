@@ -80,6 +80,8 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
 
     # For each engine, we initialize the engine, send a request to it, and then tear down the engine.
     if engine == "tgl":
+        tgl_server = None
+        draft_process = None
         try:
             tgl_server, draft_process = launch_tgl_server(
                 speculator_type, backup, target_path, draft_path, lookahead, fanout, PORT, cross_node=cross_node,
@@ -119,13 +121,16 @@ def test_ssd_vs_hf_reference(backup, speculator_type, cross_node, engine, max_ne
             pytest.fail(f"[{engine}] error: {e}")
 
         finally:
-            # TODO: We currently speedup the test by not killing the server; uncomment this when done debugging.
-            print(f"[{engine}] killing server", flush=True)
-            kill_server(tgl_server)
-            assert not wait_for_server(PORT, timeout=3.0), "tgl server failed to stop"
-            print(f"[{engine}] server stopped", flush=True)
+            # Guard for launch_tgl_server itself raising: tgl_server stays None and
+            # there is nothing to kill — without the guard the UnboundLocalError here
+            # masks the primary launch error in the pytest report.
+            if tgl_server is not None:
+                print(f"[{engine}] killing server", flush=True)
+                kill_server(tgl_server)
+                assert not wait_for_server(PORT, timeout=3.0), "tgl server failed to stop"
+                print(f"[{engine}] server stopped", flush=True)
 
-            if cross_node:
+            if cross_node and draft_process is not None:
                 print(f"[{engine}] killing draft process", flush=True)
                 kill_server(draft_process)
                 print(f"[{engine}] draft process stopped", flush=True)
