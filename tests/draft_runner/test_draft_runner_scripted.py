@@ -254,30 +254,41 @@ def _fresh_seqs(bank, n: int, tag_base: int):
 
 
 def _scripted_schedule(seqs, r: int):
-    """Round r outcomes per seq as (k, rec, expected_hit): heterogeneous ks,
-    guaranteed misses sprinkled. Respects the algorithm's fan reallocation
-    (after a MISS round all fanout moves to k=0) and downgrades boundary-tie
-    hits to scripted misses (margin-aware)."""
+    """Round r outcomes per seq as (k, rec, expected_hit).
+
+    Hits are scripted ONLY at k=0: the k=0 fork position is chain-free (the
+    recovery token is conditioned on a target activation and its glue row
+    attends only the target-conditioned prefix), so an independent mirror can
+    predict the engine's candidate set robustly (margin-aware). Fork positions
+    k>=1 are conditioned on the engine's private recurrence chain and are NOT
+    predictable from outside — those ks are exercised via scripted MISSES
+    (which still drive heterogeneous extend_counts through the varlen glue
+    path); their hit-path content is covered by the bit-exact permutation
+    equivariance test and the batched server test."""
     outs = []
     for i, s in enumerate(seqs):
         if r == 0:
             outs.append((None, 777 + i, False))
-        elif (r + i) % 4 == 3:
-            outs.append((min((r + i) % (K + 1), K), MISS_TOKEN + i, False))  # scripted miss
+        elif (r + i) % 3 == 2:
+            outs.append((min((r + i) % (K + 1), K), MISS_TOKEN + i, False))  # scripted miss, varied k
         else:
-            k = (r + i) % (K + 1) if s.last_hit else 0
-            rec, is_hit = s.hit_or_miss(k, MISS_TOKEN + i)
-            outs.append((k, rec, is_hit))
+            rec, is_hit = s.hit_or_miss(0, MISS_TOKEN + i)
+            outs.append((0, rec, is_hit))
     return outs
 
 
 @requires_2gpus
-@pytest.mark.parametrize("B", [1, 2, 4])
-def test_scripted_outcomes_hit_miss_exact(eagle_session, B):
+@pytest.mark.parametrize(
+    "B,tag_base", [(1, 100), (1, 200), (2, 200), (4, 400)],
+    ids=["B1", "B1-altprompts", "B2", "B4"],
+)
+def test_scripted_outcomes_hit_miss_exact(eagle_session, B, tag_base):
     """Heterogeneous per-row (k, hit/miss) schedules: the engine's cache_hits
     must exactly follow the script — hits at max-margin fork candidates, misses
-    at far-out tokens — across mixed batches (varlen glue path at B>1)."""
-    seqs = _fresh_seqs(eagle_session, B, tag_base=100 * B)
+    at far-out tokens — across mixed batches (varlen glue path at B>1).
+    B1-altprompts uses the same prompts as B2, so a B2-only failure isolates a
+    batch effect from prompt-content margin fragility."""
+    seqs = _fresh_seqs(eagle_session, B, tag_base=tag_base)
     n_hits_scripted = 0
     for r in range(8):
         outs = _scripted_schedule(seqs, r)
@@ -290,7 +301,10 @@ def test_scripted_outcomes_hit_miss_exact(eagle_session, B):
                 continue
             assert hits[i] == int(expected_hit), (
                 f"round {r} seq {i}: cache_hit={hits[i]} but scripted "
-                f"{'hit' if expected_hit else 'miss'} (k={k}, rec={rec})"
+                f"{'hit' if expected_hit else 'miss'} (k={k}, rec={rec}; mirror "
+                f"fork_set[k]={s.mirror.fork_sets.get(k) if s.mirror.fork_sets else None}, "
+                f"margin={s.mirror.fork_margins.get(k) if s.mirror.fork_sets else None}, "
+                f"engine_toks={toks[i].tolist()})"
             )
     assert n_hits_scripted >= 3 * B, (
         f"schedule degenerated to misses ({n_hits_scripted} hits scripted) — "
@@ -310,9 +324,8 @@ def test_hits_track_mirror_content(eagle_session):
             if r == 0:
                 outs.append((None, 555 + i, False))
             else:
-                k = (r + i) % (K + 1) if s.last_hit else 0
-                rec, is_hit = s.hit_or_miss(k, MISS_TOKEN + i)
-                outs.append((k, rec, is_hit))
+                rec, is_hit = s.hit_or_miss(0, MISS_TOKEN + i)  # k=0: chain-free fork position
+                outs.append((0, rec, is_hit))
         # capture mirror entries BEFORE advance rotates them
         pre_entries = []
         for i, s in enumerate(seqs):
@@ -396,9 +409,9 @@ def test_batch_shrink_and_regrow(eagle_session):
         [(0,) + s.hit_or_miss(0, MISS_TOKEN + i) for i, s in enumerate(seqs)],
     )
 
-    # shrink: only seqs 0 and 2
+    # shrink: only seqs 0 and 2 (k=0 hits: the chain-free scriptable position)
     sub = [seqs[0], seqs[2]]
-    outs_sub = [(1,) + s.hit_or_miss(1, MISS_TOKEN + i) for i, s in enumerate(sub)]
+    outs_sub = [(0,) + s.hit_or_miss(0, MISS_TOKEN + i) for i, s in enumerate(sub)]
     toks, hits, _ = _drive_round(eagle_session.session, sub, outs_sub)
     for i, (_, _, expected) in enumerate(outs_sub):
         assert hits[i] == int(expected)

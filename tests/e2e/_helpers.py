@@ -13,10 +13,13 @@ import sys
 from pathlib import Path
 
 
-# Canonical local model snapshots (8B target + 1B standalone draft).
-LLAMA_3_1_8B_SNAPSHOT = "/scratch/avner/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
-LLAMA_3_2_1B_SNAPSHOT = "/scratch/avner/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
-EAGLE3_8B_SNAPSHOT = "/scratch/avner/huggingface/hub/models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B/snapshots/61aa096484ad9752292507b0cc9973bb423abb35"
+# Canonical local model snapshots (8B target + 1B standalone draft) — shared
+# with tests/hf/helpers.py so both suites track the same machine layout.
+from tests.hf.helpers import (  # noqa: E402
+    LLAMA_3_1_8B_SNAPSHOT,
+    LLAMA_3_2_1B_SNAPSHOT,
+    EAGLE3_8B_SNAPSHOT,
+)
 
 
 def require_8b_target() -> str:
