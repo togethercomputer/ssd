@@ -1,8 +1,8 @@
 # CLAUDE.md
 
 ## Project Overview
-This codebase implements a speculative decoding algorithm for fast LLM inference called "speculative speculative decoding" which performs speculation in parallel to verification.
-The way it manages to parallelize these operations is as follows:
+This codebase implements a speculative decoding algorithm for fast LLM inference called "speculative speculative decoding" (aka, SSD) which performs speculation in parallel to verification. This algorithm was introduced in this paper which we wrote: https://arxiv.org/pdf/2603.03251
+The way SSD manages to parallelize speculation and verification is as follows:
 - The draft model predicts the most likely outcomes from verifying it's most recent speculation (how many tokens will be accepted, and what the "recovery token" aka "bonus token" will be).
 - The draft model then speculates a sequence of tokens for each of these outcomes, in a sequence of "lookahead" forward passes of the draft model (here, lookahead is the length of each speculation), using a special attention mask that encodes this token tree with many braches off of a shared trunk (the previous speculation).
 - In the case where one of these outcomes occurs, we can immediately return the corresponding speculation from the "speculation cache".
