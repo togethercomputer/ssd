@@ -75,15 +75,20 @@ CITIES = ["San Francisco", "Kyoto", "Nairobi", "Reykjavik"]
 # ~1.0). This is the chaos-immune conditioning check — it catches the
 # activation-misalignment bug class directly.
 ACT_REL_DIFF_THRESHOLD = 0.15
-# Eagle cache-hit ("chain") rounds at B>1: round-to-round batch-composition
-# changes add bf16 perturbation sources into the recurrence chain, so the
-# one-round-delay reconstruction diverges more often than at B=1 (where the
-# single-seq test holds 0.90/0.80). Verified benign on this setup: shipped
-# activations clean (see ACT_REL_DIFF_THRESHOLD), completions exactly HF,
-# accept lengths exact, draft bit-deterministic. These bounds only catch
-# catastrophic conditioning bugs (which score near 0).
-BATCH_CHAIN_TOKEN_FRACTION = 0.6
-BATCH_CHAIN_ROUND_FRACTION = 0.35
+# Eagle cache-hit ("chain") rounds at B>1 track the single-seq bounds closely
+# (observed 0.94-1.0 token / 0.77-0.95 round once the greedy-temperature
+# plumbing bug was fixed — the earlier 0.43-0.71 readings came from the draft
+# SAMPLING its speculations, not from batch effects). Slightly looser than the
+# single-seq 0.90/0.80 to absorb batched-kernel drift.
+BATCH_CHAIN_TOKEN_FRACTION = 0.9
+BATCH_CHAIN_ROUND_FRACTION = 0.7
+# Chain-free rounds (phoenix, jit reconstructions) are held to the strict
+# per-token threshold at B=1; batched varlen kernels flip occasional near-tie
+# tokens (isolated ranks ~5-50 with clean conditioning inputs), so at B>1
+# allow rare small excursions while still catching systematic conditioning
+# bugs (which produce ranks in the hundreds on most rounds).
+BATCH_STRICT_MAX_RANK = 64
+BATCH_STRICT_TOKEN_FRACTION = 0.97
 
 
 def _prompts(tokenizer) -> dict[str, list[int]]:
@@ -281,8 +286,14 @@ def test_batch_ssd_vs_hf_reference(speculator_type, backup, tmp_path):
 
             if strict_ranks:
                 worst = max(max(r) for r in strict_ranks)
-                if worst > SPEC_RANK_THRESHOLD:
-                    failures.append(f"{rid}: chain-free worst rank {worst} (rounds {strict_ranks})")
+                flat_s = [x for r in strict_ranks for x in r]
+                frac_s = sum(x <= SPEC_RANK_THRESHOLD for x in flat_s) / len(flat_s)
+                print(f"[batch][{rid}] strict rounds: worst {worst}, frac<= {frac_s:.3f}", flush=True)
+                if worst > BATCH_STRICT_MAX_RANK or frac_s < BATCH_STRICT_TOKEN_FRACTION:
+                    failures.append(
+                        f"{rid}: chain-free rounds off reference (worst rank {worst}, "
+                        f"token frac {frac_s:.3f}; rounds {strict_ranks})"
+                    )
             if chain_ranks:
                 flat = [x for r in chain_ranks for x in r]
                 ft = sum(x <= SPEC_RANK_THRESHOLD for x in flat) / len(flat)

@@ -121,6 +121,10 @@ def launch_tgl_server(
         "--page-size", "64",
         "--speculative-async-communicate-cache-hits",
         "--speculative-async-communicate-logits",
+        # Derive the async NCCL store port from the HTTP port: the fixed
+        # default (29600) collides with any other async-spec server on the
+        # box, including other users' (observed EADDRINUSE on a shared node).
+        "--speculative-async-port", str(port + 1),
         # "--disable-cuda-graph",
     ]
     cmd.extend(extra_args)
