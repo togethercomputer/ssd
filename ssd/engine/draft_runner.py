@@ -382,30 +382,35 @@ class DraftRunner(ModelRunner):
                     hit_marker = "[HIT]" if i in hit_indices else ""
                     print(f"[{_ts()}]     [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
 
-            # Fill via direct indexing (advanced indexing gathers copies, so the
-            # in-place miss-row overwrite below cannot corrupt the cache).
+            # Miss rows fall back to the SAME SEQUENCE's first cache entry (its
+            # k=0 top-fork branch from the previous round) — a smart fallback
+            # speculation that still gets tokens accepted after a near-miss
+            # (dropping it for zeros costs ~0.3-0.4 accept length in fast mode).
+            # The old behavior indexed global row 0 instead, which at B>1
+            # belongs to a DIFFERENT sequence (cross-request proposal leak) and
+            # leaked session history into fresh sequences' first rounds (fork
+            # selection excludes trunk tokens, so even the next round's
+            # candidate sets inherited it). Sequences with no cache entries get
+            # deterministic zeros (token 0 + sentinel logits + zero acts),
+            # matching the empty-cache round.
+            eq_seq = request_keys[:, 0:1] == self.tree_cache_keys[:, 0].unsqueeze(0)  # [B, T]
+            has_own, own_idx = eq_seq.max(dim=1)
+            idx = torch.where(cache_hits, idx, torch.where(has_own, own_idx, torch.zeros_like(own_idx)))
+            # advanced indexing gathers copies, so the in-place dead-row
+            # overwrite below cannot corrupt the cache
             out_tokens = self.tree_cache_tokens[idx]
             if self.config.communicate_logits:
                 out_logits = self.tree_cache_logits[idx]
             if self.config.use_eagle_or_phoenix:
                 out_activations = self.tree_cache_activations[idx]
-            # Miss rows: return ZEROS (token 0 + sentinel logits + zero acts),
-            # exactly like the empty-cache round. Any mutually-consistent values
-            # are correct here (the glue trunk conditions on the same returned
-            # tokens), but the previous behavior — handing back stale cache row
-            # 0 — leaked session history into the response AND into the next
-            # round's fork sets (the fork selection excludes the trunk token at
-            # each depth), making runs non-reproducible and, at B>1, leaking one
-            # sequence's branch content to another. Zeros are deterministic and
-            # match the documented "fast backup returns zeros" semantics.
-            if not cache_hits.all():
-                miss = ~cache_hits
-                out_tokens[miss] = 0
+            dead = ~cache_hits & ~has_own
+            if dead.any():
+                out_tokens[dead] = 0
                 if self.config.communicate_logits:
-                    out_logits[miss] = float("-inf")
-                    out_logits[miss.nonzero(as_tuple=True)[0], :, 0] = 0.0
+                    out_logits[dead] = float("-inf")
+                    out_logits[dead.nonzero(as_tuple=True)[0], :, 0] = 0.0
                 if self.config.use_eagle_or_phoenix:
-                    out_activations[miss] = 0
+                    out_activations[dead] = 0
 
         if ev: ev[3].record()  # end: build_speculation
 

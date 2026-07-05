@@ -140,37 +140,42 @@ def test_first_match_wins_on_duplicate_keys():
     assert torch.equal(out_tokens[0], m.tree_cache_tokens[dup_of])
 
 
-def test_miss_rows_return_deterministic_zeros():
-    """Miss rows must return ZEROS (token 0 + sentinel logits + zero acts),
-    exactly like the empty-cache round — NOT stale cache rows, which leaked
-    session history into responses and (via the trunk-token exclusion) into the
-    next round's fork sets, and at B>1 leaked one sequence's branch content to
-    another. The glue trunk must still be built from the returned tokens, and
-    hit rows must be untouched by the miss-row overwrite (gather = copy)."""
+def test_miss_rows_fall_back_to_own_sequence_row():
+    """Miss rows fall back to the SAME sequence's first cache entry (its k=0
+    top-fork branch — a smart fallback that keeps earning accepts), NEVER to
+    another sequence's rows (the old global-row-0 behavior leaked one
+    request's branch content to another at B>1). Sequences with no cache
+    entries get deterministic zeros. Hit rows and the cache itself must be
+    untouched, and the glue trunk built from the returned tokens."""
     m = _mock_runner()
     _, tokens, logits, acts = _populate(m, seq_ids=[7, 3], cache_hits=[1, 1])
 
     request_keys = torch.stack([
         m.tree_cache_keys[4],                              # hit (seq 7, k=2)
+        torch.tensor([3, 1, V + 5], dtype=torch.int64),    # miss: known seq 3
         torch.tensor([99, 1, V + 5], dtype=torch.int64),   # miss: unknown seq
     ])
     out_tokens, out_logits, glue_ids, cache_hits, out_acts = DraftRunner.hit_cache(
-        m, request_keys, 2, K,
-        num_tokens=torch.tensor([10, 20]),
-        temperatures=torch.zeros(2),
-        draft_block_tables=torch.zeros(2, 4, dtype=torch.int32),
+        m, request_keys, 3, K,
+        num_tokens=torch.tensor([10, 20, 30]),
+        temperatures=torch.zeros(3),
+        draft_block_tables=torch.zeros(3, 4, dtype=torch.int32),
     )
-    assert cache_hits.tolist() == [True, False]
+    assert cache_hits.tolist() == [True, False, False]
     assert torch.equal(out_tokens[0], tokens[4])
     assert torch.equal(out_logits[0], logits[4])
     assert torch.equal(out_acts[0], acts[4])
-    # miss row: deterministic zeros/sentinel, independent of cache content
-    assert (out_tokens[1] == 0).all()
-    assert (out_logits[1, :, 0] == 0).all() and torch.isneginf(out_logits[1, :, 1:]).all()
-    assert (out_acts[1] == 0).all()
-    # the cache itself must NOT have been zeroed by the miss-row overwrite
+    # known-seq miss: that sequence's OWN first entry (seq 3's rows start at MQ)
+    assert torch.equal(out_tokens[1], tokens[MQ])
+    assert torch.equal(out_logits[1], logits[MQ])
+    assert torch.equal(out_acts[1], acts[MQ])
+    # unknown-seq miss: deterministic zeros/sentinel
+    assert (out_tokens[2] == 0).all()
+    assert (out_logits[2, :, 0] == 0).all() and torch.isneginf(out_logits[2, :, 1:]).all()
+    assert (out_acts[2] == 0).all()
+    # the cache itself must NOT have been mutated by the dead-row overwrite
     assert torch.equal(m.tree_cache_tokens, tokens)
-    glue = glue_ids.view(2, K + 1)
+    glue = glue_ids.view(3, K + 1)
     assert torch.equal(glue[:, 1:], out_tokens)
 
 
