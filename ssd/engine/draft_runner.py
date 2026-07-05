@@ -382,13 +382,30 @@ class DraftRunner(ModelRunner):
                     hit_marker = "[HIT]" if i in hit_indices else ""
                     print(f"[{_ts()}]     [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
 
-            # Fill via direct indexing (miss slots get stale cache data, but that's ok since we can
-            # return any tokens/logits for cache misses, as long as they are consistent with one another).
+            # Fill via direct indexing (advanced indexing gathers copies, so the
+            # in-place miss-row overwrite below cannot corrupt the cache).
             out_tokens = self.tree_cache_tokens[idx]
             if self.config.communicate_logits:
                 out_logits = self.tree_cache_logits[idx]
             if self.config.use_eagle_or_phoenix:
                 out_activations = self.tree_cache_activations[idx]
+            # Miss rows: return ZEROS (token 0 + sentinel logits + zero acts),
+            # exactly like the empty-cache round. Any mutually-consistent values
+            # are correct here (the glue trunk conditions on the same returned
+            # tokens), but the previous behavior — handing back stale cache row
+            # 0 — leaked session history into the response AND into the next
+            # round's fork sets (the fork selection excludes the trunk token at
+            # each depth), making runs non-reproducible and, at B>1, leaking one
+            # sequence's branch content to another. Zeros are deterministic and
+            # match the documented "fast backup returns zeros" semantics.
+            if not cache_hits.all():
+                miss = ~cache_hits
+                out_tokens[miss] = 0
+                if self.config.communicate_logits:
+                    out_logits[miss] = float("-inf")
+                    out_logits[miss.nonzero(as_tuple=True)[0], :, 0] = 0.0
+                if self.config.use_eagle_or_phoenix:
+                    out_activations[miss] = 0
 
         if ev: ev[3].record()  # end: build_speculation
 

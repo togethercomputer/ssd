@@ -140,10 +140,13 @@ def test_first_match_wins_on_duplicate_keys():
     assert torch.equal(out_tokens[0], m.tree_cache_tokens[dup_of])
 
 
-def test_miss_rows_single_source_consistency():
-    """Misses index cache row 0 (argmax of all-False). Arbitrary is fine — but
-    tokens, logits and activations must come from the SAME row so the response
-    is self-consistent, and the glue trunk must be built from those tokens."""
+def test_miss_rows_return_deterministic_zeros():
+    """Miss rows must return ZEROS (token 0 + sentinel logits + zero acts),
+    exactly like the empty-cache round — NOT stale cache rows, which leaked
+    session history into responses and (via the trunk-token exclusion) into the
+    next round's fork sets, and at B>1 leaked one sequence's branch content to
+    another. The glue trunk must still be built from the returned tokens, and
+    hit rows must be untouched by the miss-row overwrite (gather = copy)."""
     m = _mock_runner()
     _, tokens, logits, acts = _populate(m, seq_ids=[7, 3], cache_hits=[1, 1])
 
@@ -159,10 +162,14 @@ def test_miss_rows_single_source_consistency():
     )
     assert cache_hits.tolist() == [True, False]
     assert torch.equal(out_tokens[0], tokens[4])
-    # miss row: all three tensors from cache row 0
-    assert torch.equal(out_tokens[1], tokens[0])
-    assert torch.equal(out_logits[1], logits[0])
-    assert torch.equal(out_acts[1], acts[0])
+    assert torch.equal(out_logits[0], logits[4])
+    assert torch.equal(out_acts[0], acts[4])
+    # miss row: deterministic zeros/sentinel, independent of cache content
+    assert (out_tokens[1] == 0).all()
+    assert (out_logits[1, :, 0] == 0).all() and torch.isneginf(out_logits[1, :, 1:]).all()
+    assert (out_acts[1] == 0).all()
+    # the cache itself must NOT have been zeroed by the miss-row overwrite
+    assert torch.equal(m.tree_cache_tokens, tokens)
     glue = glue_ids.view(2, K + 1)
     assert torch.equal(glue[:, 1:], out_tokens)
 
