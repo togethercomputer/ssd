@@ -310,7 +310,11 @@ class DraftRunner(ModelRunner):
 
         assert request_keys.shape == (B, 3), f"ERROR in hit_cache: request_keys should be (B, 3), got {request_keys.shape}"
 
-        out_activations = torch.empty(
+        # zeros (not empty): on the empty-cache fast path nothing below fills this,
+        # and it flows into the glue decode as the conditioning stream for the spec
+        # slots. Uninitialized memory there is nondeterministic and can inject
+        # NaN/Inf into KV that later code assumes is merely "stale but finite".
+        out_activations = torch.zeros(
             B, K, self.hidden_states_dim,
             dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle_or_phoenix else None

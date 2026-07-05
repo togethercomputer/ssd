@@ -55,13 +55,27 @@ def verify(
     # Rows eligible for ratio-acceptance must both need ratio (any temp>0)
     # AND be cache hits (i.e., tokens were actually sampled from q).
     base_ratio_rows = ((temps_t > 0) | (temps_q > 0))
-    
+
+    if not jit_speculate and cache_hits is None and bool(base_ratio_rows.any()):
+        raise ValueError(
+            "verify(): temperature>0 with jit_speculate=False requires cache_hits "
+            "(set communicate_cache_hits=True). Without it verify cannot tell which "
+            "rows were actually sampled from the draft distribution q and would "
+            "silently fall back to greedy acceptance, which is not lossless."
+        )
+
     if jit_speculate:
         ratio_rows = base_ratio_rows
     else:
         ratio_rows = base_ratio_rows & (cache_hits.to(torch.bool) if cache_hits is not None else torch.zeros_like(base_ratio_rows, dtype=torch.bool))
 
     do_any_ratio = ratio_rows.any().item()
+
+    if do_any_ratio and logits_q is None:
+        raise ValueError(
+            "verify(): temperature>0 on cache-hit (or jit-speculated) rows requires "
+            "the draft logits q (set communicate_logits=True) for ratio acceptance."
+        )
 
     # We need probs_p for recovery sampling whenever any temps_t>0 exists,
     # regardless of whether we end up doing ratio on any row.
