@@ -207,22 +207,39 @@ e2e suite silently skip; now shared with `tests/hf/helpers.py` constants.
   change); pin every run's GPUs; derive the async store port from the HTTP
   port (fixed 29600 collides with other users' servers on shared nodes).
 
+## The "standalone engine async hang" — resolved (three stacked causes)
+
+The `ssd.LLM` async "hang" decomposed into three independent defects, none of
+them in the speculation algorithm (a single-prompt async run completes fine
+standalone on a quiet node):
+
+1. **Fixed rendezvous port** (`model_runner.py` hardcoded `tcp://localhost:1223`
+   for the default process group): any foreign process holding the port breaks
+   startup — a torch-store-speaking squatter absorbs the rendezvous and the
+   engine waits forever. LLMEngine now free-port-scans before spawning
+   (children inherit via the pickled config); verified to pass with 1223
+   deliberately squatted. Commit `a841317`.
+2. **The e2e runner never tore the engine down** — it relied on interpreter
+   shutdown, where multiprocessing's atexit joins the non-daemon draft child
+   whose exit depends on NCCL teardown ordering. Now: explicit
+   `llm.exit(hard=False)` + `os._exit(0)` after emitting the result.
+3. **`run_llm_subprocess` captured output via pipes**, so `subprocess.run`
+   returned only on pipe EOF — held open by any lingering engine grandchild.
+   Successful runs surfaced as 600s timeouts. Now: temp-file redirection
+   (returns when the runner exits), `start_new_session` + `killpg` on timeout
+   and completion (no more orphaned engine families squatting on GPUs).
+   Commits `4eef975`.
+
+`claude.md`'s fast-backup description updated to the own-branch-fallback
+semantics (commit `25ece79`).
+
 ## Known remaining issues
 
-- **SSD standalone engine (`ssd.LLM`) async mode hangs in this environment**:
-  every async e2e subprocess (even single-prompt, 12 tokens, eager) times out
-  at 600s, while sync-spec subprocesses complete. The shared draft side is
-  proven healthy in isolation (scripted suite drives a real DraftRunner over
-  NCCL), so this is target-side/init bit-rot in the standalone engine path
-  (tests/e2e last passed on an older branch state per tests/README). Needs its
-  own debugging session; also blocks fully closing the historical
-  `test_multi_prompt_greedy_matches_trace` xfail (B10). The batch-side
-  evidence gathered here (draft bit-determinism + row-permutation
-  equivariance + benign chain near-ties) is consistent with that xfail's
+- The historical `test_multi_prompt_greedy_matches_trace` strict xfail (B10)
+  awaits a clean e2e rerun on the fixed runner mechanics. The batch-side
+  evidence gathered here (draft bit-determinism + row-permutation equivariance
+  + benign chain near-ties, same final tokens) is consistent with that
   divergence being benign kernel drift, not state corruption.
-- `claude.md` still describes fast-mode misses as "all zeros"; actual (and now
-  deliberate) semantics: the sequence's own previous k=0 branch when
-  available, zeros otherwise.
 - verify()'s greedy fallback on miss rows at temperature>0 accepts a proposed
   token iff it equals argmax(p) — a slight distributional bias inherent to the
   fast backup (documented; ratio acceptance can't apply without q).
