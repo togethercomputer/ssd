@@ -53,27 +53,61 @@ def run_llm_subprocess(config: dict, timeout: int = 600, trace_accepts: bool = F
     if trace_accepts:
         env["SSD_TRACE_ACCEPTS"] = "1"
 
-    proc = subprocess.run(
-        [sys.executable, str(runner), "--config-json", json.dumps(config)],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=timeout,
-    )
-    if proc.returncode != 0:
+    # stdout/stderr go to temp FILES, not pipes: with pipes, subprocess.run
+    # returns only on pipe EOF, which requires every GRANDCHILD (the engine's
+    # draft/worker processes) to close them too — a lingering child turns a
+    # successful run into a spurious 600s timeout. With files, wait() returns
+    # the moment the runner itself exits. start_new_session gives us a process
+    # group so a timeout can reap the whole engine family instead of leaving
+    # orphans squatting on GPUs.
+    import signal
+    import tempfile
+
+    with tempfile.TemporaryFile(mode="w+") as fout, tempfile.TemporaryFile(mode="w+") as ferr:
+        proc = subprocess.Popen(
+            [sys.executable, str(runner), "--config-json", json.dumps(config)],
+            stdout=fout,
+            stderr=ferr,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait(timeout=30)
+            raise
+        finally:
+            # Reap any engine children the runner left behind (its exit path
+            # os._exit()s and cannot guarantee every grandchild died).
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        fout.seek(0)
+        ferr.seek(0)
+        stdout = fout.read()
+        stderr = ferr.read()
+
+    if returncode != 0:
         raise RuntimeError(
-            f"runner exited with code {proc.returncode}\n"
-            f"--- stdout ---\n{proc.stdout}\n"
-            f"--- stderr ---\n{proc.stderr}\n"
+            f"runner exited with code {returncode}\n"
+            f"--- stdout ---\n{stdout}\n"
+            f"--- stderr ---\n{stderr}\n"
         )
     # Find the RUNNER_RESULT line
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         if line.startswith("RUNNER_RESULT: "):
             return json.loads(line[len("RUNNER_RESULT: "):])
     raise RuntimeError(
         f"runner did not emit RUNNER_RESULT\n"
-        f"--- stdout ---\n{proc.stdout}\n"
-        f"--- stderr ---\n{proc.stderr}\n"
+        f"--- stdout ---\n{stdout}\n"
+        f"--- stderr ---\n{stderr}\n"
     )
 
 
