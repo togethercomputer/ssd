@@ -51,6 +51,20 @@ Three related defects around continuous batching (commits `8f196015b`, `9600ceb5
 draft always speculated greedily regardless of request temperature. Now plumbed
 from `sampling_info`; greedy runs unchanged. Commit `8f196015b`.
 
+**T5. Finished requests desynced batch state (crash on first early finisher).**
+`prepare_extend_after_decode` rebinds `batch.seq_lens/seq_lens_cpu/
+req_pool_indices` to the draft-extend view, which excludes finished requests;
+the sync worker restores them afterwards, the async override didn't. The first
+request to finish ahead of its batch left these fields sized to the unfinished
+subset while `batch.reqs` stayed full-size → scheduler `filter_batch`
+IndexError (found live by the batched server test). Restored like the sync
+path — deliberately keeping the +1'd `accept_length` and accepted-chain
+`input_ids` the async wire packing depends on. Relatedly,
+`filter_batch(has_been_filtered=True)` (the v1 verify path) arrives with
+spec_info ALREADY rebuilt over unfinished requests; re-gathering with
+old-batch indices corrupted it — now skipped with size asserts. Commit
+`9600ceb54`.
+
 ### SSD repo — shared engine code
 
 **S1. `verify()` temperature>0 landmines** (`ssd/utils/verify.py`): with
@@ -68,6 +82,27 @@ conditioning — nondeterministic, NaN-able. Now zero-filled. Commit `d7325aa`.
 that is shadowed by the later instance method of the same name (the classmethod
 is dead code); callers must use `prepare()` + instance `.receive()`. Documented
 in the harness; cleanup optional.
+
+**S4. CUDA-graph ghost-row padding crashed on narrow wire block tables**
+(`cudagraph_helpers.run_glue_decode_cudagraph`): padding batch size up to a
+graph bucket assigned a wire-width block-table row (TGL sizes tables
+dynamically, ~3 wide) into the 32-wide static buffer row without slicing —
+broadcast error, draft process death, the first time B needed bucket padding
+(e.g. B=3 → bucket 4). Structurally impossible at `max_num_seqs=1`, which is
+why every single-request run passed. Commit `651969f`.
+
+**S5. Cache-miss responses leaked state across sequences and sessions.**
+Miss rows were filled from tree-cache row 0 ("any consistent tokens are ok").
+Two real problems: at B>1 row 0 belongs to a *different sequence* (cross-request
+proposal leak), and responses depended on session history — including through
+the next round's fork sets, since fork selection excludes the trunk token at
+each depth (caught by the scripted suite's rerun-determinism and
+row-permutation-equivariance tests). But plain zeros cost ~0.3–0.4 accept
+length: row-0 reuse was a *smart fallback* (the sequence's previous k=0
+top-fork branch often still fits after a near-miss). Final fix: fall back to
+the SAME sequence's first cache row (bit-identical to the old behavior at B=1,
+no cross-sequence leak at B>1), deterministic zeros only for sequences with no
+cache entries. Commits `4834672`, `0b4cb6f`.
 
 ### Test bugs (the reference test was wrong, not the engine)
 
@@ -145,8 +180,40 @@ e2e suite silently skip; now shared with `tests/hf/helpers.py` constants.
 
 ## Verification status
 
-- `tests/unit`: 116 passed (CPU).
+- `tests/unit`: **116 passed** (CPU, seconds).
 - Reference matrix (B=1, lookahead 4): **9/9 passed** (standalone/eagle/phoenix
-  × fast/jit/force-jit) after the test fixes — engine unchanged.
-- Batched server test, scripted DraftRunner suite, e2e sync-vs-force-jit:
-  <PENDING — fill in final results>
+  × fast/jit/force-jit) after the test fixes.
+- Batched server test (TGL, eagle-fast, N=4 concurrent): **passed**, both from a
+  saved trace and a fresh server run — completions exactly HF, per-request
+  accept lengths exact, shipped activations clean per slot, joins/leaves
+  exercised (B ramps 1→4, early finishers leave).
+- Scripted DraftRunner suite: **8/8 passed** (hit/miss exactness at B=1/2/4,
+  mirror content, row-permutation equivariance bit-exact, rerun determinism,
+  batch shrink/regrow with stale-cache probe).
+- PENDING at time of writing (ssh credentials to the GPU nodes expired
+  mid-campaign): a final rerun of the fast-mode combos + full matrix + the
+  remaining batch combos (eagle-jit, phoenix-fast, standalone-fast) on the
+  final code state. NOTE: the last fast-lane attempt executed stale .pyc
+  bytecode (NFS attribute caching defeated Python's mtime check after an
+  over-NFS edit) — pycache has been purged; treat "edit locally, run remotely
+  immediately" with caution.
+
+## Known remaining issues
+
+- **SSD standalone engine (`ssd.LLM`) async mode hangs in this environment**:
+  every async e2e subprocess (even single-prompt, 12 tokens, eager) times out
+  at 600s, while sync-spec subprocesses complete. The shared draft side is
+  proven healthy in isolation (scripted suite drives a real DraftRunner over
+  NCCL), so this is target-side/init bit-rot in the standalone engine path
+  (tests/e2e last passed on an older branch state per tests/README). Needs its
+  own debugging session; also blocks fully closing the historical
+  `test_multi_prompt_greedy_matches_trace` xfail (B10). The batch-side
+  evidence gathered here (draft bit-determinism + row-permutation
+  equivariance + benign chain near-ties) is consistent with that xfail's
+  divergence being benign kernel drift, not state corruption.
+- `claude.md` still describes fast-mode misses as "all zeros"; actual (and now
+  deliberate) semantics: the sequence's own previous k=0 branch when
+  available, zeros otherwise.
+- verify()'s greedy fallback on miss rows at temperature>0 accepts a proposed
+  token iff it equals argmax(p) — a slight distributional bias inherent to the
+  fast backup (documented; ratio acceptance can't apply without q).
