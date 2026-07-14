@@ -1,38 +1,47 @@
 
 import pickle
 import time
+from datetime import datetime, timedelta
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from transformers import AutoTokenizer, AutoConfig
 import os
-import flashinfer
 from ssd.config import Config
+from ssd.utils import profile
 from ssd.engine.sequence import Sequence
 from ssd.models.qwen3 import Qwen3ForCausalLM
 from ssd.models.llama3 import LlamaForCausalLM
 from ssd.models.eagle3_draft_llama3 import Eagle3DraftForCausalLM
+from ssd.models.phoenix_draft_llama3 import PhoenixLlamaForCausalLM
 from ssd.layers.sampler import Sampler
 from ssd.utils.context import set_context, reset_context, get_context
 from ssd.utils.loader import load_model
 from ssd.engine.helpers.runner_helpers import (
+    COMMAND,
     prepare_decode_tensors_from_seqs, 
     prepare_block_tables_from_seqs, 
-    prepare_prefill_tensors_from_seqs
+    prepare_prefill_tensors_from_seqs,
+    receive_tensor,
+    send_tensor,
 )
 from ssd.engine.helpers.cudagraph_helpers import (
     run_verify_cudagraph,
     run_decode_cudagraph,
-    run_fi_tree_decode_cudagraph,
+    run_tree_decode_cudagraph,
     run_glue_decode_cudagraph,
     capture_cudagraph,
     capture_verify_cudagraph,
-    capture_fi_tree_decode_cudagraph,
+    capture_tree_decode_cudagraph,
     capture_glue_decode_cudagraph,
-    get_custom_mask,
 )
-    
+
+NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
+
+def _ts():
+    return f'[[{datetime.now().strftime("%H:%M:%S.%f")[:-3]}]]'
+
 
 class ModelRunner:
 
@@ -42,24 +51,20 @@ class ModelRunner:
         
         assert is_draft in [True, False], "ERROR in ModelRunner: is_draft must be True or False"
         self.is_draft = is_draft
-        if self.is_draft: 
-            if config.draft_hf_config.torch_dtype != config.hf_config.torch_dtype:
-                if self.verbose:
-                    print(f"Warning: Draft dtype {config.draft_hf_config.torch_dtype} differs from target {config.hf_config.torch_dtype}. Casting draft to {config.hf_config.torch_dtype}.")
-                config.draft_hf_config.torch_dtype = config.hf_config.torch_dtype
+        if self.is_draft:
             assert (config.draft_hf_config.vocab_size == config.hf_config.vocab_size) or config.use_eagle, "ERROR in ModelRunner: draft_hf_config.vocab_size != hf_config.vocab_size"
-        
+
         self.hf_config = config.hf_config if not is_draft else config.draft_hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path if config.tokenizer_path else config.model, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path if config.tokenizer_path else config.model, use_fast=True, trust_remote_code=True)
         self.max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
 
         assert self.hf_config is not None, "ERROR in ModelRunner: hf_config is None" # this implies boundedness to the end 
         
         # TODO: Get rid of this.
         if self.is_draft:
-            should_use_dist = self.config.draft_async
+            should_use_dist = self.config.draft_async and self.config.async_nccl_port is None
         else:
             should_use_dist = self.config.num_gpus > 1
 
@@ -67,6 +72,7 @@ class ModelRunner:
         self.world_size = config.num_gpus if should_use_dist else 1
         self.rank = rank
         self.use_eagle = config.use_eagle
+        self.use_phoenix = config.use_phoenix
 
         if config.draft_async:
             self.draft_rank = config.num_gpus - 1
@@ -86,12 +92,10 @@ class ModelRunner:
         self._exiting = False 
         
         torch.cuda.set_device(self.rank)
-        self.device = torch.device(f'cuda:{self.rank}') 
-        
-        # cudagraph logic for FlashInfer kernels, need diff wrapper for each batch size we make a graph for 
-        if is_draft and config.draft_async:
-            self._init_flashinfer_wrappers()
-        
+        self.device = torch.device(f'cuda:{self.rank}')
+        self._cmd = torch.empty(1, dtype=torch.int64, device=self.device)
+
+
         if self.verbose: print(f'INSIDE MODEL RUNNER INIT, DRAFT={is_draft}', flush=True)
         self.tp_pg = None 
 
@@ -114,7 +118,7 @@ class ModelRunner:
             assert num_tp_gpus == 1, "ERROR in ModelRunner: draft should have tp_size=1"
             self.tp_pg = None # every rank is given an object from self.tp_pg, even tho draft doesnt participate it gets GROUP_NON_MEMBER object != None back, so we can't assert None here, we 
         
-        print(f'[model_runner] about to setup and warmup model and cudagraphs, is use_eagle={self.use_eagle}', flush=True)
+        print(f'[model_runner] about to setup and warmup model and cudagraphs, is use_eagle={self.use_eagle}, is use_phoenix={self.use_phoenix}', flush=True)
         model_type = self.setup_and_warmup_model_and_cudagraphs(config, self.hf_config, init_q, is_draft)
 
         if self.verbose: print(f'-----CAPTURED {model_type}CUDAGRAPH----', flush=True)
@@ -156,56 +160,6 @@ class ModelRunner:
                 
         if self.verbose: print(f'-----{model_type}MODEL RUNNER INITIALIZED----', flush=True)
 
-    def _init_flashinfer_wrappers(self):
-        """Initialize FlashInfer wrappers for draft async mode."""
-        self.workspace_buffer = torch.zeros(
-            512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}") 
-        
-        if self.config.enforce_eager: 
-            self.only_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
-        else: 
-            max_bs = min(self.config.max_num_seqs, 512)
-            max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
-            
-            # FlashInfer kernel tensors
-            # pages_for_max_len = (self.config.max_model_len + self.block_size - 1) // self.block_size
-            last_page_len_max_len = self.config.max_model_len % self.block_size
-            last_page_len_max_len = self.block_size if last_page_len_max_len == 0 else last_page_len_max_len
-            MQ_LEN = self.config.async_fan_out * (self.config.speculate_k + 1)
-            
-            cu_seqlens_q = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
-            kv_indptr = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
-            kv_indices = torch.empty(max_bs * max_num_blocks, dtype=torch.int32, device=self.device)
-            kv_last_page_len = torch.empty(max_bs, dtype=torch.int32, device=self.device)
-            custom_mask_buf = torch.empty(max_bs * MQ_LEN * self.config.max_model_len, dtype=torch.uint8, device=self.device)
-            mask_indptr_buf = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
-            
-            # Create graph_bs_list to match what will be used in cudagraph_helpers.py
-            graph_bs_list = [1]
-            for bs in [2, 4, 8] + list(range(16, max_bs + 1, 16)):
-                if bs <= max_bs:
-                    graph_bs_list.append(bs)
-            if max_bs not in graph_bs_list:
-                graph_bs_list.append(max_bs)
-            graph_bs_list.sort()
-            
-            # Create a dict of wrappers, one for each bs we will touch in cudagraph_helpers.py
-            self.prefill_wrappers = {}
-            print(f'[model_runner about to wrapper.init()] graph_bs_list={graph_bs_list}', flush=True)
-            for bs in graph_bs_list:
-                self.prefill_wrappers[bs] = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer, "NHD", 
-                    use_cuda_graph=True, 
-                    qo_indptr_buf=cu_seqlens_q[:bs + 1],
-                    paged_kv_indptr_buf=kv_indptr[:bs + 1],
-                    paged_kv_indices_buf=kv_indices[:bs * max_num_blocks],
-                    paged_kv_last_page_len_buf=kv_last_page_len[:bs],
-                    custom_mask_buf=custom_mask_buf[:bs * MQ_LEN * self.config.max_model_len],
-                    mask_indptr_buf=mask_indptr_buf[:bs + 1],
-                )
-            print(f'wrapper backend is {self.prefill_wrappers[bs]._backend}', flush=True)
-
-
     def setup_and_warmup_model_and_cudagraphs(self, config: Config, hf_config: AutoConfig, init_q=None, is_draft=False):
         # cudagraphs 
         self.graph_vars = {}
@@ -217,6 +171,9 @@ class ModelRunner:
         if config.use_eagle and is_draft:
             print(f'[EAGLE3] Loading Eagle3DraftForCausalLM as model_class', flush=True)
             model_class = Eagle3DraftForCausalLM
+        elif config.use_phoenix and is_draft:
+            print(f'[PHOENIX] Loading PhoenixDraftForCausalLM as model_class', flush=True)
+            model_class = PhoenixLlamaForCausalLM
         elif hf_config.model_type == 'llama':
             model_class = LlamaForCausalLM
         elif hf_config.model_type == 'qwen3':
@@ -236,11 +193,12 @@ class ModelRunner:
             tp_size=self.num_tp_gpus,
         )
         
-        if config.use_eagle:
-            kwargs['use_eagle'] = True
+        if config.use_eagle_or_phoenix:
+            kwargs['use_eagle'] = config.use_eagle
+            kwargs['use_phoenix'] = config.use_phoenix
             kwargs['eagle_layers'] = self.config.eagle_layers
-            
-        if model_class == Eagle3DraftForCausalLM:
+
+        if model_class in [Eagle3DraftForCausalLM, PhoenixLlamaForCausalLM]:
             kwargs['d_model_target'] = config.d_model_target
             kwargs['debug_mode'] = config.debug_mode
             
@@ -256,7 +214,37 @@ class ModelRunner:
         load_model(self.model, config.model, target_path=target_path, target_hidden_size=target_hidden_size)
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
-            self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
+            if config.async_nccl_port is not None:
+                _nccl_timeout = timedelta(minutes=24 * 60)
+                _banner = "=" * 80
+                print(
+                    f'\n{_banner}\n'
+                    f'>>> DRAFT: WAITING for target server at '
+                    f'{config.async_nccl_host}:{config.async_nccl_port} '
+                    f'to form NCCL process group (timeout={_nccl_timeout}) ...\n'
+                    f'{_banner}\n',
+                    flush=True,
+                )
+                from torch.distributed import TCPStore
+                from ssd.utils.dist_utils import init_custom_process_group
+                store = TCPStore(config.async_nccl_host, port=config.async_nccl_port,
+                                 world_size=2, is_master=False,
+                                 timeout=_nccl_timeout)
+                with torch.cuda.device(self.device):
+                    self.async_pg = init_custom_process_group(
+                        backend="nccl", store=store, world_size=2, rank=1,
+                        group_name="async_spec", timeout=_nccl_timeout)
+                print(f'\n{_banner}\n>>> DRAFT: NCCL process group formed! Now receiving kv_cache_size...\n{_banner}\n', flush=True)
+                # Cross-node: receive kv_cache_size from target so draft
+                # allocates the same number of KV cache blocks.
+                kv_buf = torch.empty(1, dtype=torch.int64, device=self.device)
+                kv_buf = receive_tensor(kv_buf, self.async_pg, 0, name="target kv_cache_size")
+                target_kv_cache_size = kv_buf.item()
+                print(f'[model_runner] Received target kv_cache_size={target_kv_cache_size} via NCCL', flush=True)
+                if target_kv_cache_size > 0:
+                    config.num_kvcache_blocks = target_kv_cache_size
+            else:
+                self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
         if self.verbose:
             print(f'-----{model_type}MODEL LOADED----', flush=True)
         if config.sampler_x is not None:
@@ -264,42 +252,51 @@ class ModelRunner:
             assert sum(config.fan_out_list) == sum(config.fan_out_list_miss) == config.async_fan_out * (config.speculate_k + 1), "ERROR in ModelRunner: fancy sampling only supported for constant fan out for now."
 
         self.sampler = Sampler(sampler_x=config.sampler_x, async_fan_out=config.async_fan_out)
-        if self.verbose:
-            print(f'-----WARMING UP {model_type}MODEL----', flush=True)
+        print(f'[model_runner] Warming up {model_type}model...', flush=True)
         self.warmup_model()
-        if self.verbose:
-            print(f'-----ALLOCATING {model_type}KV CACHE----', flush=True)
+        print(f'[model_runner] Allocating {model_type}KV cache...', flush=True)
         self.allocate_kv_cache()
-        if init_q is not None:
-            # super().__init__() runs warmup and calculates num_kvcache_blocks, pass that up
-            init_q.put(self.config.num_kvcache_blocks)
-            init_q.close()
 
         if not self.enforce_eager:
-            # if not self.is_draft or (self.is_draft and self.config.draft_async and self.config.speculate): 
+            print(f'[model_runner] Capturing CUDA graphs for {model_type}model...', flush=True)
+            # if not self.is_draft or (self.is_draft and self.config.draft_async and self.config.speculate):
             decode_graph_vars, decode_graph_pool, decode_graphs, decode_graph_bs_list = capture_cudagraph(self)  # decode cudagraph, draft needs in spec and target in normal
             self.graph_vars["decode"] = decode_graph_vars
             self.graph_pools["decode"] = decode_graph_pool
             self.graphs["decode"] = decode_graphs
             self.graph_bs_list["decode"] = decode_graph_bs_list
-            if self.config.speculate and not (self.is_draft and self.config.use_eagle):  # verify CG: target always, non-EAGLE draft for fan-out; EAGLE draft uses glue_decode CG instead
+            if self.config.speculate and not (self.is_draft and self.config.use_eagle_or_phoenix):  # verify CG: target always, non-EAGLE draft for fan-out; EAGLE draft uses glue_decode CG instead
                 verify_graph_vars, verify_graph_pool, verify_graphs, verify_graph_bs_list = capture_verify_cudagraph(self)
                 self.graph_vars["verify"] = verify_graph_vars
                 self.graph_pools["verify"] = verify_graph_pool
                 self.graphs["verify"] = verify_graphs
                 self.graph_bs_list["verify"] = verify_graph_bs_list
             if self.config.speculate and self.is_draft and self.config.draft_async:
-                fi_tree_decode_graph_vars, fi_tree_decode_graph_pool, fi_tree_decode_graphs, fi_tree_decode_graph_bs_list = capture_fi_tree_decode_cudagraph(self)  # fi tree decode cudagraph, draft only
-                self.graph_vars["fi_tree_decode"] = fi_tree_decode_graph_vars
-                self.graph_pools["fi_tree_decode"] = fi_tree_decode_graph_pool
-                self.graphs["fi_tree_decode"] = fi_tree_decode_graphs
-                self.graph_bs_list["fi_tree_decode"] = fi_tree_decode_graph_bs_list
-            if self.config.speculate and self.is_draft and self.config.draft_async and self.config.use_eagle:
+                tree_decode_graph_vars, tree_decode_graph_pool, tree_decode_graphs, tree_decode_graph_bs_list = capture_tree_decode_cudagraph(self)  # fi tree decode cudagraph, draft only
+                self.graph_vars["tree_decode"] = tree_decode_graph_vars
+                self.graph_pools["tree_decode"] = tree_decode_graph_pool
+                self.graphs["tree_decode"] = tree_decode_graphs
+                self.graph_bs_list["tree_decode"] = tree_decode_graph_bs_list
+            if self.config.speculate and self.is_draft and self.config.draft_async and self.config.use_eagle_or_phoenix:
                 glue_gv, glue_pool, glue_graphs, glue_bs_list = capture_glue_decode_cudagraph(self)
                 self.graph_vars["glue_decode"] = glue_gv
                 self.graph_pools["glue_decode"] = glue_pool
                 self.graphs["glue_decode"] = glue_graphs
                 self.graph_bs_list["glue_decode"] = glue_bs_list
+
+        print(f'[model_runner] {model_type}model initialization complete.', flush=True)
+        if init_q is not None:
+            # Signal the scheduler that we're fully initialized (model loaded,
+            # KV cache allocated, CUDA graphs captured).  Must happen after
+            # CUDA graph capture so the scheduler doesn't send NCCL requests
+            # before the draft runner enters its recv loop.
+            init_q.put(self.config.num_kvcache_blocks)
+            init_q.close()
+        elif self.is_draft and self.draft_async and hasattr(self, 'async_pg'):
+            # Cross-node mode: no mp.Queue available, signal readiness via NCCL.
+            ready_buf = torch.tensor([self.config.num_kvcache_blocks], dtype=torch.int64, device=self.device)
+            send_tensor(ready_buf, self.async_pg, 0, name="num_kvcache_blocks")
+            print(f'[model_runner] Cross-node init: sent num_kvcache_blocks={self.config.num_kvcache_blocks} via NCCL', flush=True)
 
         return model_type
 
@@ -315,20 +312,23 @@ class ModelRunner:
             self.send_draft_exit_signal()
         except Exception:
             pass
-        # 2) Best-effort local cleanup (no collectives; avoid group destroys in hard mode)
+        # 2) Best-effort local cleanup (no collectives; avoid group destroys in hard mode).
+        # Drop GPU tensors so main-process ranks (target rank 0) actually release
+        # model weights and KV cache — otherwise a subsequent engine or subprocess
+        # on the same GPU will OOM.
         try:
-            if not self.enforce_eager and hasattr(self, "graphs"):
-                del self.graphs
-                if hasattr(self, "graph_pool"):
-                    del self.graph_pool
-            if hasattr(self, "verify_graphs"):
-                del self.verify_graphs
-            if hasattr(self, "verify_graph_pool"):
-                del self.verify_graph_pool
-            if hasattr(self, "glue_graphs"):
-                del self.glue_graphs
-            if hasattr(self, "glue_graph_pool"):
-                del self.glue_graph_pool
+            for attr in (
+                "graphs", "graph_pools", "graph_vars", "graph_bs_list",
+                "prefill_wrappers", "only_prefill_wrapper", "workspace_buffer",
+                "verify_graphs", "verify_graph_pool",
+                "glue_graphs", "glue_graph_pool",
+                "model", "kv_cache", "sampler",
+            ):
+                if hasattr(self, attr):
+                    setattr(self, attr, None)
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
         except Exception:
             pass
         # Close SHM on all ranks that have it
@@ -356,7 +356,7 @@ class ModelRunner:
                 pass
             try:
                 # Default group
-                if self.world_size > 1 or (self.draft_async and self.is_draft):
+                if (self.world_size > 1 or (self.draft_async and self.is_draft)) and self.config.async_nccl_port is None:
                     dist.destroy_process_group()
             except Exception:
                 pass
@@ -365,6 +365,15 @@ class ModelRunner:
         if self.is_draft:
             if self.verbose:
                 print(f"[ModelRunner] Draft hard-exit", flush=True)
+            # os._exit() skips atexit handlers, so the profile trace (registered
+            # via atexit in ssd.utils.profile) would never be written. Flush +
+            # dump explicitly here. No-op unless SSD_PROFILE_TRACE=1.
+            try:
+                from ssd.utils import profile
+                profile.flush()
+                profile.dump_trace()
+            except Exception:
+                pass
             os._exit(0)
         # Target ranks: let the process return if we're a worker (subprocess),
         # main rank will be force-exited by the engine after it joins children.
@@ -378,16 +387,6 @@ class ModelRunner:
             self.call(method_name, *args)
             if method_name == "exit":
                 break
-
-    def recv_cmd(self):
-        t = torch.empty(1, dtype=torch.int64, device=self.device)
-        dist.recv(t, src=0, group=self.async_pg)
-        return int(t.item())
-
-    def recv_tensor(self, shape, dtype=torch.int64):
-        t = torch.empty(shape, dtype=dtype, device=self.device)
-        dist.recv(t, src=0, group=self.async_pg)
-        return t
     
     def send_draft_exit_signal(self):
         """
@@ -398,9 +397,30 @@ class ModelRunner:
             return
         try:
             cmd = torch.tensor([2], dtype=torch.int64, device=self.device)
-            dist.send(cmd, dst=self.draft_rank, group=self.async_pg)
+            send_tensor(cmd, self.async_pg, self.draft_rank, name="draft exit signal")
         except Exception:
+            if NCCL_LOG:
+                print(f"[{_ts()}] [NCCL_LOG SEND_DRAFT_EXIT_SIGNAL] ERROR SENDING DRAFT EXIT SIGNAL", flush=True)
             pass
+
+    def _wait_for_cmd(self, handle_entry=None):
+        """Waits for a command, using the provided handle if available."""
+        if handle_entry:
+            if NCCL_LOG:
+                print(f"[{_ts()}] [NCCL_LOG WAIT_FOR_CMD] WAITING FOR CMD", flush=True)
+
+            work_handle, cmd_tensor = handle_entry
+            # block until the irecv completes and the buffer is filled
+            work_handle.wait()
+        else:
+            # no pending irecv, fall back to the normal recv path
+            cmd_tensor = receive_tensor(self._cmd, self.async_pg, 0, name="cmd", prefix="DRAFT:wait_for_cmd")
+
+        command = COMMAND(cmd_tensor.item())
+        if NCCL_LOG:
+            print(f"[{_ts()}] [NCCL_LOG WAIT_FOR_CMD] CMD RECEIVED: {command}", flush=True)
+        return command, None
+
     def read_shm(self):
         assert self.world_size > 1 and self.rank
         self.event.wait()
@@ -435,10 +455,15 @@ class ModelRunner:
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         
         hidden_states = None
-        if self.config.use_eagle and self.is_draft:
+        if self.config.use_eagle_or_phoenix and self.is_draft:
             num_tokens = num_seqs * max_model_len
             d_model_target = self.config.d_model_target or 4096
-            hidden_states = torch.zeros(num_tokens, 3 * d_model_target, dtype=self.hf_config.torch_dtype, device=self.device)
+            if self.config.use_eagle:
+                hidden_states = torch.zeros(num_tokens, 3 * d_model_target, dtype=self.hf_config.torch_dtype, device=self.device)
+            elif self.config.use_phoenix:
+                hidden_states = torch.zeros(num_tokens, d_model_target, dtype=self.hf_config.torch_dtype, device=self.device)
+            else:
+                raise ValueError(f"Unsupported model type: {self.config.use_eagle_or_phoenix}")
         
         self.run(seqs, True, hidden_states=hidden_states)
         torch.cuda.empty_cache()
@@ -472,7 +497,10 @@ class ModelRunner:
             usable_bytes = max(usable_bytes - reserved_bytes, 0)
             assert usable_bytes > 0, "ERROR: Not enough memory for draft KV cache after accounting for tree_cache for logits storage"
 
-        config.num_kvcache_blocks = int(usable_bytes) // block_bytes
+        if config.num_kvcache_blocks is not None and config.num_kvcache_blocks > 0:
+            config.num_kvcache_blocks = min(config.num_kvcache_blocks, int(usable_bytes) // block_bytes)
+        else:
+            config.num_kvcache_blocks = int(usable_bytes) // block_bytes
         if self.verbose:
             print(f'KV CACHE ALLOCATION for {"TARGET" if not self.is_draft else "DRAFT"} model', flush=True)
             print(f' free={free/1e9:.2f}GB, util={config.gpu_memory_utilization:.2f}', flush=True)
@@ -489,17 +517,23 @@ class ModelRunner:
             num_kv_heads,
             hf_config.head_dim, 
         )
-        
+
         print(f"allocate_kv_cache(): kv_cache shape = {self.kv_cache.shape}", flush=True)
+
+        # Create tree_score_mod once (shared across all attention layers)
+        tree_score_mod = None
+        if self.is_draft and self.draft_async:
+            from ssd.layers.tree_mask import create_tree_score_mod
+            tree_score_mod = create_tree_score_mod(config.max_model_len)
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
-                if self.is_draft and self.draft_async and not self.enforce_eager:
-                    module.prefill_wrappers = self.prefill_wrappers
-                elif self.is_draft and self.draft_async and self.enforce_eager:
-                    module.only_prefill_wrapper = self.only_prefill_wrapper # this will make it not None so it can be used on fwd
+                if self.is_draft and self.draft_async:
+                    module.max_seqlen_k = config.max_model_len
+                    module.tree_score_mod = tree_score_mod
                 layer_id += 1
 
     
@@ -550,46 +584,37 @@ class ModelRunner:
         return temperatures
 
     def eager_tree_decode_plan(self, input_ids, positions, step, cache_hits):
-        """Plan FlashInfer for tree decode in eager mode"""
+        """Set up context metadata for FA4 tree decode in eager mode."""
         assert self.is_draft and self.config.draft_async, "ERROR in eager_tree_decode_plan: not a draft async model"
+        from ssd.layers.tree_mask import build_tree_mask_bias
         context = get_context()
-        
-        K, F = self.config.speculate_k, self.config.async_fan_out
-        # MQ_LEN = F * (K+1)
+        K = self.config.speculate_k
         MQ_LEN = self.config.MQ_LEN
-        flat_batch_size = input_ids.size(0) 
-        B = flat_batch_size // MQ_LEN # [N] tokens = B * sum(fan_out_list)
-        
-        # Convert block_tables to FlashInfer format
-        block_tables = context.block_tables # [B, M]
-        context_lens = context.context_lens # [B]
-        
-        counts = (context_lens + self.block_size - 1) // self.block_size # [B]
-        kv_indptr = torch.cat([torch.tensor([0], device=block_tables.device),
-                               counts.cumsum(dim=0)]).to(torch.int32)  
-        mask = torch.arange(block_tables.size(1), device=block_tables.device)[None, :] < counts[:, None]
-        kv_indices = block_tables[mask]                    # flattened page ids
-        
-        # Last-page actual token count per request
-        kv_last_page_len = (context_lens % self.block_size)
-        kv_last_page_len[kv_last_page_len == 0] = self.block_size
-        kv_last_page_len = kv_last_page_len.to(torch.int32)
-        cu_seqlens_q = torch.arange(B + 1, device=self.device, dtype=torch.int32) * MQ_LEN # assumes same MQ_LEN across batch dimension 
-        custom_mask = get_custom_mask(self.config, context_lens, step, K, F, B, device=self.device, cache_hits=cache_hits)
-        
-        self.only_prefill_wrapper.plan(
-            cu_seqlens_q,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            self.hf_config.num_attention_heads,
-            self.hf_config.num_key_value_heads,
-            self.hf_config.head_dim,
-            self.block_size,
-            custom_mask=custom_mask,
-            q_data_type=self.hf_config.torch_dtype,
-            kv_data_type=self.hf_config.torch_dtype,
+        B = input_ids.size(0) // MQ_LEN
+        context.tree_cu_seqlens_q = torch.arange(B + 1, device=self.device, dtype=torch.int32) * MQ_LEN
+        context.tree_mask_bias = build_tree_mask_bias(
+            context.context_lens, step=step, K=K, MQ_LEN=MQ_LEN,
+            fan_out_list=self.config.fan_out_list,
+            fan_out_list_miss=self.config.fan_out_list_miss,
+            cache_hits=cache_hits,
+            max_kv_stride=self.config.max_model_len,
+            device=self.device,
         )
+
+    @property
+    def hidden_states_dim(self):
+        # The dimension of the hidden states that are concatenated with the draft tokens embeddings
+        # as the input to the Eagle/Phoenix draft model.
+        assert self.config.use_eagle_or_phoenix and self.is_draft
+        return self.config.hf_config.hidden_size if self.config.use_eagle else self.config.d_model_target
+
+    @property
+    def eagle_acts_dim(self):
+        assert self.config.use_eagle_or_phoenix and not self.is_draft
+        if self.config.eagle_layers:
+            return len(self.config.eagle_layers) * self.config.hf_config.hidden_size
+        else:
+            return self.config.hf_config.hidden_size
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, last_only: bool = True, tree_decode_step: int = -1, cache_hits: torch.Tensor | None = None, hidden_states: torch.Tensor | None = None):
@@ -603,10 +628,10 @@ class ModelRunner:
             if is_tree_decode:
                 self.eager_tree_decode_plan(input_ids, positions, tree_decode_step, cache_hits)
             
-            if self.config.use_eagle: 
+            if self.config.use_eagle_or_phoenix:
                 if self.is_draft:
                     assert hidden_states is not None, "hidden_states required for EAGLE draft"
-                    assert isinstance(self.model, Eagle3DraftForCausalLM)
+                    assert isinstance(self.model, Eagle3DraftForCausalLM) or isinstance(self.model, PhoenixLlamaForCausalLM)
                     prenorm = self.model(input_ids, positions, hidden_states)
                     logits = self.model.compute_logits(prenorm, last_only)
                     return logits, prenorm  # return prenorm as conditioning vector for next iteration
@@ -620,7 +645,7 @@ class ModelRunner:
                 return logits 
 
         elif is_tree_decode:
-            return run_fi_tree_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["fi_tree_decode"], tree_decode_step, cache_hits, hidden_states=hidden_states)
+            return run_tree_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["tree_decode"], tree_decode_step, cache_hits, hidden_states=hidden_states)
         elif is_mq_kp1 and hidden_states is not None and "glue_decode" in self.graph_vars:
             # EAGLE draft glue decode with 2K+1 per seq
             return run_glue_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["glue_decode"], hidden_states)
@@ -639,33 +664,32 @@ class ModelRunner:
         draft_return_logits: bool = False,
         hidden_states: torch.Tensor | None = None
     ) -> list[int] | tuple[list[int], torch.Tensor]:
-        _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1" and not is_prefill and not last_only
-        if _pt:
-            torch.cuda.synchronize()
-            _r0 = time.perf_counter()
+        ev = profile.new_events(3)
+        if ev: ev[0].record()
 
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
         else:
             input_ids, positions = self.prepare_decode(seqs, verify=not last_only)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-
-        if _pt:
-            torch.cuda.synchronize()
-            _r1 = time.perf_counter()
+        if ev: ev[1].record()
 
         # Handle EAGLE returning (logits, conditioning_vector for next iter)
         conditioning = None
-        if self.config.use_eagle:
+        if self.config.use_eagle_or_phoenix:
             logits, conditioning = self.run_model(
                 input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
         else:
             logits = self.run_model(input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
+        if ev: ev[2].record()
 
-        if _pt:
-            torch.cuda.synchronize()
-            _r2 = time.perf_counter()
-            print(f"[PROFILE target_run] prepare_decode={(_r1-_r0)*1000:.2f}ms run_model={(_r2-_r1)*1000:.2f}ms eagle={self.config.use_eagle} n_ids={input_ids.shape[0]}", flush=True)
+        profile.emit(
+            "ModelRunner.run",
+            ["prepare", "run_model"],
+            ev,
+            is_prefill=is_prefill,
+            n_ids=input_ids.shape[0],
+        )
 
         if last_only:
             token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
@@ -678,5 +702,3 @@ class ModelRunner:
             if conditioning is not None:
                 return logits, conditioning
             return logits
-    
-

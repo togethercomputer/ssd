@@ -6,9 +6,9 @@ from random import randint
 from typing import List, Optional, Tuple
 from transformers import AutoTokenizer
 try:
-    from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
+    from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B, PHOENIX_70B
 except ImportError:
-    from bench_paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
+    from bench_paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B, PHOENIX_70B
 
 
 def _get_snapshot_path(base_path: str) -> str:
@@ -61,6 +61,15 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
                 return EAGLE3_QWEN_32B
             else:
                 raise ValueError(f"EAGLE draft not available for Qwen size {args.size}")
+
+    if getattr(args, "phoenix", False):
+        if args.llama:
+            if args.size == "70":
+                return PHOENIX_70B
+            else:
+                raise ValueError(f"Phoenix draft not available for Llama size {args.size}")
+        else:
+            raise ValueError(f"Phoenix draft not available for Qwen models")
 
     if args.llama:
         draft_size_to_model = {
@@ -157,6 +166,7 @@ def load_dataset_token_ids(
         return None
 
     dataset_file_path = DATASET_PATHS[dataset_name]
+    print(f"Loading dataset '{dataset_name}' from: {dataset_file_path}")
     if not os.path.exists(dataset_file_path):
         print(
             f"Warning: Dataset file not found at {dataset_file_path}, falling back to random tokens")
@@ -172,10 +182,11 @@ def load_dataset_token_ids(
                 data = json.loads(line.strip())
                 text: str = data["text"]
                 if use_chat_template and hasattr(tokenizer, 'apply_chat_template'):
-                    tokens = tokenizer.apply_chat_template(
+                    result = tokenizer.apply_chat_template(
                         [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
                         add_generation_prompt=True,
                     )
+                    tokens = result.input_ids if hasattr(result, 'input_ids') else result
                 else:
                     tokens = tokenizer.encode(text, add_special_tokens=False)
 

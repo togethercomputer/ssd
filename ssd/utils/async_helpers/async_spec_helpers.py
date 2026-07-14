@@ -40,16 +40,17 @@ def get_forked_recovery_tokens_from_logits(config: Config, logits: torch.Tensor,
     assert logits.shape[0] == B and logits.shape[1] == K+1, f"logits must have shape (B, K+1, V), got {logits.shape}"
     assert len(fan_out_list) == K + 1, f"fan_out_list must have length K+1={K+1}, got {len(fan_out_list)}"
     assert returned_tokens.shape == (B, K+1), f"returned_tokens must have shape (B, K+1), got {returned_tokens.shape}"
-    
-    # Use scatter_ to set returned tokens to -inf so we don't include those in forked tokens 
+
+    # Use scatter_ to set returned tokens to -inf so we don't include those in forked tokens
     # Don't touch the last sequence position, only scatter the first K positions
+    # Clone required: logits is an inference-mode tensor (from model forward under torch.inference_mode)
     logits = logits.clone()
-    logits[:, :-1, :] = logits[:, :-1, :].scatter(
+    logits[:, :-1, :].scatter_(
         dim=2,
         index=returned_tokens[:, 1:].unsqueeze(2),
         value=float('-inf'),
     )
-    
+
     # Compute top-k once at max fanout, then mask per row/position
     k_max = max(max(fan_out_list), max(fan_out_list_miss))
     _, topk_idx = torch.topk(logits, k_max, dim=-1)  # [B, K+1, k_max]

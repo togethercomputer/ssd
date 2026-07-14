@@ -31,13 +31,14 @@ def parse_arguments():
     # Speculative decoding configuration
     parser.add_argument("--spec", action="store_true", help="Enable speculative decoding")
     parser.add_argument("--eagle", action="store_true", help="Enable eagle speculative decoding (implies --spec, uses default eagle draft for model)")
+    parser.add_argument("--phoenix", action="store_true", help="Enable eagle speculative decoding (implies --spec, uses default eagle draft for model)")
     parser.add_argument("--k", type=int, default=6, help="Speculative decoding k value")
     parser.add_argument("--async", action="store_true", help="Enable async speculative decoding")
     parser.add_argument("--f", type=int, default=3, help="Async fan out value")
     parser.add_argument("--fl", type=int, nargs='+', default=None, help="Fan out list (e.g., --fl 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flh", type=int, nargs='+', default=None, help="Fan out list (e.g., --flh 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flm", type=int, nargs='+', default=None, help="Fan out list miss (e.g., --flm 1 3 4 becomes [1, 3, 4])")
-    parser.add_argument("--backup", type=str, choices=["jit", "fast"], default="jit", help="Backup strategy (jit or fast)")
+    parser.add_argument("--backup", type=str, choices=["jit", "force-jit", "fast"], default="jit", help="Backup strategy (jit or fast)")
 
     # Memory and batching configuration
     parser.add_argument("--block_sz", type=int, default=256, help="KV cache block size (see config.py: kvcache_block_size)")
@@ -80,11 +81,13 @@ def parse_arguments():
     assert not (args.qwen and '--llama' in sys.argv), "--llama and --qwen are mutually exclusive"
     if args.qwen:
         args.llama = False
-    if args.eagle:
+    if args.eagle or args.phoenix:
         args.spec = True
-        assert args.llama, "Eagle currently only supports llama models"
-        assert args.temp == 0.0 and args.dtemp is None, "Eagle currently only supports greedy decoding (temp=0)"
-        assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
+        assert args.llama, "Eagle and Phoenix currently only support llama models"
+        assert args.temp == 0.0 and args.dtemp is None, "Eagle and Phoenix currently only support greedy decoding (temp=0)"
+        assert getattr(args, 'async', False), "Eagle and Phoenix currently only support async speculative decoding"
+    if getattr(args, 'async', False):
+        args.spec = True
     return args
 
 
@@ -129,7 +132,7 @@ def initialize_wandb(args, run_name):
             "gpus": args.gpus,
             "speculative_decoding": args.spec,
             "async_speculative": getattr(args, 'async', False),
-            "jit_speculative": args.backup == "jit",
+            "backup_strategy": args.backup,
             "k": args.k if args.spec else None,
             "f": args.f,
             "fan_out_list": args.flh,
@@ -143,6 +146,8 @@ def initialize_wandb(args, run_name):
             "b": args.b,
             "block_size": args.block_sz,
             "eager": args.eager,
+            "eagle": args.eagle,
+            "phoenix": args.phoenix,
             "example_mode": args.example,
             "humaneval_mode": args.humaneval,
             "alpaca_mode": args.alpaca,
@@ -172,8 +177,11 @@ def create_llm_kwargs(args, draft_path):
         max_num_seqs=args.b,
         max_model_len=args.max_model_len,
         sampler_x=args.x,
-        jit_speculate=(args.backup == "jit"),
+        jit_speculate=(args.backup == "jit" or args.backup == "force-jit"),
+        force_jit_speculate=(args.backup == "force-jit"),
         max_steps=args.max_steps,
+        communicate_cache_hits=True,
+        communicate_logits=False,
     )
 
     if args.flh is not None:
@@ -296,6 +304,8 @@ def main():
     llm_kwargs = create_llm_kwargs(args, draft_path)
     if args.eagle:
         llm_kwargs['use_eagle'] = True
+    if args.phoenix:
+        llm_kwargs['use_phoenix'] = True
     if args.debug:
         llm_kwargs['debug_mode'] = True
 
