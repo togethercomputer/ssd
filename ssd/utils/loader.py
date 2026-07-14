@@ -69,15 +69,15 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, 
     
     if safetensor_files:
         print(f"[load_model] Detected EAGLE3 draft model, trying safetensors first")
-        # Load all safetensors into a single state dict
+        # Load all safetensors into a single state dict (sorted for deterministic shard order)
         state_dict = {}
-        for file in safetensor_files:
+        for file in sorted(safetensor_files):
             try:
                 with safe_open(file, "pt", "cpu") as f:
+                    n_before = len(state_dict)
                     for key in f.keys():
                         state_dict[key] = f.get_tensor(key)
-                print(f"[load_model] Loaded {len(state_dict)} weights from {file}")
-                break  # For EAGLE, typically just one file
+                print(f"[load_model] Loaded {len(state_dict) - n_before} weights from {file}")
             except Exception as e:
                 print(f"[load_model] Error reading safetensor {file}: {e}")
                 continue
@@ -186,6 +186,8 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, 
 def load_safetensors_model(model: nn.Module, path: str, packed_modules_mapping: dict):
     """Load model weights from safetensors files"""
     safetensor_files = glob(os.path.join(path, "*.safetensors"))
+    assert safetensor_files, f"No safetensors files found at {path}"
+    print(f"[load_safetensors_model] Found {len(safetensor_files)} safetensors files at {path}")
     for file in tqdm(safetensor_files, desc="Loading model files"):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():

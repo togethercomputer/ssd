@@ -249,24 +249,29 @@ class LlamaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = self.embed_tokens(input_ids)  # torch.Size([4096, 2560]) always through residual stream 
+        if hidden_states is None:
+            hidden_states = self.embed_tokens(input_ids)
         residual = None
         
         # Collect activations if use_eagle
-        collected_acts = [] if self.use_eagle else None
-        
+        collected_acts = [] if not self.draft and self.use_eagle else None
+
         for layer_idx, layer in enumerate(self.layers):
-            if collected_acts is not None and layer_idx in self.eagle_layers:
-                current_act = hidden_states if residual is None else hidden_states + residual 
+            if collected_acts is not None and self.eagle_layers is not None and layer_idx in self.eagle_layers:
+                current_act = hidden_states if residual is None else hidden_states + residual
                 collected_acts.append(current_act)
             hidden_states, residual = layer(positions, hidden_states, residual)
-            
-        
-        hidden_states, _ = self.norm(hidden_states, residual) 
-        
-        if collected_acts:
-            eagle_acts = torch.cat(collected_acts, dim=-1)
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+
+        if collected_acts is not None:
+            if len(collected_acts) > 1:
+                eagle_acts = torch.cat(collected_acts, dim=-1)
+            else:
+                assert len(collected_acts) == 1
+                eagle_acts = collected_acts[0]
             print(f'[LlamaModel] eagle_acts shape={eagle_acts.shape}', flush=True)
             return hidden_states, eagle_acts
         else:
@@ -284,7 +289,8 @@ class LlamaForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: LlamaConfig,        draft: bool = False,
+        config: LlamaConfig,
+        draft: bool = False,
         speculate: bool = False,
         use_eagle: bool = False,
         eagle_layers: list[int] | None = None,
@@ -304,13 +310,24 @@ class LlamaForCausalLM(nn.Module):
         self.eagle_layers = eagle_layers
         self.tp_group = tp_group
         self.tp_size = tp_size
-        
+
         assert not (use_eagle and draft), "ERROR in LlamaForCausalLM: use_eagle should be on EagleDraftForCausalLM and not LlamaForCausalLM"
         assert not (tp_group is None and self.tp_size > 1), "ERROR in LlamaForCausalLM: tp_group is None and tp_size > 1"
 
         print(f'Starting LlamaForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}')
         print(f'[LlamaForCausalLM] use_eagle={use_eagle}, eagle_layers={eagle_layers}', flush=True)
-        self.model = LlamaModel(config, draft, speculate, spec_k, async_fan_out, draft_async, use_eagle=use_eagle, eagle_layers=eagle_layers, tp_group=tp_group, tp_size=self.tp_size)
+        self.model = LlamaModel(
+            config,
+            draft,
+            speculate,
+            spec_k,
+            async_fan_out,
+            draft_async,
+            use_eagle=use_eagle,
+            eagle_layers=eagle_layers,
+            tp_group=tp_group,
+            tp_size=self.tp_size,
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,

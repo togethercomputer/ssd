@@ -14,12 +14,13 @@ from ssd.engine.step import InferenceStep, AutoRegressiveStep, SpecDecodeStep
 from ssd.engine.verifier import Verifier
 
 import atexit
+import weakref
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch.distributed as dist
 import torch.multiprocessing as mp
-
 
 
 METRICS = {
@@ -33,7 +34,11 @@ METRICS = {
     "decode_total_tokens": 0,
     "target_step_times": [],
     "target_verify_times": [],
+    # Per-step accept trace: enabled by tests when SSD_TRACE_ACCEPTS=1.
+    # See verifier.verify(); each step is a list of (seq_id, suffix, recovery).
 }
+if os.environ.get("SSD_TRACE_ACCEPTS", "0") == "1":
+    METRICS["per_step_accepts"] = []
 
 
 class LLMEngine:
@@ -45,8 +50,6 @@ class LLMEngine:
         self.config = config
         Sequence.block_size = config.kvcache_block_size 
 
-        assert config.kvcache_block_size >= (
-            2 * config.speculate_k + 2), "ERROR: support for block size < 2*k+2 is not implemented"
         assert config.num_gpus > 1 or not config.draft_async, "ERROR: draft_async requires at least 2 gpus"
             
         # Check that target and draft are from the same family
@@ -83,7 +86,12 @@ class LLMEngine:
             init_q = ctx.Queue()
             draft_rank = config.num_gpus - 1
             self.draft_ps = ctx.Process(
-                target=DraftRunner, args=(config, draft_rank, init_q))
+                target=DraftRunner, args=(
+                    DraftRunner.create_draft_config(config),
+                    draft_rank,
+                    init_q,
+                ),
+            )
             self.draft_ps.start()
             print(
                 f'Draft runner created on rank {draft_rank} (async)!', flush=True)
@@ -94,11 +102,25 @@ class LLMEngine:
 
         # do this after so we can launch model runner above so that the q is actually populated
         if config.speculate and config.draft_async:
+            _timeout_s = 1200  # 20 minutes
+            _banner = "=" * 80
+            print(
+                f'\n{_banner}\n'
+                f'>>> TARGET: WAITING for draft runner to send kv_cache_size (timeout={_timeout_s}s) ...\n'
+                f'{_banner}\n',
+                flush=True,
+            )
             try:
-                num_blocks = init_q.get(timeout=180)  # seconds
+                num_blocks = init_q.get(timeout=_timeout_s)
             except Exception as e:
                 raise RuntimeError(
-                    "ERROR: Timed out waiting for draft kv cache size") from e
+                    f"ERROR: Timed out after {_timeout_s}s waiting for draft kv cache size") from e
+            print(
+                f'\n{_banner}\n'
+                f'>>> TARGET: Received draft kv_cache_size={num_blocks}!\n'
+                f'{_banner}\n',
+                flush=True,
+            )
 
             init_q.close()
             self.draft_cfg = DraftRunner.create_draft_config(config)
@@ -109,7 +131,7 @@ class LLMEngine:
 
         if config.speculate and not config.draft_async:
             # keep it colocated on rank 0, process/dist agnostic in this case
-            self.draft_runner = DraftRunner(config)
+            self.draft_runner = DraftRunner(DraftRunner.create_draft_config(config))
             self.draft_cfg = self.draft_runner.draft_cfg
             print(f'Draft runner created on rank 0 (no async)', flush=True)
 
@@ -121,7 +143,15 @@ class LLMEngine:
         print(f"[LLMEngine] finished llm_engine init", flush=True)
 
         self._exiting = False
-        atexit.register(lambda: self.exit(hard=True))
+        # Use a weakref so `del llm` can actually release the engine (and its
+        # GPU tensors on target rank 0) before process exit. A direct closure
+        # over `self` keeps the engine alive for the whole process lifetime.
+        _weak_self = weakref.ref(self)
+        def _atexit_cleanup():
+            obj = _weak_self()
+            if obj is not None:
+                obj.exit(hard=True)
+        atexit.register(_atexit_cleanup)
 
     def exit(self, hard: bool = True):
         print(f"[LLMEngine] Exiting (hard={hard})", flush=True)
@@ -135,10 +165,11 @@ class LLMEngine:
                 self.model_runner.send_draft_exit_signal()
         except Exception:
             pass
-        # 2) Tell all target ranks (including rank 0 self) to exit (non-blocking cleanup, no os._exit inside)
+        # 2) Tell all target ranks (including rank 0 self) to exit (non-blocking cleanup, no os._exit inside).
+        # Forward `hard` so soft exits actually destroy process groups; otherwise the next test
+        # in the same process gets "trying to initialize the default process group twice".
         try:
-            self.model_runner.call("exit",
-                                   True if not self.config.draft_async else True)
+            self.model_runner.call("exit", hard)
         except Exception:
             pass
         # 3) Wait briefly for TP workers; terminate if still around
@@ -190,11 +221,13 @@ class LLMEngine:
         self.scheduler.add(seq)
 
 
-    def step(self, step: InferenceStep):
+    def step(self, step: InferenceStep, step_num: int):
         t = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
-        ttl_tokens = step.prefill(seqs) if is_prefill else step.decode(seqs)
-
+        ttl_tokens = (
+            step.prefill(seqs, step_num=step_num) if is_prefill else
+            step.decode(seqs, step_num=step_num)
+        )
         time_taken = perf_counter() - t
 
         if is_prefill:
@@ -239,35 +272,48 @@ class LLMEngine:
                 print(
                     f"[metrics] Avg target verify time (ms): {sum(METRICS['target_verify_times']) * 1000 / len(METRICS['target_verify_times']):.2f}", flush=True)
             if self.config.draft_async:
-                print(
-                    f"[metrics] Avg Cache Hits: {sum(METRICS['cache_hits']) / len(METRICS['cache_hits']):.2f}", flush=True)
-                # Log separate metrics for cache hits
-                if METRICS['accepted_suffix_lens_on_hit']:
-                    avg_suffix_len_on_hit = sum(
-                        METRICS['accepted_suffix_lens_on_hit']) / len(METRICS['accepted_suffix_lens_on_hit'])
-                    print(
-                        f"[metrics] Avg Tokens per step on Cache Hit: {avg_suffix_len_on_hit:.2f}", flush=True)
-                    
-                    # Calculate empirical frequencies of accepted_suffix_lens_on_hit - 1
-                    adjusted_lens = [length - 1 for length in METRICS['accepted_suffix_lens_on_hit']]
-                    total_count = len(adjusted_lens)
-                    freq_counts = {}
-                    for length in adjusted_lens:
-                        freq_counts[length] = freq_counts.get(length, 0) + 1
-                    
-                    # Print normalized empirical probabilities for range [0, K]
-                    print(f"[metrics] Empirical frequencies of accepted_suffix_lens_on_hit - 1:", flush=True)
-                    for k in range(self.config.speculate_k + 1):
-                        prob = freq_counts.get(k, 0) / total_count
-                        print(f"  {k}: {prob:.3f}", flush=True)
-                if METRICS['accepted_suffix_lens_on_miss']:
-                    avg_suffix_len_on_miss = sum(
-                        METRICS['accepted_suffix_lens_on_miss']) / len(METRICS['accepted_suffix_lens_on_miss'])
-                    print(
-                        f"[metrics] Avg Tokens per step on Cache Miss: {avg_suffix_len_on_miss:.2f}", flush=True)
+                if METRICS['accepted_suffix_lens_with_recovery']:
+                    print(f"[metrics] Avg Tokens per step (incl recovery): {sum(METRICS['accepted_suffix_lens_with_recovery']) / len(METRICS['accepted_suffix_lens_with_recovery']):.2f}", flush=True)
+                else:
+                    print(f"[metrics] Avg Tokens per step (incl recovery): N/A (THIS MAY INDICATE A BUG)", flush=True)
+
+                if not self.config.communicate_cache_hits:
+                    # TODO: Compute these metrics on the draft side?
+                    print(f"Skipping metrics based on cache hits vs misses because communicate_cache_hits is False", flush=True)
                 else:
                     print(
-                        f"[metrics] Avg Tokens per step on Cache Hit: N/A (no cache hits)", flush=True)
+                        f"[metrics] Avg Cache Hits: {sum(METRICS['cache_hits']) / len(METRICS['cache_hits']):.2f}", flush=True)
+                    # Log separate metrics for cache hits
+                    if METRICS['accepted_suffix_lens_on_hit']:
+                        avg_suffix_len_on_hit = sum(
+                            METRICS['accepted_suffix_lens_on_hit']) / len(METRICS['accepted_suffix_lens_on_hit'])
+                        print(
+                            f"[metrics] Avg Tokens per step on Cache Hit: {avg_suffix_len_on_hit:.2f}", flush=True)
+
+                        # Calculate empirical frequencies of accepted_suffix_lens_on_hit - 1
+                        adjusted_lens = [length - 1 for length in METRICS['accepted_suffix_lens_on_hit']]
+                        total_count = len(adjusted_lens)
+                        freq_counts = {}
+                        for length in adjusted_lens:
+                            freq_counts[length] = freq_counts.get(length, 0) + 1
+
+                        # Print normalized empirical probabilities for range [0, K]
+                        print(f"[metrics] Empirical frequencies of accepted_suffix_lens_on_hit - 1:", flush=True)
+                        for k in range(self.config.speculate_k + 1):
+                            prob = freq_counts.get(k, 0) / total_count
+                            print(f"  {k}: {prob:.3f}", flush=True)
+                    else:
+                        print(
+                            f"[metrics] Avg Tokens per step on Cache Hit: N/A (no cache hits)", flush=True)
+
+                    if METRICS['accepted_suffix_lens_on_miss']:
+                        avg_suffix_len_on_miss = sum(
+                            METRICS['accepted_suffix_lens_on_miss']) / len(METRICS['accepted_suffix_lens_on_miss'])
+                        print(
+                            f"[metrics] Avg Tokens per step on Cache Miss: {avg_suffix_len_on_miss:.2f}", flush=True)
+                    else:
+                        print(
+                            f"[metrics] Avg Tokens per step on Cache Miss: N/A (no cache misses)", flush=True)
 
     def create_inference_step(self, config: Config) -> InferenceStep:
         if config.speculate:
@@ -281,6 +327,10 @@ class LLMEngine:
                     draft_dtype=config.draft_hf_config.torch_dtype,
                     kvcache_block_size=config.kvcache_block_size,
                     max_model_len=config.max_model_len,
+                    eagle=config.use_eagle,
+                    eagle_act_dim=self.model_runner.eagle_acts_dim if config.use_eagle else 0,
+                    communicate_logits=config.communicate_logits,
+                    communicate_cache_hits=config.communicate_cache_hits,
                     async_pg=self.model_runner.async_pg,
                     draft_runner_rank=self.num_tp_gpus,
                     tokenizer=self.tokenizer,
@@ -325,8 +375,6 @@ class LLMEngine:
         use_tqdm: bool = True,
         stream_callback=None,
     ) -> list[str]:
-        for k in METRICS:
-            METRICS[k] = [] if isinstance(METRICS[k], list) else 0
 
         if use_tqdm:
             pbar = tqdm(total=len(prompts),
@@ -349,7 +397,7 @@ class LLMEngine:
                 )
             i += 1
             t = perf_counter()
-            output = self.step(inference_step)
+            output = self.step(inference_step, i - 1)
             time_taken = perf_counter() - t
             METRICS["target_step_times"].append(time_taken)
 

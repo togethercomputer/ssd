@@ -3,7 +3,8 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn.cute.interface import flash_attn_varlen_func as fa4_varlen_func
+from ssd.layers.tree_mask import create_tree_score_mod
 from ssd.utils.context import get_context
 
 
@@ -65,10 +66,10 @@ class Attention(nn.Module):
         self.speculate = speculate
         self.draft_async = draft_async
         self.use_eagle = use_eagle
-        self.prefill_wrappers = {}
         self.F = F # async_fan_out
         self.K = K # speculate_k
-        self.only_prefill_wrapper = None
+        self.max_seqlen_k = 0  # set during KV cache allocation to config.max_model_len
+        self.tree_score_mod = None  # set during KV cache allocation
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         o: torch.Tensor
@@ -87,7 +88,7 @@ class Attention(nn.Module):
                 k, v = k_cache, v_cache
 
             k, v = k.view(-1, self.num_kv_heads, self.head_dim), v.view(-1, self.num_kv_heads, self.head_dim)
-            o = flash_attn_varlen_func(q, k, v,
+            o, _ = fa4_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True)
@@ -104,29 +105,45 @@ class Attention(nn.Module):
 
             if verify_or_glue:
                 assert context.context_lens is not None
-                o = flash_attn_with_kvcache(q, k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, page_table=context.block_tables,
+                o, _ = fa4_varlen_func(q, k_cache, v_cache,
+                                        cu_seqlens_q=context.cu_seqlens_q,
+                                        cu_seqlens_k=None,
+                                        max_seqlen_q=context.max_seqlen_q,
+                                        max_seqlen_k=self.max_seqlen_k,
+                                        seqused_k=context.context_lens,
+                                        page_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True,
-                                        cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
                                         )
 
             elif tree_decode:
-                if self.only_prefill_wrapper is not None:
-                    prefill_wrapper = self.only_prefill_wrapper
-                else:
-                    mq_len = self.F * (self.K+1)
-                    bs = q.shape[0] // mq_len
-                    wrapper_bs = None
-                    for available_bs in sorted(self.prefill_wrappers.keys()):
-                        if available_bs >= bs:
-                            wrapper_bs = available_bs
-                            break
-                    prefill_wrapper = self.prefill_wrappers[wrapper_bs]
-                o = prefill_wrapper.run(q, (self.k_cache, self.v_cache))
+                score_mod_kwargs = {}
+                if self.tree_score_mod is not None and context.tree_mask_bias is not None:
+                    score_mod_kwargs["score_mod"] = self.tree_score_mod
+                    score_mod_kwargs["aux_tensors"] = [context.tree_mask_bias]
+                o, _ = fa4_varlen_func(
+                    q,
+                    self.k_cache,
+                    self.v_cache,
+                    cu_seqlens_q=context.tree_cu_seqlens_q,
+                    cu_seqlens_k=None,
+                    max_seqlen_q=self.F * (self.K + 1),
+                    max_seqlen_k=self.max_seqlen_k,
+                    seqused_k=context.context_lens,
+                    page_table=context.block_tables,
+                    softmax_scale=self.scale,
+                    causal=False,
+                    **score_mod_kwargs,
+                )
             else: # single query decode
-                q = q.unsqueeze(1)
-                o = flash_attn_with_kvcache(q, k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, page_table=context.block_tables,
+                batch_size = context.context_lens.shape[0]
+                cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=q.device)
+                o, _ = fa4_varlen_func(q, k_cache, v_cache,
+                                            cu_seqlens_q=cu_seqlens_q,
+                                            cu_seqlens_k=None,
+                                            max_seqlen_q=1,
+                                            max_seqlen_k=self.max_seqlen_k,
+                                            seqused_k=context.context_lens,
+                                            page_table=context.block_tables,
                                             softmax_scale=self.scale, causal=True,
                                             )
 
