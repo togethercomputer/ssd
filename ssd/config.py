@@ -38,6 +38,11 @@ class Config:
     async_nccl_host: str = "127.0.0.1"
     communicate_logits: bool = False
     communicate_cache_hits: bool = False
+    # Rendezvous port for the DEFAULT torch.distributed group (multi-GPU target
+    # and/or same-node async draft). Picked automatically by LLMEngine when
+    # unset; a fixed port here (the old hardcoded 1223) makes engine startup
+    # hang forever whenever any other process on the box holds it.
+    dist_init_port: int | None = None
 
     # eagle3 / phoenix
     use_eagle: bool = False 

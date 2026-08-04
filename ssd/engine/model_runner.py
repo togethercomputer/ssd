@@ -99,8 +99,16 @@ class ModelRunner:
         if self.verbose: print(f'INSIDE MODEL RUNNER INIT, DRAFT={is_draft}', flush=True)
         self.tp_pg = None 
 
-        if should_use_dist: 
-            default_port = 1223 
+        if should_use_dist:
+            # Port chosen by LLMEngine (free-port scan) and shared with every
+            # spawned rank via the pickled config; 1223 is only the fallback for
+            # direct ModelRunner construction outside the engine. The old
+            # hardcoded 1223 made startup hang forever whenever anything else on
+            # the box held that port (rendezvous connects to the foreign
+            # listener and waits for peers that never come). NOTE: no custom
+            # timeout here — the group's timeout also governs later collectives,
+            # and the async draft legitimately blocks on irecv between requests.
+            default_port = self.config.dist_init_port or 1223
             dist.init_process_group(
                 "nccl", f"tcp://localhost:{default_port}",
                 world_size=self.world_size,

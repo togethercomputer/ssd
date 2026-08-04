@@ -488,10 +488,16 @@ def run_glue_decode_cudagraph(model_runner, input_ids, positions, last_only, gra
     if wrapper_bs > orig_B:
         # Ghost seqs get 0-length queries
         graph_vars["cu_seqlens_q"][orig_B + 1:wrapper_bs + 1] = cu[-1]
-        # Ghost seqs need valid block_tables/context_lens (copy last real seq)
-        pad_B = wrapper_bs - orig_B
+        # Ghost seqs need valid block_tables/context_lens (copy last real seq).
+        # The wire block table is dynamically sized (TGL pads width to
+        # seq_lens.max()+tree, typically << the static buffer width), so slice
+        # the width like the real-row copy above — a full-row assignment
+        # crashes the first time B needs padding up to a graph bucket
+        # (impossible at max_num_seqs=1, which is why B=1 runs never saw it).
         graph_vars["context_lens"][orig_B:wrapper_bs] = context.context_lens[orig_B - 1]
-        graph_vars["block_tables"][orig_B:wrapper_bs] = context.block_tables[orig_B - 1]
+        graph_vars["block_tables"][orig_B:wrapper_bs, :context.block_tables.size(1)] = (
+            context.block_tables[orig_B - 1]
+        )
 
     if hidden_states is not None and "eagle_hidden_states" in graph_vars:
         graph_vars["eagle_hidden_states"][:orig_flat] = hidden_states

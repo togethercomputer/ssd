@@ -164,13 +164,19 @@ def test_multi_prompt_first_seq_trace_matches_at_longer_length():
 @pytest.mark.tier1
 @pytest.mark.xfail(
     reason=(
-        "Known divergence on multi-prompt batches: async+force-jit and sync-spec "
-        "produce the same final tokens but diverging per-step acceptance traces "
-        "for seq #1 (second prompt in the batch). Seq #0 matches exactly — see "
-        "test_multi_prompt_first_seq_trace_matches_at_longer_length. Hypothesis: "
-        "tree-attention vs linear-decode produces subtly different draft logits "
-        "at non-zero batch positions, or KV rollback after partial accepts drifts "
-        "state for the second sequence."
+        "Characterized divergence on multi-prompt batches: async+force-jit and "
+        "sync-spec produce the same final tokens but diverging per-step "
+        "acceptance traces for seq #1 (second prompt in the batch); seq #0 "
+        "matches exactly even at 64 tokens. The 2026-07 correctness campaign "
+        "narrowed this to benign per-row bf16 numerics between the two process "
+        "topologies (colocated vs separate-process draft => different kernel "
+        "shapes/streams), flipping occasional near-tie draft proposals at batch "
+        "rows > 0 — NOT state corruption: final tokens are asserted identical "
+        "(test_multi_prompt_greedy_matches_tokens), the draft process is "
+        "bit-deterministic and row-permutation-equivariant at fixed shapes "
+        "(tests/draft_runner/test_draft_runner_scripted.py), and its shipped "
+        "conditioning matches HF ground truth (batched server test). Kept as a "
+        "strict xfail so any behavioral change in either direction is flagged."
     ),
     strict=True,
 )

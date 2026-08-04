@@ -13,10 +13,13 @@ import sys
 from pathlib import Path
 
 
-# Canonical local model snapshots (8B target + 1B standalone draft).
-LLAMA_3_1_8B_SNAPSHOT = "/scratch/avner/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
-LLAMA_3_2_1B_SNAPSHOT = "/scratch/avner/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
-EAGLE3_8B_SNAPSHOT = "/scratch/avner/huggingface/hub/models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B/snapshots/61aa096484ad9752292507b0cc9973bb423abb35"
+# Canonical local model snapshots (8B target + 1B standalone draft) — shared
+# with tests/hf/helpers.py so both suites track the same machine layout.
+from tests.hf.helpers import (  # noqa: E402
+    LLAMA_3_1_8B_SNAPSHOT,
+    LLAMA_3_2_1B_SNAPSHOT,
+    EAGLE3_8B_SNAPSHOT,
+)
 
 
 def require_8b_target() -> str:
@@ -50,27 +53,61 @@ def run_llm_subprocess(config: dict, timeout: int = 600, trace_accepts: bool = F
     if trace_accepts:
         env["SSD_TRACE_ACCEPTS"] = "1"
 
-    proc = subprocess.run(
-        [sys.executable, str(runner), "--config-json", json.dumps(config)],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=timeout,
-    )
-    if proc.returncode != 0:
+    # stdout/stderr go to temp FILES, not pipes: with pipes, subprocess.run
+    # returns only on pipe EOF, which requires every GRANDCHILD (the engine's
+    # draft/worker processes) to close them too — a lingering child turns a
+    # successful run into a spurious 600s timeout. With files, wait() returns
+    # the moment the runner itself exits. start_new_session gives us a process
+    # group so a timeout can reap the whole engine family instead of leaving
+    # orphans squatting on GPUs.
+    import signal
+    import tempfile
+
+    with tempfile.TemporaryFile(mode="w+") as fout, tempfile.TemporaryFile(mode="w+") as ferr:
+        proc = subprocess.Popen(
+            [sys.executable, str(runner), "--config-json", json.dumps(config)],
+            stdout=fout,
+            stderr=ferr,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait(timeout=30)
+            raise
+        finally:
+            # Reap any engine children the runner left behind (its exit path
+            # os._exit()s and cannot guarantee every grandchild died).
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        fout.seek(0)
+        ferr.seek(0)
+        stdout = fout.read()
+        stderr = ferr.read()
+
+    if returncode != 0:
         raise RuntimeError(
-            f"runner exited with code {proc.returncode}\n"
-            f"--- stdout ---\n{proc.stdout}\n"
-            f"--- stderr ---\n{proc.stderr}\n"
+            f"runner exited with code {returncode}\n"
+            f"--- stdout ---\n{stdout}\n"
+            f"--- stderr ---\n{stderr}\n"
         )
     # Find the RUNNER_RESULT line
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         if line.startswith("RUNNER_RESULT: "):
             return json.loads(line[len("RUNNER_RESULT: "):])
     raise RuntimeError(
         f"runner did not emit RUNNER_RESULT\n"
-        f"--- stdout ---\n{proc.stdout}\n"
-        f"--- stderr ---\n{proc.stderr}\n"
+        f"--- stdout ---\n{stdout}\n"
+        f"--- stderr ---\n{stderr}\n"
     )
 
 

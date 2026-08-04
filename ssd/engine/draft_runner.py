@@ -310,7 +310,11 @@ class DraftRunner(ModelRunner):
 
         assert request_keys.shape == (B, 3), f"ERROR in hit_cache: request_keys should be (B, 3), got {request_keys.shape}"
 
-        out_activations = torch.empty(
+        # zeros (not empty): on the empty-cache fast path nothing below fills this,
+        # and it flows into the glue decode as the conditioning stream for the spec
+        # slots. Uninitialized memory there is nondeterministic and can inject
+        # NaN/Inf into KV that later code assumes is merely "stale but finite".
+        out_activations = torch.zeros(
             B, K, self.hidden_states_dim,
             dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle_or_phoenix else None
@@ -378,13 +382,35 @@ class DraftRunner(ModelRunner):
                     hit_marker = "[HIT]" if i in hit_indices else ""
                     print(f"[{_ts()}]     [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
 
-            # Fill via direct indexing (miss slots get stale cache data, but that's ok since we can
-            # return any tokens/logits for cache misses, as long as they are consistent with one another).
+            # Miss rows fall back to the SAME SEQUENCE's first cache entry (its
+            # k=0 top-fork branch from the previous round) — a smart fallback
+            # speculation that still gets tokens accepted after a near-miss
+            # (dropping it for zeros costs ~0.3-0.4 accept length in fast mode).
+            # The old behavior indexed global row 0 instead, which at B>1
+            # belongs to a DIFFERENT sequence (cross-request proposal leak) and
+            # leaked session history into fresh sequences' first rounds (fork
+            # selection excludes trunk tokens, so even the next round's
+            # candidate sets inherited it). Sequences with no cache entries get
+            # deterministic zeros (token 0 + sentinel logits + zero acts),
+            # matching the empty-cache round.
+            eq_seq = request_keys[:, 0:1] == self.tree_cache_keys[:, 0].unsqueeze(0)  # [B, T]
+            has_own, own_idx = eq_seq.max(dim=1)
+            idx = torch.where(cache_hits, idx, torch.where(has_own, own_idx, torch.zeros_like(own_idx)))
+            # advanced indexing gathers copies, so the in-place dead-row
+            # overwrite below cannot corrupt the cache
             out_tokens = self.tree_cache_tokens[idx]
             if self.config.communicate_logits:
                 out_logits = self.tree_cache_logits[idx]
             if self.config.use_eagle_or_phoenix:
                 out_activations = self.tree_cache_activations[idx]
+            dead = ~cache_hits & ~has_own
+            if dead.any():
+                out_tokens[dead] = 0
+                if self.config.communicate_logits:
+                    out_logits[dead] = float("-inf")
+                    out_logits[dead.nonzero(as_tuple=True)[0], :, 0] = 0.0
+                if self.config.use_eagle_or_phoenix:
+                    out_activations[dead] = 0
 
         if ev: ev[3].record()  # end: build_speculation
 

@@ -66,6 +66,19 @@ def main():
         result["per_step_accepts"] = metrics["per_step_accepts"]
     print("RUNNER_RESULT: " + json.dumps(result), flush=True)
 
+    # Tear the engine down EXPLICITLY, then die hard. Relying on interpreter
+    # shutdown is fragile: multiprocessing's atexit joins the non-daemon
+    # draft/worker children, whose exit in turn depends on NCCL teardown
+    # ordering — when that ordering loses, this process never exits and the
+    # calling test times out even though generation succeeded.
+    try:
+        llm.exit(hard=False)
+    except Exception:
+        pass
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
 
 if __name__ == "__main__":
     main()
