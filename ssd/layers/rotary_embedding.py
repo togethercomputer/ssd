@@ -3,6 +3,32 @@ import torch
 from torch import nn
 
 
+def rope_theta_from_config(config, default: float) -> float:
+    """Return rope_theta from an HF config (transformers v4 attr or v5 rope_parameters)."""
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+        return rope_parameters["rope_theta"]
+    return getattr(config, "rope_theta", default)
+
+
+def set_rope_theta_on_config(config, rope_theta: float) -> None:
+    """Set rope_theta on an HF config so both v4 and v5 readers see it."""
+    config.rope_theta = rope_theta
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict):
+        rope_parameters["rope_theta"] = rope_theta
+
+
+def rope_scaling_from_config(config) -> dict | None:
+    """Return rope_scaling, mapping transformers v5's default rope_parameters dict to None."""
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+        if rope_type == "default":
+            return None
+    return rope_scaling
+
+
 def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,

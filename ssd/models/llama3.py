@@ -6,7 +6,7 @@ from ssd.layers.activation import SiluAndMul
 from ssd.layers.attention import Attention
 from ssd.layers.layernorm import RMSDNorm
 from ssd.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from ssd.layers.rotary_embedding import get_rope
+from ssd.layers.rotary_embedding import get_rope, rope_theta_from_config, rope_scaling_from_config
 from ssd.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
@@ -160,8 +160,8 @@ class LlamaDecoderLayer(nn.Module):
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 500000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_theta=rope_theta_from_config(config, 500000),
+            rope_scaling=rope_scaling_from_config(config),
             draft=self.draft,
             speculate=self.speculate,
             spec_k=self.spec_k,
