@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from transformers import AutoConfig
 import torch
 from ssd.paths import DEFAULT_TARGET, DEFAULT_DRAFT
+from ssd.layers.rotary_embedding import rope_theta_from_config, set_rope_theta_on_config
 
 @dataclass
 class Config:
@@ -77,11 +78,11 @@ class Config:
                 print(f'[Config] just set eagle_layers={self.eagle_layers}', flush=True)
             # Eagle draft must use target's rope_theta (draft config may default to wrong value)
             if self.speculate and self.draft_hf_config is not None:
-                target_rope_theta = getattr(self.hf_config, 'rope_theta', 500000.0)
-                draft_rope_theta = getattr(self.draft_hf_config, 'rope_theta', 10000.0)
+                target_rope_theta = rope_theta_from_config(self.hf_config, 500000.0)
+                draft_rope_theta = rope_theta_from_config(self.draft_hf_config, 10000.0)
                 if target_rope_theta != draft_rope_theta:
                     print(f'[Config] Overriding eagle draft rope_theta: {draft_rope_theta} -> {target_rope_theta}', flush=True)
-                    self.draft_hf_config.rope_theta = target_rope_theta
+                    set_rope_theta_on_config(self.draft_hf_config, target_rope_theta)
                 # Also override max_position_embeddings for correct RoPE cache size
                 # NOTE: Do NOT change max_model_len here - it was already correctly capped.
                 # Only change draft_hf_config.max_position_embeddings for RoPE.
